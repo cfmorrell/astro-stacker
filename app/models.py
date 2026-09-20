@@ -73,20 +73,28 @@ class StackLightsRequest(BaseModel):
     raw/nights/<name>/{lights,flats} layout (see /projects/{name}/stage
     and BuildMastersRequest), even for a project that only has one
     session; there is no separate single-night layout to remember or ask
-    about. Each named night's lights are calibrated against ITS OWN
-    process/nights/<name>/master_flat by default (flats vary night to
-    night), while `master_dark` stays a single shared value across every
-    night. With exactly one name, that night's own sequence is
+    about. With exactly one name, that night's own sequence is
     registered/stacked directly; with two or more, they're combined first
     via Siril's `merge` (which — confirmed the hard way — refuses to run
     with fewer than two inputs, hence the split).
+
+    Master reuse policy (per Chris, settled): `master_dark` (and
+    master_bias, upstream in /masters/run) are shared across the whole
+    project by default — one dark/bias set normally covers every night.
+    `master_flat` is the opposite: EACH night gets its OWN master flat by
+    default (process/nights/<name>/master_flat), because flats capture
+    dust/vignetting that genuinely changes night to night and get retaken
+    for that reason — don't default this to one shared flat "for
+    simplicity." The `master_flat` override below exists for the actual
+    exception: a specific night that's missing its own flats and should
+    reuse another night's (or an external master library's) instead.
     """
 
     nights: list[str] = Field(..., min_length=1)
     stack: StackOptions = Field(default_factory=StackOptions)
     is_osc: bool = True  # False drops -cfa/-equalize_cfa/-debayer for mono cameras
     master_dark: Optional[str] = None  # absolute path override; default process/master_dark (shared)
-    master_flat: Optional[str] = None  # override applied to ALL nights uniformly; default is per-night
+    master_flat: Optional[str] = None  # override for a night missing its own flats; default is per-night, not shared
     exclude_frames: list[str] = Field(default_factory=list)  # raw light frame basenames to skip (see /lights/analyze)
 
     model_config = {

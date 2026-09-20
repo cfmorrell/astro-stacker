@@ -22,11 +22,18 @@ def run_script(
     workdir: Path,
     log_path: Path,
     on_line: Optional[Callable[[str], None]] = None,
+    append_log: bool = False,
 ) -> int:
     """Write script_text to a scratch .ssf file under workdir and run it via
     siril-cli, streaming combined stdout/stderr line-by-line to log_path and
     to on_line() as it arrives. Returns the process's exit code (does not
     raise on a non-zero exit — that's the caller's job).
+
+    `append_log=True` opens log_path for appending instead of truncating —
+    used by jobs.create_multi_script_job() when several independent
+    siril-cli invocations (one per night, see Handoff.md gotcha #8) share
+    one job's log file, so a later step doesn't erase an earlier one's
+    output.
     """
     workdir.mkdir(parents=True, exist_ok=True)
     script_path = workdir / ".job.ssf"
@@ -39,7 +46,7 @@ def run_script(
     cmd = [config.SIRIL_BIN, "siril-cli", "-s", str(script_path), "-d", str(workdir)]
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("w") as log_file:
+    with log_path.open("a" if append_log else "w") as log_file:
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,

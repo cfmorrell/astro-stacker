@@ -73,6 +73,19 @@ post-processing elsewhere.
   excludes nothing; a human picks `exclude_frames` for `/stack/run`
   afterward. Don't add an auto-reject threshold later without Chris
   explicitly asking for one — it would invert this decision.
+- **Anomaly flagging is relative to each night's own data, never a fixed
+  cutoff.** Chris, after sending a real astropup-blink screenshot: "the
+  key is looking for anomalies in the data, not fixating on particular
+  numbers as cutoffs." `app/framestats.py`'s `flag_anomalies()` computes a
+  robust (MAD-based) z-score per metric against the REST OF THAT NIGHT's
+  own frames — never an absolute FWHM/star-count/etc. number — matching
+  both that direction and astropup-blink's own per-metric outlier
+  presentation against a sequence's own distribution. Validated against
+  real known-bad frames Chris identified by eye (a 7-frame dawn-twilight
+  ramp and a subtler elevated-background frame) before this was built —
+  see "Current validated status." Don't replace this with fixed
+  thresholds later without a specific reason; it would contradict this
+  direction and the "recommend, don't auto-filter" one above.
 - **`/lights/analyze` uses astropy+photutils directly, not Siril**
   (settled 2026-09-2x). Cause: a real, confirmed performance cliff running
   multiple sequences in one Siril session (gotcha #8) — identical
@@ -126,16 +139,24 @@ post-processing elsewhere.
   `merge "session/pp_light" ... all_sessions`) — referenced for that
   pattern only, not copied; this project stays headless-CLI/.ssf, not
   sirilpy.
-- **astropup-blink** (`astropup.app/#app-blink`, mentioned by Chris as the
-  UX reference for frame review) — its actual page content wasn't
-  fetchable when researched (2026-09-20; the page appears to be a
-  JS-rendered SPA that returned nothing to a plain fetch). `/lights/analyze`
-  was designed from Siril's own native capabilities plus Chris's explicit
-  requirement ("recommendations, not automatic filtering") rather than
-  from a real look at astropup-blink's UI — worth an actual look
-  (screenshot/manual walkthrough) before building any UI on top of this,
-  in case its specific presentation (e.g. how it visualizes outliers) is
-  worth matching more closely than a guess got us.
+- **astropup-blink** (`astropup.app/#app-blink`, Chris's UX reference for
+  frame review) — its live page wasn't fetchable when first researched
+  (2026-09-20, a JS-rendered SPA that returned nothing to a plain fetch),
+  but Chris later sent a real screenshot (2026-09-2x) of it reviewing
+  Night 2's data. What it shows: a top bar (`All 17 / ✓10 / ⚠7`), four
+  per-metric panels (Star count, FWHM, Eccentricity, SNR) each a per-sub
+  bar chart with an "Auto" threshold toggle highlighting the outlier bars
+  for THAT metric against the rest of the sequence — not a fixed absolute
+  cutoff — plus a session timeline, and a large two-up image preview
+  ("blink" comparator) below, one of which visibly showed a satellite/
+  plane trail. This directly informed `flag_anomalies()`'s design
+  (per-metric, relative-to-the-sequence flagging — see Architecture
+  decisions) and confirmed the "7 flagged" in the screenshot lines up with
+  a real 7-frame dawn-twilight ramp in the actual capture data. Still not
+  replicated: the visual blink-comparator itself (no image preview
+  generation exists yet — see Immediate next steps) or SNR-panel-style
+  spatial background maps (`app/framestats.py` uses a single global
+  background/std per frame, not `Background2D`'s 2D map).
 - **Siril's `.seq` registration-data format** (undocumented anywhere
   found — reverse-engineered from real output): after `register`, a `R<layer>`
   line per frame holds `fwhm wfwhm roundness quality background nb_stars`,
@@ -226,12 +247,13 @@ post-processing elsewhere.
    (`shutil.rmtree` + recreate). This is deliberately a *separate*
    directory from wherever that scope's master files live
    (`process/master_{bias,dark}.fit`, `process/nights/<name>/master_flat.fit`),
-   which must never be wiped. **`/masters/run` has this same latent risk
-   and does not yet have the fix** — it still converts straight into the
-   shared `process/`(`/nights/<name>`) dir with no cleanup, so re-running
-   it a second time against a *different* frame count in `raw/biases`
-   `raw/darks`, or a night's `raw/.../flats` is unverified and should be
-   assumed unsafe until it gets the same treatment.
+   which must never be wiped. **`/masters/run` now has the same fix
+   (2026-09-2x)**: bias/dark/each night's flat each build in their own
+   disposable `process/_build/...` scratch dir, wiped fresh every run,
+   with the final master moved to its stable location only after that
+   step's siril-cli process exits successfully (`app/ssf.py`'s
+   `perform_move()`). Verified by rebuilding masters twice in a row
+   against `multi1`'s real data — both runs succeeded identically.
 7. **`merge` refuses to run with fewer than two input sequences** — its
    own usage string is `merge sequence1 sequence2 [sequence3 ...]
    output_sequence`; `sequence2` is not optional. Confirmed the hard way
@@ -256,13 +278,48 @@ post-processing elsewhere.
    source, but "up to N threads can be used" gets reprinted before every
    `register`, suggesting it re-evaluates available memory/thread
    headroom each time and finds less of it left over from the previous
-   sequence's ~3GB of registered-image writes. **Consequence: this is why
-   `/lights/analyze` no longer uses Siril at all** — see the architecture
-   decision above and `app/framestats.py`. `/stack/run` and `/masters/run`
-   still shell out to Siril and still run every night sequentially in one
-   session, so they still carry this risk for large night counts; nobody
-   has hit it there yet only because analyze was the first thing pushing
-   many-sequences-per-session hard enough to notice.
+   sequence's ~3GB of registered-image writes. **Consequence #1: this is
+   why `/lights/analyze` no longer uses Siril at all** — see the
+   architecture decision above and `app/framestats.py`. **Consequence #2
+   (2026-09-2x): `/stack/run` and `/masters/run` no longer run multiple
+   sequences in one Siril session either.** Each night's calibrate step
+   (and each master type — bias/dark/each night's flat) now runs as its
+   own separate `siril-cli` subprocess, orchestrated by
+   `jobs.create_multi_script_job()` (`app/jobs.py`'s `ScriptStep`) — see
+   `app/ssf.py`'s `render_build_masters()`/`render_stack_lights()`, which
+   build the step list instead of one combined script. The *final*
+   register+stack step for a multi-night project is the one place this
+   still can't be split further (merge/register/stack genuinely need
+   every night's data in one Siril session at once) — acceptable since
+   gotcha #8's cost comes from *repeated* calibrate+register cycles, and
+   that final step only ever calls `register` once regardless of night
+   count.
+9. **`shutil.move()` relocates a file — it does not leave a copy behind.**
+   Not actually a Siril gotcha, but hit implementing gotcha #6's fix for
+   masters: the first version had a flat-build step read the shared
+   master bias back from the *bias step's own scratch dir*, reasoning
+   the scratch copy "isn't deleted, only copied/renamed" once moved to
+   its stable location — wrong; `shutil.move()` is a real move (rename on
+   the same filesystem), so the scratch file was already gone by the time
+   the flat step ran, and `calibrate` failed with "invalid arguments."
+   Fixed by having later steps reference the STABLE destination path
+   instead (safe here because steps run in a fixed order — bias's move
+   always completes before any flat step starts).
+10. **Editing any file under `app/` while a job is mid-run kills that
+    job's tracking, but not the underlying `siril-cli` process.**
+    `uvicorn --reload` watches the whole `app/` directory; any edit
+    (including one totally unrelated to the running job) restarts the
+    Python process, wiping the in-memory `_jobs` dict (`app/jobs.py`).
+    The actual OS subprocess already spawned via `subprocess.Popen`
+    doesn't get killed by this — it's reparented to PID 1 and keeps
+    running to completion, writing its log file same as always, but
+    `/jobs/{id}` returns 404 for it from that point on since the tracking
+    object is gone. Hit this for real (2026-09-2x) mid-testing a ~28-frame
+    stack. Not a bug to "fix" so much as a dev-workflow trap: avoid
+    editing `app/` files while watching a long job's progress through the
+    API; if it happens, the job's actual result can still be found on
+    disk (check `process/.../result.fit` and the job's log file directly)
+    even though the API can no longer report on it.
 
 ## Current validated status
 - ✅ Docker build/run/exec loop works on the NAS.
@@ -382,19 +439,49 @@ post-processing elsewhere.
   place night-count still matters. Re-validated end-to-end after the
   change: single-night direct path (no merge) and the two-night merge
   path both re-run successfully against `multi1`'s real data.
-- ❌ `/masters/run` does **not** have the gotcha #6 fix yet — re-running it
-  against a changed frame count in `raw/biases`/`raw/darks`/a night's
-  `raw/.../flats` is unverified and should be assumed unsafe (see gotcha
-  #6's note) until it gets the same disposable-workspace treatment.
-- ❌ `/stack/run` and `/masters/run` still carry gotcha #8's session-
-  degradation risk for projects with several nights — every night's
-  Siril work still runs sequentially in one `siril-cli` session. Nobody's
-  hit this in practice yet for stacking specifically (only 2-night
-  projects tested), but the mechanism is confirmed real (gotcha #8) and
-  should be assumed to compound with night count until proven otherwise
-  or fixed (e.g. one `siril-cli` invocation per night's calibrate step,
-  same idea originally proposed for analyze before photutils replaced it
-  outright).
+- ✅ **`/masters/run` gotcha #6 fix implemented and verified
+  (2026-09-2x)**: bias/dark/each night's flat each build in their own
+  `process/_build/...` scratch dir, wiped fresh every run — see gotcha
+  #6's updated note. Verified by rebuilding masters twice in a row
+  against `multi1`'s real (now 2-night, 28-light) data; both runs
+  succeeded identically, no stale-file bleed-through.
+- ✅ **`/stack/run` and `/masters/run` gotcha #8 fix implemented
+  (2026-09-2x)**: every night's calibrate step (and every master type)
+  now runs as its own independent `siril-cli` subprocess instead of one
+  script covering everything — see the architecture decision above,
+  gotcha #8's updated note, and `jobs.create_multi_script_job()`.
+  Re-validated end-to-end against `multi1`'s real 2-night, 28-light data
+  after the change: masters build (4 independent subprocesses: bias,
+  dark, flat×2) and the full multi-night stack (2 calibrate subprocesses
+  + 1 merge/register/stack subprocess) both re-ran successfully.
+- ✅ **Anomaly-based frame flagging implemented and validated against
+  real known-bad data (2026-09-2x)**: `app/framestats.py`'s
+  `flag_anomalies()` adds a robust (MAD-based) per-metric z-score
+  (`star_count`, `fwhm`, `roundness`, and a new `snr` field — median
+  detected-star flux / background std, added to match astropup-blink's
+  own SNR panel) computed against the rest of each night's own frames,
+  flagging anything at z >= 3.0 on any metric. Chris sent a real
+  astropup-blink screenshot of Night 2 (17 subs, 10 kept / 7 flagged) and
+  identified real problem frames by eye: night1's frame 0001 (elevated
+  background, reduced star count — a subtler "still settling after dusk"
+  case) and night2's frames 0105-0111 (a textbook dawn-twilight ramp:
+  background 635->8756 ADU, star count 368->18, monotonic). Result:
+  correctly flagged 0001 (plus, honestly, two milder frames right after
+  it showing the same "still settling" pattern at a smaller scale — z
+  ~4.3-4.5, a real signal, not noise) and 6 of the 7 twilight frames
+  outright (0106-0111; 0105 itself sits at z~2.7-2.9, just under the 3.0
+  threshold — visible as the start of a clear ramp in the raw z-scores
+  even though it doesn't cross the flag line on its own). Nothing here
+  was tuned to hit these exact frames — defaults were set once, from a
+  single quick pass, before this validation ran.
+- ✅ **Master reuse policy clarified in `StackLightsRequest`'s docstring**
+  (2026-09-2x, no behavior change — this already matched Chris's
+  intent): master bias/dark are shared project-wide; master flat is
+  per-night by default, with `master_flat` as an override for the
+  exception (a night missing its own flats), not a way to force one
+  shared flat across nights. A true *per-night* override (vs. today's
+  single value applied to every night if given) is still not wired up —
+  see Immediate next steps.
 - ❌ **Crop is permanently out of scope**, not deferred — see Architecture
   decisions. Don't reopen this.
 - ❌ Archive/cleanup (the Endstate's last bullet) is explicitly deferred
@@ -451,6 +538,16 @@ still the reference; only where things land on disk changed. `test1`'s
 original `process/result.fit` (this exact flat layout) still exists
 untouched as the original manual validation.
 
+**2026-09-2x follow-up:** the above single combined script is now further
+split into several independent `siril-cli` invocations — one per master
+type and one per night's calibrate step, plus one final register/stack —
+per gotcha #8 (running multiple heavy sequence operations in one Siril
+session is a severe, confirmed performance cliff). See
+`render_build_masters()`/`render_stack_lights()` in `app/ssf.py` and
+`jobs.create_multi_script_job()`. Again, the command sequence inside each
+individual step is unchanged from this reference; only the process
+boundaries and scratch-directory layout changed.
+
 Notes for whoever templates this in Python (see gotcha #2/#3 above for why
 the `raw/` staging layer exists at all — don't collapse it away):
 - All four frame types convert into the same `process/` dir — matches the
@@ -464,53 +561,37 @@ the `raw/` staging layer exists at all — don't collapse it away):
   rejection method, that's the whole parameterization surface.
 
 ## Immediate next steps
-Everything from the prior handoff's list is **done** — split masters/
+Everything from the prior two handoffs' lists is **done**: split masters/
 lights phases, FastAPI render/run + background jobs, progress parsing,
-real multi-night validation, a staging endpoint, and frame review/
-filtering (recommend-only, now on astropy+photutils instead of Siril —
-see "Current validated status") — see that section above for detail.
-Crop is permanently out of scope (Architecture decisions), not deferred.
-Archive/cleanup is explicitly deferred per Chris, not started. What's
-actually next:
+real multi-night validation, a staging endpoint, frame review/filtering
+(recommend-only, on astropy+photutils, with anomaly-based flagging
+validated against real known-bad frames), and both Siril gotcha #6 (stale
+workspace) and #8 (session-degradation) fixes are now in `/masters/run`
+and `/stack/run` too, not just `/lights/analyze` — see "Current validated
+status" above for detail on all of it. Crop is permanently out of scope
+(Architecture decisions), not deferred. Archive/cleanup is explicitly
+deferred per Chris, not started. What's actually left:
 
-1. **Give `/masters/run` the gotcha #6 fix** (disposable workspace,
-   wiped before each run) that `/stack/run` already has. Currently the
-   only piece of the pipeline still writing straight into a persistent
-   directory with no cleanup — low risk in the common "build once"
-   workflow, but unverified and should be fixed before anyone relies on
-   rebuilding masters repeatedly. (`/lights/analyze/run` no longer needs
-   this fix at all — it doesn't touch Siril or that workspace pattern
-   anymore.)
-2. **`/stack/run`/`/masters/run` still carry gotcha #8's session-
-   degradation risk** for many-night projects (every night's Siril work
-   runs sequentially in one session). Not yet a proven problem for
-   stacking specifically, but the mechanism is real and confirmed
-   elsewhere. If a project with several nights turns out slow, this is
-   the first thing to check — likely fix is one `siril-cli` invocation
-   per night's calibrate step instead of one script covering all nights.
-3. **No UI consumes any of this yet** — `/docs` (Swagger) is the only way
+1. **No UI consumes any of this yet** — `/docs` (Swagger) is the only way
    to drive it today. The natural next slice is a real frontend: stage a
    project, kick off masters/stack jobs and watch `percent_complete`/
    `current_command`, and — the interesting part — a `/lights/analyze`
-   review screen (thumbnails or a plot of FWHM/roundness/background per
-   frame, letting a human pick `exclude_frames` before stacking — this is
-   now fast enough, ~8s for 20 frames, to feel interactive rather than
-   "kick off a job and wait"). Take an actual look at astropup-blink's UI
-   before building this — it wasn't inspectable when researched (see
-   Reference material) and might have a specific presentation worth
-   matching.
-4. `master_flat`/`master_dark` overrides in `StackLightsRequest` currently
-   apply uniformly to *all* nights if given — fine for now, but if a real
-   workflow needs a *per-night* override too (e.g. reusing one specific
-   night's master library entry), that's not wired up.
-5. Frame-review numbers (FWHM/roundness/background/star-count) are
-   returned raw with no computed "this one looks off" flag — Chris asked
-   for recommendations, and right now a human has to eyeball the numbers
-   themselves. A simple z-score-per-metric flag (still purely advisory,
-   never auto-excluding) would close that gap without contradicting the
-   recommend-don't-filter decision.
-6. `IRAFStarFinder`'s `threshold_sigma`/`bin_factor` defaults (8.0 / 4)
-   were picked from one quick pass against real data (getting a sane,
-   non-saturated star count), not rigorously tuned — fine for a v1
-   review tool, but worth another look once there's more than one
-   target's worth of data to check them against.
+   review screen (per-metric sparklines/bars with flagged frames
+   highlighted, a large-preview blink comparator between two frames, in
+   the spirit of the astropup-blink screenshot Chris sent — see Reference
+   material) letting a human pick `exclude_frames` before stacking. This
+   is fast enough now (~8s for 20 frames) to feel interactive rather than
+   "kick off a job and wait." The screenshot also showed actual image
+   thumbnails mattering, not just numbers (a visible satellite/plane
+   trail in one frame) — `/lights/analyze` doesn't generate or serve any
+   preview image today, only numeric stats; a real review UI will likely
+   need one.
+2. **Per-night master overrides aren't wired up.** `master_dark`/
+   `master_flat` on `StackLightsRequest` are single values applied
+   uniformly to every requested night if given. That's correct for
+   `master_dark` (genuinely shared — see the master reuse policy in
+   Architecture decisions), but `master_flat` really wants a *per-night*
+   override (e.g. "night3 is missing its own flats, reuse night2's" or a
+   library entry) rather than one value forced onto every night in the
+   request. Not built — flagged, not attempted, since Chris scoped this
+   round to 1/2/5/6 and explicitly excluded this one.

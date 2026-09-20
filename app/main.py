@@ -56,48 +56,75 @@ def stage_project(name: str, req: StageProjectRequest | None = None):
     return {"project": name, "staged": summary}
 
 
+def _render_steps_text(steps: list[ssf.SirilStep]) -> str:
+    """Join several independent siril-cli scripts into one dry-run preview,
+    clearly marked as separate invocations — see Handoff.md gotcha #8 for
+    why /masters and /stack no longer run as a single combined script.
+    """
+    parts = []
+    for i, step in enumerate(steps):
+        parts.append(f"# ==== siril-cli invocation {i + 1}/{len(steps)}: {step.label} ====\n{step.script}")
+    return "\n".join(parts)
+
+
+def _run_steps(steps: list[ssf.SirilStep], project: Path) -> dict:
+    """Wipe each step's fresh_dir, wire up its move (if any), and hand the
+    whole list to jobs.create_multi_script_job() — one subprocess per
+    step, in order (Handoff.md gotcha #8).
+    """
+    ssf.prepare_fresh_dirs([s.fresh_dir for s in steps if s.fresh_dir is not None])
+    job_steps = [
+        jobs.ScriptStep(
+            script=s.script,
+            workdir=s.workdir,
+            label=s.label,
+            on_success=(lambda move=s.move: ssf.perform_move(move)) if s.move else None,
+        )
+        for s in steps
+    ]
+    job = jobs.create_multi_script_job(job_steps, project / "logs")
+    return {"job_id": job.id}
+
+
 @app.post("/projects/{name}/masters/render", response_class=PlainTextResponse)
 def render_masters(name: str, req: BuildMastersRequest):
     project = _project_or_404(name)
     try:
-        return ssf.render_build_masters(project, req).text
+        steps = ssf.render_build_masters(project, req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _render_steps_text(steps)
 
 
 @app.post("/projects/{name}/masters/run")
 def run_masters(name: str, req: BuildMastersRequest):
     project = _project_or_404(name)
     try:
-        rendered = ssf.render_build_masters(project, req)
+        steps = ssf.render_build_masters(project, req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    for d in rendered.ensure_dirs:
-        d.mkdir(parents=True, exist_ok=True)
-    job = jobs.create_job(rendered.text, project, project / "logs")
-    return {"job_id": job.id}
+    return _run_steps(steps, project)
 
 
 @app.post("/projects/{name}/stack/render", response_class=PlainTextResponse)
 def render_stack(name: str, req: StackLightsRequest):
     project = _project_or_404(name)
     try:
-        return ssf.render_stack_lights(project, req).text
+        steps, _nights, _selections = ssf.render_stack_lights(project, req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _render_steps_text(steps)
 
 
 @app.post("/projects/{name}/stack/run")
 def run_stack(name: str, req: StackLightsRequest):
     project = _project_or_404(name)
     try:
-        rendered = ssf.render_stack_lights(project, req)
+        steps, _nights, selections = ssf.render_stack_lights(project, req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    ssf.prepare_fresh_dirs(rendered.fresh_dirs)
-    ssf.apply_light_selections(rendered.light_selections)
-    job = jobs.create_job(rendered.text, project, project / "logs")
-    return {"job_id": job.id}
+    ssf.apply_light_selections(selections)
+    return _run_steps(steps, project)
 
 
 @app.post("/projects/{name}/lights/analyze/render")
@@ -148,9 +175,13 @@ def run_analyze(name: str, req: AnalyzeLightsRequest):
                     f"analyzing {target.key}: {f.name} ({done + 1}/{total_files})",
                 )
                 stats = framestats.analyze_frame(f, bin_factor=req.bin_factor, threshold_sigma=req.threshold_sigma)
-                night_stats.append(stats.__dict__)
+                night_stats.append(stats)
                 done += 1
-            result["nights"][target.key] = night_stats
+            # Anomaly flagging compares each frame against the rest of
+            # THIS night only (see flag_anomalies' docstring) — done after
+            # the whole night's stats are in, not per-frame.
+            framestats.flag_anomalies(night_stats)
+            result["nights"][target.key] = [s.__dict__ for s in night_stats]
         return result
 
     job = jobs.create_python_job(work, project / "logs", workdir=project)

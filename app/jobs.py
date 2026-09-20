@@ -1,13 +1,21 @@
 """Minimal in-memory background job manager.
 
 Stacking runs can take an hour+ (see Handoff.md), so /masters/run and
-/stack/run can't block the request thread. `create_job()` runs siril-cli
-in a background thread and exposes status, parsed progress, and a rolling
-"current_line" plus the full log file for polling from the UI.
-`create_python_job()` runs an arbitrary Python callable the same way
-instead — used by /lights/analyze (app/framestats.py), which doesn't
-invoke Siril at all. Both share the same Job/snapshot shape so /jobs/{id}
-doesn't need to know which kind it's looking at.
+/stack/run can't block the request thread. Three ways to run one:
+- `create_job()` — a single siril-cli invocation in a background thread.
+- `create_multi_script_job()` — SEVERAL independent siril-cli invocations,
+  run one after another as SEPARATE subprocesses within one job. This
+  exists specifically for gotcha #8: running multiple sequences'
+  calibrate+register in *one* Siril session causes a severe, confirmed
+  performance cliff (identical work: 10s alone vs 90s as the 2nd sequence
+  in one process). Giving each night (or each master type) its own fresh
+  siril-cli process sidesteps that entirely — see app/ssf.py's
+  render_stack_lights()/render_build_masters(), which build the step list.
+- `create_python_job()` — an arbitrary Python callable, no Siril at all;
+  used by /lights/analyze (app/framestats.py).
+
+All three share the same Job/snapshot shape so /jobs/{id} doesn't need to
+know which kind it's looking at.
 
 Intentionally simple (no persistence, no multi-worker coordination) — good
 enough for a single-user, single-process FastAPI app on one NAS box. If
@@ -123,6 +131,97 @@ def create_job(
                     with job._lock:
                         job.result = result
                 except Exception as exc:  # defensive: e.g. .seq parsing hiccup
+                    with job._lock:
+                        job.error = f"post-processing failed: {exc}"
+        except Exception as exc:  # defensive: e.g. siril binary missing
+            with job._lock:
+                job.status = "failed"
+                job.error = str(exc)
+        finally:
+            with job._lock:
+                job.ended_at = time.time()
+                if job.status == "succeeded":
+                    job.percent_complete = 100.0
+
+    threading.Thread(target=_run, daemon=True, name=f"job-{job_id}").start()
+    return job
+
+
+@dataclass
+class ScriptStep:
+    """One independent siril-cli invocation within a create_multi_script_job()
+    run. `on_success`, if given, runs immediately after this step's exit
+    code is 0 and *before* the next step starts — e.g. moving a just-built
+    master_bias.fit to its stable location so the next step (a flat build)
+    can reference it there. A step's own failure stops the whole job;
+    later steps never run.
+    """
+
+    script: str
+    workdir: Path
+    label: str  # shown in progress messages, e.g. "night1 calibrate", "master_bias"
+    on_success: Optional[Callable[[], None]] = None
+
+
+def create_multi_script_job(
+    steps: list[ScriptStep],
+    log_dir: Path,
+    on_all_success: Optional[Callable[[], dict]] = None,
+) -> Job:
+    """Run several independent siril-cli invocations in order, each its own
+    subprocess (see module docstring — this is the gotcha #8 fix). All
+    steps' output appends to one shared log file. Stops at the first
+    failing step; `on_all_success()`, if given, runs once every step has
+    succeeded, and its return value is stored as job.result.
+    """
+    job_id = uuid.uuid4().hex[:12]
+    log_path = log_dir / f"{job_id}.log"
+    job = Job(id=job_id, workdir=steps[0].workdir if steps else log_dir, log_path=log_path)
+    with _registry_lock:
+        _jobs[job_id] = job
+
+    total = len(steps)
+
+    def _run() -> None:
+        with job._lock:
+            job.status = "running"
+            job.started_at = time.time()
+        try:
+            for i, step in enumerate(steps):
+                base = i / total * 100.0 if total else 0.0
+                span = 100.0 / total if total else 100.0
+
+                def on_line(line: str, base=base, span=span, label=step.label) -> None:
+                    with job._lock:
+                        job.current_line = f"[{label}] {line}"
+                        m = _COMMAND_RE.search(line)
+                        if m:
+                            job.current_command = m.group(1)
+                        m = _PROGRESS_RE.search(line)
+                        if m:
+                            job.percent_complete = base + float(m.group(1)) / 100.0 * span
+
+                rc = siril_runner.run_script(
+                    step.script, step.workdir, log_path, on_line=on_line, append_log=(i > 0)
+                )
+                if rc != 0:
+                    with job._lock:
+                        job.return_code = rc
+                        job.status = "failed"
+                        job.error = f"step {i + 1}/{total} ({step.label}) failed"
+                    return
+                if step.on_success is not None:
+                    step.on_success()
+
+            with job._lock:
+                job.return_code = 0
+                job.status = "succeeded"
+            if on_all_success is not None:
+                try:
+                    result = on_all_success()
+                    with job._lock:
+                        job.result = result
+                except Exception as exc:  # defensive
                     with job._lock:
                         job.error = f"post-processing failed: {exc}"
         except Exception as exc:  # defensive: e.g. siril binary missing
