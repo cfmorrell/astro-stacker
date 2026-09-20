@@ -42,7 +42,23 @@ post-processing elsewhere.
   bullet below. Calibration/registration/stacking stay on Siril; it's
   validated and does real geometric-transform/stacking work not worth
   reimplementing.
-- No file-browser UI for v1 — typed directory paths.  Will eventually want to add some file management (pull lights/flats from telescope controller, darks/biases from server, copy remote/link local files into working directory for processing). Once complete, archive files as directed.
+- No file-browser UI for v1 — typed directory paths. **Superseded
+  2026-09-2x**: `/captures/browse` + the frontend's Stage section now
+  give a basic folder picker (no breadcrumbs yet — see Immediate next
+  steps). Still wanted eventually: pulling lights/flats from a telescope
+  controller, darks/biases from a server, and archiving files once done.
+- **Frontend: plain HTML/CSS/JS in `app/static/`, no build step, no
+  framework** (settled 2026-09-2x). Chris asked for astrolab's dark
+  card-based *styling* but this project's own *functionality* — closer to
+  Siril's own OSC Multi-Night Stacking tool (stage -> masters -> review ->
+  stack), not astrolab's much bigger pipeline (BG Extract/Denoise/Color
+  Balance are explicitly out of scope — see the Endstate/"raw stack" and
+  crop decisions). Served directly by FastAPI (`StaticFiles` mounted last
+  in `app/main.py`, so it never shadows an API route). No React/Vue/build
+  tooling — matches the project's own minimalism (single repo, one
+  maintainer, CPU-only NAS box) and keeps the whole thing inspectable as
+  plain files. Revisit only if the UI's complexity genuinely outgrows
+  this, not preemptively.
 - Long-running jobs (stacking can take an hour+) need background
   execution + log streaming, not a blocking HTTP request. Built as a
   minimal in-thread job manager (`app/jobs.py`) — good enough for a
@@ -321,7 +337,65 @@ post-processing elsewhere.
     disk (check `process/.../result.fit` and the job's log file directly)
     even though the API can no longer report on it.
 
+## Frontend/web gotchas (do not rediscover these either)
+Found building `app/static/` (2026-09-2x) — Python/browser issues, not
+Siril ones, but the same "don't rediscover this" spirit applies.
+
+1. **`Path.resolve()` follows symlinks — don't use it for a
+   traversal-safety check on a path that's *supposed* to point outside
+   the directory you're checking containment against.** The first version
+   of `GET /projects/{name}/preview` resolved the requested path and
+   checked the RESOLVED path was under the project dir. Every raw light/
+   flat under `raw/` is itself a symlink into `CAPTURES_DIR` by design
+   (`app/staging.py`) — so its resolved target is *never* under the
+   project dir, and every single raw-frame preview request was rejected
+   with "path escapes project directory." Fixed by checking the
+   LEXICAL path instead (reject `..` components / absolute paths in the
+   untrusted string) and letting `open()`/`is_file()` follow the symlink
+   naturally — the security property that actually matters (can't read
+   `../../etc/passwd`) doesn't need symlink resolution to enforce.
+2. **`<img loading="lazy">` triggers on proximity to the *viewport*, not
+   to a scrolling ancestor container.** The Review section's frame strip
+   scrolls horizontally (`overflow-x: auto`); images past the initially
+   visible ~6 cards never entered the viewport itself, so lazy loading
+   correctly-by-spec never fired for them — they just sat "loading"
+   forever until a user happened to scroll the strip. Confirmed via a
+   scripted browser test (7/11 loaded, stuck indefinitely; scrolling the
+   strip to the end immediately loaded the rest). Fixed by dropping
+   `loading="lazy"` for these thumbnails — predictable "everything loads
+   when analysis completes" beats saving bandwidth on a review screen
+   with at most a few dozen frames.
+3. **Decoding a full-resolution FITS array just to make a 320px
+   thumbnail wastes the expensive part of the work.** `PIL`'s
+   `.thumbnail()` only shrinks the *output* — the percentile/stretch
+   computation (`app/imaging.py`) still runs over the full ~26M-pixel
+   array first. Fixed the same way `app/framestats.py` did for analysis
+   speed: stride-downsample the array *before* the stretch, sized to the
+   requested `max_size`. The frontend requests `max_size=320` for the
+   review grid and the full default (1024) for the one large stack
+   result preview.
+
 ## Current validated status
+- ✅ **First-version frontend built and validated end-to-end against real
+  data (2026-09-2x)**: `app/static/` (`index.html`/`app.js`/`styles.css`),
+  served by FastAPI. Covers the full flow — stage (with a `/captures`
+  folder picker), build masters, review lights (per-frame thumbnails,
+  metric bars, anomaly flags, exclude checkboxes), and stack (picks up
+  the review's exclusions, shows the final `result.fit`) — against
+  `multi1`'s real two-night data. New backend support behind it:
+  `GET /projects` (list), `GET /projects/{name}/status` (what's staged/
+  built/run, read from the filesystem, not tracked state), `GET
+  /captures/browse` (read-only folder picker), and `GET
+  /projects/{name}/preview` (`app/imaging.py`: FITS -> stretched PNG
+  quick-look, for both raw lights and finished stacks). Tested with a
+  scripted headless-Chrome session (Chrome DevTools Protocol, no
+  Puppeteer needed) driving real clicks through stage/analyze/exclude/
+  stack-preview, not just eyeballing a static screenshot — this is what
+  caught both bugs in the Frontend/web gotchas section above before
+  Chris ever saw them. Styling follows astrolab's dark card-based look;
+  functionality follows Siril's own OSC Multi-Night Stacking tool
+  (per Chris) rather than astrolab's much larger pipeline. See Immediate
+  next steps for what this first pass doesn't cover yet.
 - ✅ Docker build/run/exec loop works on the NAS.
 - ✅ git push works with the repo-local SSH key.
 - ✅ `siril-cli` invocation confirmed correct (gotcha #1 above).
@@ -561,37 +635,42 @@ the `raw/` staging layer exists at all — don't collapse it away):
   rejection method, that's the whole parameterization surface.
 
 ## Immediate next steps
-Everything from the prior two handoffs' lists is **done**: split masters/
+Everything from the prior handoffs' lists is **done**: split masters/
 lights phases, FastAPI render/run + background jobs, progress parsing,
 real multi-night validation, a staging endpoint, frame review/filtering
 (recommend-only, on astropy+photutils, with anomaly-based flagging
-validated against real known-bad frames), and both Siril gotcha #6 (stale
-workspace) and #8 (session-degradation) fixes are now in `/masters/run`
-and `/stack/run` too, not just `/lights/analyze` — see "Current validated
-status" above for detail on all of it. Crop is permanently out of scope
-(Architecture decisions), not deferred. Archive/cleanup is explicitly
-deferred per Chris, not started. What's actually left:
+validated against real known-bad frames), both Siril gotcha #6/#8 fixes
+in `/masters/run` and `/stack/run`, and now a first-version frontend (see
+"Current validated status" for all of it). Crop is permanently out of
+scope (Architecture decisions), not deferred. Archive/cleanup is
+explicitly deferred per Chris, not started. What's actually left:
 
-1. **No UI consumes any of this yet** — `/docs` (Swagger) is the only way
-   to drive it today. The natural next slice is a real frontend: stage a
-   project, kick off masters/stack jobs and watch `percent_complete`/
-   `current_command`, and — the interesting part — a `/lights/analyze`
-   review screen (per-metric sparklines/bars with flagged frames
-   highlighted, a large-preview blink comparator between two frames, in
-   the spirit of the astropup-blink screenshot Chris sent — see Reference
-   material) letting a human pick `exclude_frames` before stacking. This
-   is fast enough now (~8s for 20 frames) to feel interactive rather than
-   "kick off a job and wait." The screenshot also showed actual image
-   thumbnails mattering, not just numbers (a visible satellite/plane
-   trail in one frame) — `/lights/analyze` doesn't generate or serve any
-   preview image today, only numeric stats; a real review UI will likely
-   need one.
-2. **Per-night master overrides aren't wired up.** `master_dark`/
+1. **The frontend is a first pass, not a finished UI.** Chris said "let's
+   see where we land" — this is that first landing, not the destination.
+   Known gaps, roughly in order of what'll be noticed first: no way to
+   *remove* a staged night or re-stage over one that already exists from
+   the UI (the API supports re-running `/stage`, the form just doesn't
+   pre-fill from what's already there); the folder browser
+   (`/captures/browse`) has no breadcrumb trail, just an "← up" button;
+   no polling/auto-refresh of project status while a job from *another*
+   browser tab or the Swagger UI is running; the exclude-frames list is
+   global across nights in one request (matches the API's own semantics,
+   see gotcha-adjacent note in `StackLightsRequest`, but worth a UI hint
+   if it ever causes confusion); no way to browse job history (only the
+   most recently started job's progress is shown per section, nothing
+   persists across a page reload). None of these are hard, just not done.
+2. **No image thumbnails for the *stack* preview's intermediate steps** —
+   only the raw lights (Review) and the final `result.fit` (Stack) get
+   previews. A real "blink through everything" experience closer to the
+   astropup-blink screenshot would also want previews of e.g. per-night
+   master flats, for spotting a bad flat before it ruins a whole night's
+   calibration.
+3. **Per-night master overrides aren't wired up.** `master_dark`/
    `master_flat` on `StackLightsRequest` are single values applied
    uniformly to every requested night if given. That's correct for
    `master_dark` (genuinely shared — see the master reuse policy in
    Architecture decisions), but `master_flat` really wants a *per-night*
    override (e.g. "night3 is missing its own flats, reuse night2's" or a
    library entry) rather than one value forced onto every night in the
-   request. Not built — flagged, not attempted, since Chris scoped this
-   round to 1/2/5/6 and explicitly excluded this one.
+   request. Not built — flagged, not attempted; the frontend's Stack
+   section only exposes the existing global override for the same reason.

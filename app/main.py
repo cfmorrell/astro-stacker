@@ -1,8 +1,10 @@
 """FastAPI app: render .ssf scripts (dry-run) or run them as background jobs.
 
-No file-browser UI yet beyond /projects/{name}/stage — everything else
-still takes typed directory/project names, matching the on-disk layout
-(raw/, process/) documented in app/ssf.py's module docstring.
+Also serves the first-version frontend (app/static/, mounted at the very
+end of this file) — a plain HTML/CSS/JS page with no build step, styled
+after astrolab's dark card-based UI but scoped to this project's own
+functionality (stage -> masters -> analyze/review -> stack), closer in
+spirit to Siril's own OSC Multi-Night Stacking tool. See Handoff.md.
 """
 
 from __future__ import annotations
@@ -10,9 +12,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
+from fastapi.staticfiles import StaticFiles
 
-from . import config, framestats, jobs, ssf, staging
+from . import config, framestats, imaging, jobs, ssf, staging, status
 from .models import (
     AnalyzeLightsRequest,
     BuildMastersRequest,
@@ -21,6 +24,8 @@ from .models import (
 )
 
 app = FastAPI(title="astro-stacker")
+
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 
 def _project_path(name: str) -> Path:
@@ -40,6 +45,65 @@ def _project_or_404(name: str) -> Path:
 @app.get("/health")
 def health():
     return {"status": "ok", "siril_bin": config.SIRIL_BIN, "projects_dir": str(config.PROJECTS_DIR)}
+
+
+@app.get("/projects")
+def list_projects():
+    if not config.PROJECTS_DIR.is_dir():
+        return {"projects": []}
+    return {"projects": sorted(p.name for p in config.PROJECTS_DIR.iterdir() if p.is_dir())}
+
+
+@app.get("/projects/{name}/status")
+def project_status(name: str):
+    project = _project_or_404(name)
+    return status.project_status(project)
+
+
+@app.get("/captures/browse")
+def browse_captures(path: str = ""):
+    """List subdirectories under CAPTURES_DIR (read-only) so the frontend
+    can offer a folder picker for /projects/{name}/stage instead of
+    requiring exact paths to be typed — matches the reference Siril
+    multi-night tool's "Browse..." buttons for lights/darks/flats/biases.
+    """
+    base = config.CAPTURES_DIR.resolve()
+    target = (base / path).resolve() if path else base
+    if target != base and base not in target.parents:
+        raise HTTPException(status_code=400, detail="path escapes CAPTURES_DIR")
+    if not target.is_dir():
+        raise HTTPException(status_code=404, detail=f"not a directory under captures: {path!r}")
+    dirs = sorted(p.name for p in target.iterdir() if p.is_dir())
+    fit_count = sum(1 for pat in ("*.fit", "*.fits") for _ in target.glob(pat))
+    return {"path": path, "dirs": dirs, "fit_count": fit_count}
+
+
+@app.get("/projects/{name}/preview")
+def project_preview(name: str, path: str, max_size: int = imaging.DEFAULT_MAX_SIZE):
+    """Quick-look PNG for a FITS file inside this project (a raw light,
+    during review, or a finished result.fit) — see app/imaging.py. `path`
+    is relative to the project dir; rejects anything that would escape it.
+
+    Deliberately checks the LEXICAL path, not the symlink-resolved one:
+    every raw light/flat under raw/ is itself a symlink pointing outside
+    the project entirely, into CAPTURES_DIR (see app/staging.py) — that's
+    by design, not a traversal attempt. Resolving symlinks before the
+    containment check (an earlier version did this) rejected every raw
+    frame preview with "path escapes project directory", since the
+    resolved target is never actually under the project dir.
+    """
+    project = _project_or_404(name)
+    rel = Path(path)
+    if rel.is_absolute() or ".." in rel.parts:
+        raise HTTPException(status_code=400, detail="path escapes project directory")
+    candidate = project / rel
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail=f"file not found: {path!r}")
+    try:
+        png_bytes = imaging.render_preview_png(candidate, max_size=max_size)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"could not render preview: {exc}") from exc
+    return Response(content=png_bytes, media_type="image/png")
 
 
 @app.post("/projects/{name}/stage")
@@ -204,3 +268,10 @@ def job_log(job_id: str):
     if not job.log_path.exists():
         return ""
     return job.log_path.read_text()
+
+
+# Mounted last, deliberately: Starlette matches routes in registration
+# order, so every API route above still wins over this catch-all. Only
+# unmatched paths (/, /app.js, /styles.css, ...) fall through to here.
+if STATIC_DIR.is_dir():
+    app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
