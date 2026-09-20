@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ssh -o RemoteCommand=none -o RequestTTY=no astro-stacker 'docker exec astro-stacker-dev bash -lc '\\\\'' *)"
+    ]
+  }
+}

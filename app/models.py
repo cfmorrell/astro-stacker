@@ -43,6 +43,17 @@ class BuildMastersRequest(BaseModel):
 
     stack: StackOptions = Field(default_factory=StackOptions)
 
+    model_config = {
+        # Without this, Swagger UI's "Example Value" falls back to a
+        # generic type-based placeholder for every field (learned the hard
+        # way: see StackLightsRequest below). Harmless here since the only
+        # field is a nested model with real defaults, but kept for symmetry
+        # and in case fields are added later.
+        "json_schema_extra": {
+            "example": {"stack": {"method": "rej", "sigma_low": 3.0, "sigma_high": 3.0}}
+        }
+    }
+
 
 class StackLightsRequest(BaseModel):
     """Calibrate, register, and stack lights into project_dir/process/result.fit.
@@ -60,3 +71,23 @@ class StackLightsRequest(BaseModel):
     is_osc: bool = True  # False drops -cfa/-equalize_cfa/-debayer for mono cameras
     master_dark: Optional[str] = None  # absolute path override; default process/master_dark
     master_flat: Optional[str] = None  # absolute path override; default process/master_flat
+
+    model_config = {
+        # FastAPI/Swagger has no way to know [""] is a meaningful sentinel
+        # (single-night default) rather than an empty placeholder, and its
+        # auto-generated "Example Value" fills every plain str/list[str]
+        # field with the literal word "string" — which is a valid-looking
+        # night name and silently produces raw/string/lights, a directory
+        # that will never exist. This explicit example is what Swagger UI
+        # shows instead, so "Try it out" round-trips a request that actually
+        # works unedited.
+        "json_schema_extra": {
+            "example": {
+                "nights": [""],
+                "stack": {"method": "rej", "sigma_low": 3.0, "sigma_high": 3.0},
+                "is_osc": True,
+                "master_dark": None,
+                "master_flat": None,
+            }
+        }
+    }

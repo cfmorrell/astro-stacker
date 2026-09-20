@@ -88,6 +88,20 @@ def render_stack_lights(project: Path, req: StackLightsRequest) -> RenderedScrip
                 }
             )
 
+    # Fail fast with a clear message instead of handing siril-cli a path
+    # that doesn't exist — a `cd` into a missing dir buries the real
+    # problem 20+ lines into Siril's own log output (see Handoff.md
+    # gotcha #2). This is also what catches a Swagger UI "Try it out"
+    # request sent with its auto-filled placeholder values unedited
+    # (e.g. nights=["string"]) before it ever reaches siril-cli.
+    for night in nights:
+        if not Path(night["raw_lights"]).is_dir():
+            raise ValueError(
+                f"lights directory not found: {night['raw_lights']!r} "
+                "(check the project's raw/ layout, or the `nights` list "
+                "if this is a multi-night request)"
+            )
+
     # No extension: Siril's calibrate -dark=/-flat= take a bare name and
     # resolve the .fit/.fits/.fit.fz file themselves, matching how the
     # validated script references "master_dark"/"master_flat" (produced by
@@ -95,6 +109,15 @@ def render_stack_lights(project: Path, req: StackLightsRequest) -> RenderedScrip
     # command itself).
     dark_master = req.master_dark or str(process / "master_dark")
     flat_master = req.master_flat or str(process / "master_flat")
+
+    for label, master in (("dark", dark_master), ("flat", flat_master)):
+        if not (Path(master).exists() or Path(master + ".fit").exists()):
+            raise ValueError(
+                f"master {label} not found at {master!r} (or {master}.fit) — "
+                "build masters first via /masters/run, or pass an explicit "
+                f"master_{label} override that points at a real file"
+            )
+
     osc_flags = " -cfa -equalize_cfa -debayer" if req.is_osc else ""
 
     template = _env.get_template("calibrate_stack.ssf.j2")
