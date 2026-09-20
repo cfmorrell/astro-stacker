@@ -8,6 +8,14 @@ stacked `.fit`. All further processing (stretching, star removal, color
 work) happens in other software, outside this tool. Deliberately **not**
 trying to be a full workbench.
 
+## Endstate
+A docker contained self hosted web app where I can complete the following:
+- Pull together lights/flats/darks/biases for processing and eventual archival
+- Review, rate, and with human in the loop filter light frames by FWHM, Star Count, Eccentricity, and/or SNR
+- Build the siril script to conduct multi-night image calibration and stacking
+- Execute said script with the result of a single stacked .fit file that can then be postprocessed in other software. The user should be aware of the steps of the process and have approximate percentages/time until completion/etc. available.
+- Once images have been appropriately archived, the working directory should be cleaned up to avoid data bloat.
+
 ## Why this exists (brief history)
 Started by evaluating `bscholer/astrolab` for UnRAID. Diagnosed a real,
 confirmed-in-source gap: astrolab's calibration matcher only ever reads a
@@ -29,7 +37,7 @@ post-processing elsewhere.
   chose this.
 - Backend: FastAPI, templates `.ssf` scripts, shells out to `siril-cli`.
   No sirilpy live-session integration — headless CLI only.
-- No file-browser UI for v1 — typed directory paths.
+- No file-browser UI for v1 — typed directory paths.  Will eventually want to add some file management (pull lights/flats from telescope controller, darks/biases from server, copy remote/link local files into working directory for processing). Once complete, archive files as directed.
 - Long-running jobs (stacking can take an hour+) need background
   execution + log streaming, not a blocking HTTP request. Not yet built.
 - GPU: CPU-only (`:cpu`, no NVIDIA Container Toolkit on this box).
@@ -52,7 +60,7 @@ post-processing elsewhere.
   `.ssf` scripts (`OSC_Preprocessing*.ssf`, etc.) for reference syntax.
 - **Licensing:** rolandet's and free-astro's scripts are GPLv3. If this
   repo goes public and substantially reuses their logic, it inherits that
-  obligation. Currently private on GitHub for this reason.
+  obligation. Currently private on GitHub for this reason.  Assume eventual GPLv3.
 
 ## Environment / paths (confirmed, don't ask again)
 - NAS: UnRAID, host `FractalR5Tower`, SSH alias `unraid`.
