@@ -104,19 +104,49 @@ def project_preview(
     path: str,
     max_size: int = imaging.DEFAULT_MAX_SIZE,
     stretch: str = imaging.DEFAULT_STRETCH,
+    debayer: bool = False,
 ):
     """Quick-look PNG for a FITS file inside this project (a raw light,
     during review, or a finished result.fit) — see app/imaging.py.
     `stretch` is one of "none"/"linked"/"unlinked" (only meaningfully
-    different for multi-channel calibrated/stacked data).
+    different for multi-channel calibrated/stacked data). `debayer` only
+    matters for a raw (single-plane) OSC sub — the frontend passes it
+    based on this project's own `is_osc` setting (see /status).
     """
     project = _project_or_404(name)
     candidate = _project_relative_file(project, path)
     try:
-        png_bytes = imaging.render_preview_png(candidate, max_size=max_size, stretch=stretch)
+        png_bytes = imaging.render_preview_png(candidate, max_size=max_size, stretch=stretch, debayer=debayer)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"could not render preview: {exc}") from exc
     return Response(content=png_bytes, media_type="image/png")
+
+
+@app.get("/projects/{name}/browse")
+def browse_project(name: str, path: str = ""):
+    """List subdirectories and .fit/.fits files under this project's own
+    directory, for the Stack section's master dark/flat override file
+    pickers (see app/static/) — distinct from /captures/browse, which
+    browses the read-only source captures instead. Files are returned
+    with their absolute path since that's what StackLightsRequest's
+    master_dark/master_flat overrides expect (see app/ssf.py).
+    """
+    project = _project_or_404(name)
+    base = project.resolve()
+    target = (base / path).resolve() if path else base
+    if target != base and base not in target.parents:
+        raise HTTPException(status_code=400, detail="path escapes project directory")
+    if not target.is_dir():
+        raise HTTPException(status_code=404, detail=f"not a directory in project: {path!r}")
+    dirs = sorted(p.name for p in target.iterdir() if p.is_dir())
+    files = sorted(
+        (p.name for p in target.iterdir() if p.is_file() and p.suffix.lower() in (".fit", ".fits")),
+    )
+    return {
+        "path": path,
+        "dirs": dirs,
+        "files": [{"name": name_, "abs_path": str(target / name_)} for name_ in files],
+    }
 
 
 @app.get("/projects/{name}/download")
@@ -267,7 +297,7 @@ def run_analyze(name: str, req: AnalyzeLightsRequest):
             # Anomaly flagging compares each frame against the rest of
             # THIS night only (see flag_anomalies' docstring) — done after
             # the whole night's stats are in, not per-frame.
-            framestats.flag_anomalies(night_stats)
+            framestats.flag_anomalies(night_stats, z_threshold=req.anomaly_sigma)
             # Chronological, not filename, order: failed frames tend to
             # come in clumps (clouds rolling through, dusk/dawn), which
             # only reads clearly if the sequence is in actual capture

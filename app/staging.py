@@ -77,6 +77,8 @@ def stage_project(project: Path, req: StageProjectRequest) -> dict:
         summary["darks"] = _link_dir(source, project / "raw" / "darks")
 
     nights_summary: dict = {}
+    meta = config.read_project_meta(project)
+    night_labels: dict = meta.setdefault("night_labels", {})
     for night in req.nights:
         if not night.name or "/" in night.name or night.name in (".", ".."):
             raise ValueError(f"invalid night name: {night.name!r}")
@@ -87,7 +89,18 @@ def stage_project(project: Path, req: StageProjectRequest) -> dict:
             "lights": _link_dir(lights_source, night_root / "lights"),
             "flats": _link_dir(flats_source, night_root / "flats"),
         }
+        # The frontend never asks for a night name (auto-numbered night1,
+        # night2, ...) but Chris wants the checkboxes elsewhere in the UI
+        # to show whatever the SOURCE folder was actually called (e.g. his
+        # real capture folders are literally "Night 1"/"Night 2") — so
+        # remember that original folder name here, keyed by our internal
+        # name, purely for display.
+        night_labels[night.name] = Path(night.lights_dir).parent.name or night.name
     if nights_summary:
         summary["nights"] = nights_summary
+
+    if req.is_osc is not None:
+        meta["is_osc"] = req.is_osc
+    config.write_project_meta(project, meta)
 
     return summary

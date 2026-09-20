@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from . import config
+
 _FIT_SUFFIXES = ("*.fit", "*.fits")
 
 
@@ -26,6 +28,8 @@ def _master_exists(path_no_ext: Path) -> bool:
 def project_status(project: Path) -> dict:
     raw = project / "raw"
     process = project / "process"
+    meta = config.read_project_meta(project)
+    night_labels = meta.get("night_labels", {})
 
     nights = []
     nights_dir = raw / "nights"
@@ -42,6 +46,12 @@ def project_status(project: Path) -> dict:
             nights.append(
                 {
                     "name": name,
+                    # What the source capture folder was actually called
+                    # (e.g. "Night 1") — for display only; every internal
+                    # path/API call still uses `name`. Falls back to
+                    # `name` itself for projects staged before this was
+                    # tracked (app/staging.py).
+                    "label": night_labels.get(name, name),
                     "light_count": _count_fits(night_dir / "lights"),
                     "flat_count": _count_fits(night_dir / "flats"),
                     "master_flat_built": _master_exists(night_process / "master_flat"),
@@ -60,6 +70,9 @@ def project_status(project: Path) -> dict:
         "master_dark_built": _master_exists(process / "master_dark"),
         "nights": nights,
         "merged_result_path": merged_rel if (project / merged_rel).exists() else None,
+        # Defaults True (matches StackLightsRequest.is_osc's own default)
+        # for projects staged before this setting existed.
+        "is_osc": meta.get("is_osc", True),
     }
 
 

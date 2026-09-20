@@ -154,6 +154,15 @@ class AnalyzeLightsRequest(BaseModel):
         gt=0,
         description="Star-detection threshold, in multiples of background std above the median.",
     )
+    anomaly_sigma: float = Field(
+        default=3.0,
+        gt=0,
+        description=(
+            "How many standard deviations a frame's star_count/fwhm/roundness/snr must be "
+            "from the rest of that night's own frames to get flagged. Lower = more sensitive "
+            "(more flags, more false positives); higher = only the clearest outliers."
+        ),
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -162,6 +171,7 @@ class AnalyzeLightsRequest(BaseModel):
                 "exclude_frames": [],
                 "bin_factor": 4,
                 "threshold_sigma": 8.0,
+                "anomaly_sigma": 3.0,
             }
         }
     }
@@ -196,6 +206,7 @@ class StageProjectRequest(BaseModel):
     biases_dir: Optional[str] = "biases"  # relative to CAPTURES_DIR; None = skip staging biases
     darks_dir: Optional[str] = "darks"  # relative to CAPTURES_DIR; None = skip staging darks
     nights: list[NightSource] = Field(default_factory=list)
+    is_osc: Optional[bool] = None  # None = leave any previously-recorded setting alone; see app/config.py's project meta
 
     model_config = {
         "json_schema_extra": {
@@ -206,6 +217,7 @@ class StageProjectRequest(BaseModel):
                     {"name": "night1", "lights_dir": "Night 1/lights", "flats_dir": "Night 1/flats"},
                     {"name": "night2", "lights_dir": "Night 2/lights", "flats_dir": "Night 2/flats"},
                 ],
+                "is_osc": True,
             }
         }
     }

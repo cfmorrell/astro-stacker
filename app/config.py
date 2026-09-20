@@ -13,6 +13,7 @@ See Handoff.md "Environment / paths" for the mount layout this assumes:
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -30,3 +31,22 @@ def project_dir(name: str) -> Path:
     if not name or name in (".", "..") or "/" in name or "\\" in name:
         raise ValueError(f"invalid project name: {name!r}")
     return PROJECTS_DIR / name
+
+
+def read_project_meta(project: Path) -> dict:
+    """Small per-project settings that don't fit anywhere on disk already
+    (is_osc, and each internal night name's original source-folder label
+    for display — see app/staging.py). Missing/corrupt file just means
+    "no settings recorded yet", not an error.
+    """
+    meta_path = project / "meta.json"
+    if not meta_path.is_file():
+        return {}
+    try:
+        return json.loads(meta_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def write_project_meta(project: Path, meta: dict) -> None:
+    (project / "meta.json").write_text(json.dumps(meta, indent=2))

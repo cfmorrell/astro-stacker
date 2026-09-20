@@ -30,6 +30,32 @@ DEFAULT_MAX_SIZE = 1024
 DEFAULT_STRETCH = "linked"
 _STRETCH_MODES = ("none", "linked", "unlinked")
 
+# (R, G1, B, G2) sample offsets within a 2x2 Bayer tile, keyed by the FITS
+# BAYERPAT convention (top-left pixel first, reading left-to-right).
+_BAYER_OFFSETS = {
+    "RGGB": ((0, 0), (0, 1), (1, 0), (1, 1)),
+    "BGGR": ((1, 1), (0, 1), (1, 0), (0, 0)),
+    "GRBG": ((0, 1), (0, 0), (1, 1), (1, 0)),
+    "GBRG": ((1, 0), (0, 0), (1, 1), (0, 1)),
+}
+
+
+def _debayer_block_mean(mono: np.ndarray, pattern: str) -> np.ndarray:
+    """Quick-look-only demosaic: averages each 2x2 Bayer tile into one RGB
+    pixel (half resolution in each dimension) instead of leaving a raw OSC
+    sub looking like grainy grayscale noise. Same "block-mean over a
+    multiple-of-2 tile acts as a free rough debayer" trick already used in
+    app/framestats.py for analysis speed — not photometric quality, but
+    plenty for a review thumbnail or a click-to-inspect preview.
+    """
+    (ry, rx), (g1y, g1x), (by, bx), (g2y, g2x) = _BAYER_OFFSETS.get(pattern.upper(), _BAYER_OFFSETS["RGGB"])
+    h, w = mono.shape
+    mono = mono[: h - h % 2, : w - w % 2]
+    r = mono[ry::2, rx::2]
+    g = (mono[g1y::2, g1x::2].astype(np.float32) + mono[g2y::2, g2x::2].astype(np.float32)) / 2.0
+    b = mono[by::2, bx::2]
+    return np.stack([r, g, b], axis=-1)
+
 
 def _apply_stretch(arr: np.ndarray, mode: str) -> np.ndarray:
     interval = PercentileInterval(99.5)
@@ -42,18 +68,29 @@ def render_preview_png(
     path: Path,
     max_size: int = DEFAULT_MAX_SIZE,
     stretch: str = DEFAULT_STRETCH,
+    debayer: bool = False,
 ) -> bytes:
     if stretch not in _STRETCH_MODES:
         raise ValueError(f"unknown stretch mode {stretch!r}, expected one of {_STRETCH_MODES}")
 
     with fits.open(path) as hdul:
         data = hdul[0].data
+        header = hdul[0].header
     data = np.asarray(data, dtype=np.float32)
 
     if data.ndim == 3:
         # Siril stores calibrated/stacked color data channels-first
         # (3, H, W); PIL wants channels-last (H, W, 3).
         rgb = np.moveaxis(data, 0, -1)
+        h, w = rgb.shape[:2]
+    elif debayer:
+        # Raw OSC sub, and the caller knows this is a Bayer camera (see
+        # /projects/{name}/status's is_osc, set at staging time) — turn
+        # the mosaic into real (if half-resolution) color instead of
+        # grayscale noise. BAYERPAT is written by ASIAIR/typical capture
+        # software; RGGB is the overwhelmingly common default if absent.
+        pattern = str(header.get("BAYERPAT", "RGGB")).strip()
+        rgb = _debayer_block_mean(data, pattern)
         h, w = rgb.shape[:2]
     else:
         # Raw OSC subs are single-plane Bayer mosaics — no color info to
