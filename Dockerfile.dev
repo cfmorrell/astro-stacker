@@ -30,6 +30,7 @@ RUN apt-get update -qq && \
         libgsl27 libfftw3-double3 libfftw3-single3 libgomp1 libexiv2-27 \
         libheif1 libraw20 libwcs7 libglib2.0-0 libgl1 libxrender1 libxext6 \
         libxft2 libfontconfig1 libsm6 libcurl4 libcfitsio10 libopencv-core406 \
+        vim nano\
     && rm -rf /var/lib/apt/lists/*
 
 # --- Siril 1.4 AppImage, extracted without FUSE ------------------------------
