@@ -1,21 +1,25 @@
 # syntax=docker/dockerfile:1
 #
-# Dev image: Python + Siril CLI, no web layer yet.
-# Build once, then `docker exec` into a long-running container while you
-# iterate on the calibrate/register/stack script from the CLI.
+# Dev image: Python + Siril CLI + FastAPI (app/).
+# Build once, then `docker exec` into a long-running container. Run the API
+# with: cd /app && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+# (add -p 8000:8000 to the `docker run` below to reach it from outside).
 #
 # Build:
 #   docker build -t siril-web-dev -f Dockerfile.dev .
 #
-# Run (long-lived, so ad hoc `pip install`s survive between sessions):
-#   docker run -d --name siril-web-dev \
-#     -v /mnt/user/appdata/siril-web/src:/app \
-#     -v /mnt/user/Astronomy/012-AstroLabProcessing:/captures:ro \
-#     -v /mnt/user/appdata/siril-web-dev-data:/data \
-#     siril-web-dev tail -f /dev/null
+# Run (long-lived, so ad hoc `pip install`s survive between sessions).
+# Matches the actual running container (astro-stacker-dev) per Handoff.md's
+# "Environment / paths" section:
+#   docker run -d --name astro-stacker-dev \
+#     -v /mnt/user/docker_appdata/astro-stacker/src:/app \
+#     -v /mnt/user/Astronomy/013-Astro-Stacker-Processing:/captures:ro \
+#     -v /mnt/user/docker_appdata/astro-stacker/data:/data \
+#     -p 8000:8000 \
+#     astro-stacker-dev tail -f /dev/null
 #
-# Then to get a shell:
-#   docker exec -it siril-web-dev bash
+# Then to get a shell (the `astro-stacker` SSH alias does this automatically):
+#   docker exec -it astro-stacker-dev bash
 #
 # And to resume after a reboot (data/installs on the image/volumes persist,
 # this just restarts the same container):
@@ -62,4 +66,13 @@ ENV SIRIL_BIN=/opt/siril/AppRun \
     PYTHONUNBUFFERED=1
 
 WORKDIR /app
+
+# FastAPI web layer (see app/). Copied+installed at build time so a fresh
+# container has it; since /app is bind-mounted over this at runtime anyway,
+# `pip install -r requirements.txt` after editing it also works live via
+# `docker exec` without a rebuild — ad hoc installs persist in this
+# long-lived container between sessions (see run instructions above).
+COPY requirements.txt /tmp/requirements.txt
+RUN pip3 install --break-system-packages --no-cache-dir -r /tmp/requirements.txt
+
 CMD ["bash"]

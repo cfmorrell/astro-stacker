@@ -39,7 +39,10 @@ post-processing elsewhere.
   No sirilpy live-session integration — headless CLI only.
 - No file-browser UI for v1 — typed directory paths.  Will eventually want to add some file management (pull lights/flats from telescope controller, darks/biases from server, copy remote/link local files into working directory for processing). Once complete, archive files as directed.
 - Long-running jobs (stacking can take an hour+) need background
-  execution + log streaming, not a blocking HTTP request. Not yet built.
+  execution + log streaming, not a blocking HTTP request. Built as a
+  minimal in-thread job manager (`app/jobs.py`) — good enough for a
+  single-user, single-process app; swap for a real queue only if that
+  stops being true.
 - GPU: CPU-only (`:cpu`, no NVIDIA Container Toolkit on this box).
 - Single repo, not split into "app" + "container" repos — one maintainer,
   one deployable, no independent lifecycle for the Dockerfile.
@@ -101,6 +104,24 @@ post-processing elsewhere.
    for reads.
 3. `-d` sets Siril's working directory for the *session*, not per-command.
    Relative paths in a script resolve against whatever `-d` pointed at.
+4. **`cd "path"` strips quotes correctly; `-key="path"` style options do
+   NOT.** `cd "/data/projects/x"` works fine, but `convert bias
+   -out="/data/projects/x/process"` creates a directory literally named
+   `"/data/projects/x/process"` (quote characters included) inside the
+   *source* dir instead — the quotes become part of the value, and since
+   that path doesn't exist, the write silently lands somewhere unintended.
+   Confirmed empirically (2026-09-20, `app/ssf.py` testing). Same applies
+   to `-dark=`/`-flat=`/etc. **Consequence:** in templates, keep `cd`
+   targets quoted but leave `-key=value` path arguments unquoted (fine for
+   this project since paths never contain spaces — sanitized project/night
+   names, no spaces in the NAS mount tree).
+5. **`convert ... -out=<dir>` does not create `<dir>` itself** — it must
+   already exist, or the command silently fails to write there (compounds
+   with gotcha #4: it *looks* like it succeeded because Siril's log still
+   says "N file(s) created," just not where you expect). `app/ssf.py`'s
+   `RenderedScript.ensure_dirs` list exists for exactly this: callers
+   `mkdir -p` every directory a script will `cd`/write into *before*
+   invoking siril-cli, rather than relying on Siril to create anything.
 
 ## Current validated status
 - ✅ Docker build/run/exec loop works on the NAS.
@@ -116,17 +137,46 @@ post-processing elsewhere.
   correctly-sized `result.fit` from actual capture data (ASI2600MC Duo,
   OSC). This is the reference implementation — port its logic into Python,
   don't re-derive the Siril command sequence from scratch.
-- ❌ Master-building not yet factored into its own reusable script/module
-  (it's currently inline in the one combined `.ssf` below) — worth
-  splitting into a "build masters" step and a "calibrate/register/stack
-  lights" step once this becomes Python, since a real workflow will often
-  reuse the same masters across multiple stacking runs rather than
-  rebuilding them every time.
-- ❌ No Python/FastAPI code written yet. `scripts/stage_captures.sh` is the
-  only repo code so far, and it's shell, not Python.
-- ❌ No `crop` step yet (trims the ragged registration border) — left out
-  of the first full test deliberately to keep troubleshooting simpler.
-  Add it once the Python version is running.
+- ✅ **Python/FastAPI layer built and tested end-to-end against real
+  capture data (2026-09-20)**: `app/` now has `config.py`, `models.py`
+  (Pydantic request models — `StackMethod`/`StackOptions` is the "few
+  different stacking algorithms" knob), `ssf.py` (Jinja2 rendering from
+  `templates/*.ssf.j2`), `siril_runner.py` (subprocess invocation +
+  streaming), `jobs.py` (in-memory background job manager), and
+  `main.py` (FastAPI app). Master-building and calibrate/register/stack
+  are split into two independent phases as planned, each with its own
+  `/render` (dry-run, no side effects) and `/run` (background job)
+  endpoint. Verified by standing up uvicorn in the dev container and
+  hitting it with real HTTP requests against a freshly-staged project
+  (`test2`, since-deleted test scaffolding — `test1` and its validated
+  `result.fit` were never touched): masters build succeeded
+  (`master_bias.fit`/`master_dark.fit`/`master_flat.fit` all produced),
+  then a full stack run against 10 real Heart Nebula lights succeeded in
+  ~18s end-to-end through the API (job manager, log streaming, and all),
+  producing a correctly-sized `result.fit` (6248x4176, 3-layer, 32-bit —
+  same dimensions as `test1`'s). Found and fixed two new Siril gotchas in
+  the process (#4 and #5 above) that the original manual walkthrough
+  didn't hit because it never varied the working directory structure.
+- ✅ Multi-night stacking implemented in `ssf.py`/`calibrate_stack.ssf.j2`
+  (per-night `pp_light` sequences merged via Siril's `merge`, following
+  the pattern in rolandet's v1.2/v3.0 scripts) but **not yet validated
+  against real multi-night data** — only render-tested (syntax checked,
+  never actually run through siril-cli). Single-night path is the
+  well-trodden one; treat multi-night as unverified until run for real.
+- ❌ No `crop` step yet (trims the ragged registration border) — still
+  deliberately deferred. Punted again because Siril's actual crop syntax
+  (region-based `crop x y width height`, not a margin-trim) needs to be
+  verified against a real registered frame's dimensions before wiring it
+  in; guessing at the arguments for a destructive image op isn't worth
+  the risk of silently producing wrong output.
+- ❌ No project-creation/staging endpoint — `mkdir` + `stage_captures.sh`
+  still have to be run by hand before `/masters/run`. Fine for now (no
+  file-browser UI is a stated v1 non-goal), but worth wrapping once a
+  real UI shows up.
+- ❌ No log-based progress/ETA parsing — `/jobs/{id}` exposes the raw
+  current log line (siril-cli does print `progress: N%` lines) but
+  nothing turns that into the "aware of steps/percentages/time" UX the
+  Endstate asks for. The raw signal is there; nobody's parsed it yet.
 
 ## Validated `.ssf` script (known-good reference — don't rederive)
 Tested against staged raw frames at `data/projects/test1/raw/{lights,darks,flats,biases}`
@@ -180,12 +230,25 @@ the `raw/` staging layer exists at all — don't collapse it away):
   rejection method, that's the whole parameterization surface.
 
 ## Immediate next steps
-1. Split the validated script above into two logical phases in Python:
-   build-masters (bias/dark/flat) and calibrate-register-stack (lights) —
-   masters get reused across runs, lights don't.
-2. Adapt `make_master_darks_auto.py`/`make_master_biases_auto.py` from
-   rolandet's repo for reference on how someone else structured this same
-   split, rather than designing it from zero.
-3. FastAPI skeleton — `/build` (render `.ssf`, don't run) and `/run`
-   (execute + stream log), background job execution for long stacks.
-4. Add the `crop` step once the Python version is running end-to-end.
+Steps 1–3 from the prior handoff (split masters/lights phases into
+Python, reference rolandet's master-builder scripts, FastAPI skeleton
+with render/run + background jobs) are **done** — see "Current validated
+status" above. What's next:
+
+1. Parse siril-cli's `progress: N%` log lines in `jobs.py`/`Job` into a
+   proper `percent_complete` field on `/jobs/{id}` (the raw line is
+   already captured as `current_line`; this is just extracting the number
+   and exposing it more usefully) — closes the gap on the Endstate's
+   "aware of steps/percentages/time" requirement.
+2. Run the multi-night (`merge`) path against real multi-night capture
+   data at least once — it's only been render-tested so far, never
+   actually executed through siril-cli.
+3. Wrap project creation + `stage_captures.sh` in an endpoint (e.g.
+   `POST /projects/{name}` that stages from `/captures`) so a project
+   doesn't require manual shell setup before the API can touch it.
+4. Research Siril's actual `crop` syntax against a real registered
+   frame's dimensions (region-based `x y width height`, not a
+   margin-trim) before wiring it in — don't guess at this one.
+5. Frame review/filtering (FWHM, star count, eccentricity, SNR) and
+   archival/cleanup are still fully unstarted — they're the two Endstate
+   bullets with no design work behind them yet.
