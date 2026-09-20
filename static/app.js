@@ -6,7 +6,7 @@
  */
 
 const STEPS = ["stage", "masters", "review", "stack"];
-const STEP_LABELS = { stage: "Stage", masters: "Masters", review: "Review", stack: "Stack" };
+const STEP_LABELS = { stage: "File Staging", masters: "Calibration Frames", review: "Review Light Frames", stack: "Stack" };
 const LARGE_NIGHT_THRESHOLD = 20; // beyond this, collapse to flagged frames +/- 2 neighbors
 
 const state = {
@@ -19,6 +19,7 @@ const state = {
   showSurvivorsOnly: false,
   expandedGroups: {},   // per-night Set of "start-end" collapsed-group keys the user expanded
   stretchMode: "linked",
+  lastAnomalySigma: 3.0,  // the anomaly_sigma actually used for the current lastAnalyzeResult's flags
 };
 
 // ---------- tiny fetch helpers ----------
@@ -53,18 +54,40 @@ function el(tag, attrs, children) {
   return node;
 }
 
-function formatTime(iso) {
-  if (!iso) return "—";
-  const t = iso.split("T")[1] || iso;
-  return t.split(".")[0];
+function formatCaptured(iso) {
+  // FITS DATE-OBS has no trailing "Z" (e.g. "2026-09-14T00:00:47.585420")
+  // but IS UTC per the FITS standard. Appending "Z" before parsing forces
+  // the browser to treat it as UTC rather than guessing (engines vary,
+  // and guessing wrong silently shows the wrong local time); Date's own
+  // toLocale*String methods then do the actual UTC->local conversion.
+  if (!iso) return { date: "—", time: "—" };
+  const d = new Date(iso.endsWith("Z") ? iso : `${iso}Z`);
+  if (isNaN(d.getTime())) return { date: "—", time: "—" };
+  const date = d.toLocaleDateString(undefined, { year: "2-digit", month: "2-digit", day: "2-digit" });
+  const time = d.toLocaleTimeString(undefined, { hour12: false });
+  return { date, time };
+}
+
+function nightDisplayLabel(n) {
+  return (n && (n.label || n.name)) || "";
 }
 
 function setOutcome(el_, ok, msg) {
+  // Errors still get a full banner (there's real detail worth reading);
+  // success does not — see setStepBadge, which is the "one consistent
+  // place completion shows up" Chris asked for, matching Stage's
+  // existing top-right badge instead of Masters' old full-width one.
   el_.innerHTML = "";
-  el_.appendChild(el("div", { class: ok ? "complete-banner" : "error-banner" }, [
-    ok ? "✓ " : "✕ ",
-    msg,
-  ]));
+  if (!ok) {
+    el_.appendChild(el("div", { class: "error-banner" }, ["✕ ", msg]));
+  }
+}
+
+function setStepBadge(badgeId, kind, text) {
+  const badge = document.getElementById(badgeId);
+  if (!badge) return;
+  badge.textContent = text;
+  badge.className = `badge${kind ? ` ${kind}` : ""}`;
 }
 
 // ---------- job polling ----------
@@ -93,7 +116,7 @@ async function pollJob(jobId, { progressEl, logViewEl, pipelineEl, onDone, lockB
     const p = snap.percent_complete || 0;
     if (fill) fill.style.width = `${Math.min(100, Math.max(0, p)).toFixed(0)}%`;
     if (pct) pct.textContent = `${p.toFixed(0)}%`;
-    if (msg) msg.textContent = snap.current_command ? `[${snap.current_command}] ${snap.current_line || ""}`.slice(0, 90) : (snap.current_line || "").slice(0, 90);
+    if (msg) msg.textContent = snap.current_command ? `[${snap.current_command}] ${snap.current_line || ""}` : (snap.current_line || "");
     if (pipelineEl && snap.steps && snap.steps.length) renderPipelineSteps(pipelineEl, snap.steps, snap.current_step_index, snap.status);
     if (logViewEl) {
       try {
@@ -127,13 +150,14 @@ function renderPipelineSteps(container, steps, currentIndex, status) {
 
 function wireToggleButton(btnId, logKey, fetchFn) {
   const btn = document.getElementById(btnId);
+  const arrow = btn.querySelector(".arrow");
   const view = document.querySelector(`[data-log-view="${logKey}"]`);
   let loaded = false;
   btn.addEventListener("click", async () => {
     const isOpen = view.classList.contains("open");
     if (isOpen) {
       view.classList.remove("open");
-      btn.textContent = btn.textContent.replace("▴", "▾");
+      arrow.textContent = "▾";
       return;
     }
     if (!loaded) {
@@ -146,14 +170,14 @@ function wireToggleButton(btnId, logKey, fetchFn) {
       }
     }
     view.classList.add("open");
-    btn.textContent = btn.textContent.replace("▾", "▴");
+    arrow.textContent = "▴";
   });
 }
 
 // ---------- folder browser (for Stage section) ----------
 
 function attachFolderBrowser(inputEl, browseBtn) {
-  browseBtn.addEventListener("click", async () => {
+  async function open() {
     closeAnyBrowser();
     let path = inputEl.value || "";
     const panel = el("div", { class: "card", style: "position:fixed; z-index:50; min-width:280px;" }, []);
@@ -191,7 +215,13 @@ function attachFolderBrowser(inputEl, browseBtn) {
       panel.appendChild(actions);
     }
     render();
-  });
+  }
+  browseBtn.addEventListener("click", open);
+  // Inputs are read-only now (Chris: "I'd rather someone have to click
+  // the ellipsis and choose a folder than mistype something") - clicking
+  // the input itself opens the same picker rather than doing nothing,
+  // since a read-only field with a text cursor otherwise looks broken.
+  inputEl.addEventListener("click", open);
 }
 
 function closeAnyBrowser() {
@@ -201,6 +231,58 @@ function closeAnyBrowser() {
   }
 }
 
+// ---------- project file browser (for Stack's master overrides) ----------
+
+function attachFileBrowser(inputEl, browseBtn, startPath) {
+  async function open() {
+    closeAnyBrowser();
+    let path = startPath;
+    const panel = el("div", { class: "card", style: "position:fixed; z-index:50; min-width:280px;" }, []);
+    document.body.appendChild(panel);
+    const rect = browseBtn.getBoundingClientRect();
+    panel.style.top = `${rect.bottom + 4}px`;
+    panel.style.left = `${rect.left}px`;
+    window.__openBrowserPanel = panel;
+
+    async function render() {
+      panel.innerHTML = "";
+      let data;
+      try {
+        data = await api("GET", `/projects/${encodeURIComponent(state.project)}/browse?path=${encodeURIComponent(path)}`);
+      } catch (e) {
+        panel.appendChild(el("div", { class: "status-line err" }, [String(e)]));
+        return;
+      }
+      panel.appendChild(el("div", { class: "hint mono" }, [`/${data.path || ""}`]));
+      if (path) {
+        panel.appendChild(el("button", { class: "small", onclick: () => { path = path.split("/").slice(0, -1).join("/"); render(); } }, ["← up"]));
+      }
+      const list = el("div", { style: "margin-top:6px; max-height:220px; overflow-y:auto;" }, []);
+      for (const d of data.dirs) {
+        list.appendChild(el("div", {
+          class: "night-row", style: "cursor:pointer; justify-content:space-between;",
+          onclick: () => { path = data.path ? `${data.path}/${d}` : d; render(); },
+        }, [`📁 ${d}`]));
+      }
+      for (const f of data.files) {
+        list.appendChild(el("div", {
+          class: "night-row", style: "cursor:pointer; justify-content:space-between;",
+          onclick: () => { inputEl.value = f.abs_path; closeAnyBrowser(); },
+        }, [f.name]));
+      }
+      panel.appendChild(list);
+      const actions = el("div", { style: "margin-top:8px; display:flex; gap:8px;" }, [
+        el("button", { class: "small ghost", onclick: () => { inputEl.value = ""; closeAnyBrowser(); } }, ["✕ Clear (use default)"]),
+        el("button", { class: "small ghost", onclick: () => closeAnyBrowser() }, ["Cancel"]),
+      ]);
+      panel.appendChild(actions);
+    }
+    render();
+  }
+  browseBtn.addEventListener("click", open);
+  inputEl.addEventListener("click", open);
+}
+
 // ---------- Stage section ----------
 
 function addNightRow() {
@@ -208,8 +290,8 @@ function addNightRow() {
   const sessionNum = container.children.length + 1;
   const row = el("div", { class: "night-row" }, []);
   const label = el("span", { class: "session-label" }, [`Session ${sessionNum}`]);
-  const lightsInput = el("input", { type: "text", class: "dirpick", placeholder: "lights dir (e.g. Night 1/lights)" }, []);
-  const flatsInput = el("input", { type: "text", class: "dirpick", placeholder: "flats dir (e.g. Night 1/flats)" }, []);
+  const lightsInput = el("input", { type: "text", class: "dirpick", placeholder: "lights dir (e.g. Night 1/lights)", readonly: "readonly" }, []);
+  const flatsInput = el("input", { type: "text", class: "dirpick", placeholder: "flats dir (e.g. Night 1/flats)", readonly: "readonly" }, []);
   const lightsBrowse = el("button", { type: "button", class: "small" }, ["…"]);
   const flatsBrowse = el("button", { type: "button", class: "small" }, ["…"]);
   attachFolderBrowser(lightsInput, lightsBrowse);
@@ -242,6 +324,7 @@ document.getElementById("stage-btn").addEventListener("click", async () => {
     biases_dir: document.getElementById("biases-dir").value.trim() || null,
     darks_dir: document.getElementById("darks-dir").value.trim() || null,
     nights,
+    is_osc: document.getElementById("stage-is-osc").checked,
   };
   const summaryEl = document.getElementById("stage-summary");
   summaryEl.innerHTML = "";
@@ -275,13 +358,14 @@ function renderStageSummary(staged) {
 
 // ---------- night checklists (shared pattern) ----------
 
-function renderChecklist(containerId, nights, selected) {
+function renderChecklist(containerId, nights, selected, countFn) {
   const container = document.getElementById(containerId);
   container.innerHTML = "";
   if (!nights.length) {
     container.appendChild(el("span", { class: "empty-hint" }, ["No nights staged yet — use Stage above."]));
     return;
   }
+  const count = countFn || ((n) => n.light_count);
   for (const n of nights) {
     const checked = selected.has(n.name);
     const chip = el("label", { class: `chip${checked ? " checked" : ""}` }, [
@@ -292,10 +376,22 @@ function renderChecklist(containerId, nights, selected) {
           chip.classList.toggle("checked", e.target.checked);
         },
       }, []),
-      document.createTextNode(`${n.name} (${n.light_count})`),
+      document.createTextNode(`${nightDisplayLabel(n)} (${count(n)})`),
     ]);
     container.appendChild(chip);
   }
+}
+
+function survivorCountForNight(n) {
+  const analyzed = state.lastAnalyzeResult && state.lastAnalyzeResult.nights[n.name];
+  if (!analyzed) return n.light_count;
+  const excluded = analyzed.filter((f) => state.excludeFrames.has(f.filename)).length;
+  return analyzed.length - excluded;
+}
+
+function refreshStackNightsChecklist() {
+  if (!state.status) return;
+  renderChecklist("stack-nights", state.status.nights, stackSelected, survivorCountForNight);
 }
 
 const mastersSelected = new Set();
@@ -332,7 +428,7 @@ document.getElementById("masters-run-btn").addEventListener("click", async () =>
       logViewEl: document.querySelector('[data-log-view="masters"]'),
       lockButtons: [runBtn],
       onDone: async (snap) => {
-        if (snap.status === "succeeded") setOutcome(resultEl, true, "Masters built");
+        if (snap.status === "succeeded") setStepBadge("masters-status-badge", "ok", "masters built");
         else setOutcome(resultEl, false, `Failed: ${snap.error || ""}`);
         await loadProjectStatus();
       },
@@ -343,6 +439,10 @@ document.getElementById("masters-run-btn").addEventListener("click", async () =>
   }
 });
 
+document.getElementById("stage-next-btn").addEventListener("click", () => { state.activeStep = "masters"; showActiveStep(); });
+document.getElementById("masters-next-btn").addEventListener("click", () => { state.activeStep = "review"; showActiveStep(); });
+document.getElementById("review-next-btn").addEventListener("click", () => { state.activeStep = "stack"; showActiveStep(); });
+
 // ---------- Analyze / Review section ----------
 
 function analyzeBody() {
@@ -351,37 +451,87 @@ function analyzeBody() {
     exclude_frames: Array.from(state.excludeFrames),
     bin_factor: parseInt(document.getElementById("analyze-bin").value, 10) || 4,
     threshold_sigma: parseFloat(document.getElementById("analyze-threshold").value) || 8.0,
+    anomaly_sigma: parseFloat(document.getElementById("analyze-anomaly-sigma").value) || 3.0,
   };
 }
 
-function metricStrip(label, frames, key, subKey) {
+function metricStrip(label, frames, key, subKey, anomalySigma) {
+  if (frames.length === 0) {
+    return el("div", { class: "metric-strip" }, [el("div", { class: "metric-label" }, [label]), el("div", { class: "hint" }, ["no surviving frames"])]);
+  }
   const values = frames.map((f) => (typeof f[key] === "number" ? f[key] : 0));
-  const max = Math.max(...values, 1e-9);
+  const lo = Math.min(...values);
+  const hi = Math.max(...values);
+  // Scale bars to the metric's own min..max range, not 0..max: two FWHM
+  // values like 4.62 and 4.69 are indistinguishable as bars sized against
+  // a 0-based axis, but scaling to the actual observed range makes real
+  // (if small) differences visible - which is also just what the bars are
+  // for now that flagging is a separate, tunable z-score (see the anomaly
+  // sigma input) rather than something to infer by eye from bar height.
+  const span = hi - lo || 1;
   const bars = el("div", { class: "metric-bars" }, frames.map((f, i) => {
-    const h = Math.max(2, (values[i] / max) * 32);
-    const flagged = f.anomaly_z && f.anomaly_z[subKey] !== undefined && f.anomaly_z[subKey] >= 3.0;
-    return el("div", { class: `bar${flagged ? " flagged" : ""}`, style: `height:${h}px;`, title: `${f.filename} (${formatTime(f.captured_at)}): ${key}=${values[i]}` }, []);
+    const h = Math.max(3, ((values[i] - lo) / span) * 68 + 4);
+    const flagged = f.anomaly_z && f.anomaly_z[subKey] !== undefined && f.anomaly_z[subKey] >= anomalySigma;
+    const { date, time } = formatCaptured(f.captured_at);
+    return el("div", { class: `bar${flagged ? " flagged" : ""}`, style: `height:${h}px;`, title: `${f.filename} (${date} ${time}): ${key}=${values[i]}` }, []);
   }));
+  const axis = el("div", { class: "metric-axis" }, [
+    el("span", {}, [hi.toFixed(2)]),
+    el("span", {}, [lo.toFixed(2)]),
+  ]);
   return el("div", { class: "metric-strip" }, [
     el("div", { class: "metric-label" }, [label]),
-    bars,
+    el("div", { class: "metric-strip-body" }, [axis, bars]),
   ]);
 }
 
+let lightboxZoomed = false;
+
 function openLightbox(url, caption) {
-  document.getElementById("lightbox-img").src = url;
+  const img = document.getElementById("lightbox-img");
+  const scroll = document.getElementById("lightbox-scroll");
+  img.src = url;
+  lightboxZoomed = false;
+  scroll.classList.remove("zoomed");
+  scroll.scrollTop = 0;
+  scroll.scrollLeft = 0;
   document.getElementById("lightbox-caption").textContent = caption;
   document.getElementById("lightbox").classList.add("open");
 }
 document.getElementById("lightbox").addEventListener("click", () => {
   document.getElementById("lightbox").classList.remove("open");
 });
+document.getElementById("lightbox-scroll").addEventListener("click", (e) => {
+  // Toggle zoom instead of letting the click bubble to the overlay's
+  // close handler - zooming in to actually inspect a frame is the whole
+  // point of clicking into it (Chris: "I should be able to zoom in to
+  // look closely"). Re-centers the scroll on the click point so zooming
+  // in lands roughly where the user clicked, not the top-left corner.
+  e.stopPropagation();
+  const scroll = e.currentTarget;
+  if (!lightboxZoomed) {
+    const rect = scroll.getBoundingClientRect();
+    const fracX = (e.clientX - rect.left) / rect.width;
+    const fracY = (e.clientY - rect.top) / rect.height;
+    lightboxZoomed = true;
+    scroll.classList.add("zoomed");
+    requestAnimationFrame(() => {
+      scroll.scrollLeft = fracX * scroll.scrollWidth - rect.width / 2;
+      scroll.scrollTop = fracY * scroll.scrollHeight - rect.height / 2;
+    });
+  } else {
+    lightboxZoomed = false;
+    scroll.classList.remove("zoomed");
+  }
+});
 
 function frameCard(night, f) {
-  const smallUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(`raw/nights/${night}/lights/${f.filename}`)}&max_size=320`;
-  const largeUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(`raw/nights/${night}/lights/${f.filename}`)}&max_size=1024`;
+  const debayer = state.status && state.status.is_osc ? "&debayer=1" : "";
+  const smallUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(`raw/nights/${night}/lights/${f.filename}`)}&max_size=320${debayer}`;
+  const largeUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(`raw/nights/${night}/lights/${f.filename}`)}&max_size=1600${debayer}`;
   const checked = state.excludeFrames.has(f.filename);
   const card = el("div", { class: `frame-card${f.flagged ? " flagged" : ""}` }, []);
+  const { date, time } = formatCaptured(f.captured_at);
   // Not loading="lazy": the frame strip scrolls horizontally, and lazy
   // loading only fires once an image nears the *viewport*, not the
   // scroll container — off-screen thumbnails would silently never load
@@ -389,11 +539,11 @@ function frameCard(night, f) {
   // way: 7/11 stuck "loading" indefinitely until manually scrolled).
   card.appendChild(el("img", {
     src: smallUrl,
-    onclick: () => openLightbox(largeUrl, `${f.filename} — ${formatTime(f.captured_at)}`),
+    onclick: () => openLightbox(largeUrl, `${f.filename} — ${date} ${time}`),
   }, []));
   const meta = el("div", { class: "frame-meta" }, []);
   meta.appendChild(el("div", { class: "frame-name" }, [f.filename]));
-  meta.appendChild(el("div", { class: "frame-time" }, [formatTime(f.captured_at)]));
+  meta.appendChild(el("div", { class: "frame-time" }, [`${date}  ${time}`]));
   const stats = el("div", { class: "frame-stats" }, []);
   const rows = [
     ["stars", f.star_count, "star_count"],
@@ -402,7 +552,7 @@ function frameCard(night, f) {
     ["snr", f.snr !== null ? f.snr.toFixed(0) : "—", "snr"],
   ];
   for (const [k, v, metricKey] of rows) {
-    const isAnom = f.anomaly_z && f.anomaly_z[metricKey] !== undefined && f.anomaly_z[metricKey] >= 3.0;
+    const isAnom = f.anomaly_z && f.anomaly_z[metricKey] !== undefined && f.anomaly_z[metricKey] >= state.lastAnomalySigma;
     stats.appendChild(el("span", {}, [k]));
     stats.appendChild(el("b", { class: isAnom ? "anom" : "" }, [String(v)]));
   }
@@ -415,7 +565,14 @@ function frameCard(night, f) {
         if (e.target.checked) state.excludeFrames.add(f.filename);
         else state.excludeFrames.delete(f.filename);
         refreshExcludeDisplay();
+        // Re-rendering the whole review grid below rebuilds every node,
+        // which used to silently reset the page's scroll position back
+        // to wherever the browser felt like - jarring when you're 40
+        // frames deep excluding one at a time. Pin the viewport in place
+        // across the rebuild instead.
+        const y = window.scrollY;
         renderAnalyzeOutput();
+        requestAnimationFrame(() => window.scrollTo(window.scrollX, y));
       },
     }, []),
     document.createTextNode("exclude from stack"),
@@ -474,10 +631,13 @@ function renderAnalyzeOutput() {
     block.appendChild(el("h4", {}, [
       `${night} — ${allFrames.length} frames, ${flaggedCount} flagged` + (excludedCount ? `, ${excludedCount} excluded` : ""),
     ]));
-    block.appendChild(metricStrip("star count", frames, "star_count", "star_count"));
-    block.appendChild(metricStrip("FWHM", frames, "fwhm", "fwhm"));
-    block.appendChild(metricStrip("eccentricity", frames, "roundness", "roundness"));
-    block.appendChild(metricStrip("SNR", frames, "snr", "snr"));
+    const grid = el("div", { class: "metric-grid" }, [
+      metricStrip("star count", frames, "star_count", "star_count", state.lastAnomalySigma),
+      metricStrip("FWHM", frames, "fwhm", "fwhm", state.lastAnomalySigma),
+      metricStrip("eccentricity", frames, "roundness", "roundness", state.lastAnomalySigma),
+      metricStrip("SNR", frames, "snr", "snr", state.lastAnomalySigma),
+    ]);
+    block.appendChild(grid);
 
     const strip = el("div", { class: "frame-strip" }, []);
     if (frames.length > LARGE_NIGHT_THRESHOLD && !state.showSurvivorsOnly) {
@@ -520,19 +680,31 @@ function renderAnalyzeOutput() {
   }
 
   document.getElementById("analyze-rerun-btn").style.display = state.excludeFrames.size > 0 ? "inline-block" : "none";
+
+  const anyUnacceptedFlags = Object.values(state.lastAnalyzeResult.nights)
+    .flat()
+    .some((f) => f.flagged && !state.excludeFrames.has(f.filename));
+  document.getElementById("analyze-actions").style.display = anyUnacceptedFlags ? "block" : "none";
+
+  refreshStackNightsChecklist();
 }
 
 async function runAnalyze() {
   const runBtn = document.getElementById("analyze-run-btn");
   const rerunBtn = document.getElementById("analyze-rerun-btn");
   const resultEl = document.getElementById("analyze-result");
+  const body = analyzeBody();
   resultEl.innerHTML = "";
   resultEl.appendChild(el("div", { class: "status-line" }, ["starting…"]));
   document.getElementById("analyze-output").innerHTML = "";
+  document.getElementById("analyze-actions").style.display = "none";
+  document.getElementById("analyze-reset-btn").style.display = "none";
+  document.getElementById("review-next-btn").style.display = "none";
+  setStepBadge("review-status-badge", null, "not analyzed");
   runBtn.disabled = true;
   rerunBtn.disabled = true;
   try {
-    const { job_id } = await api("POST", `/projects/${encodeURIComponent(state.project)}/lights/analyze/run`, analyzeBody());
+    const { job_id } = await api("POST", `/projects/${encodeURIComponent(state.project)}/lights/analyze/run`, body);
     await pollJob(job_id, {
       progressEl: document.getElementById("analyze-progress"),
       lockButtons: [runBtn, rerunBtn],
@@ -541,13 +713,16 @@ async function runAnalyze() {
           setOutcome(resultEl, false, `Failed: ${snap.error || ""}`);
           return;
         }
-        setOutcome(resultEl, true, "Analysis complete");
+        setStepBadge("review-status-badge", "ok", "analyzed");
         state.analyzed = true;
         state.lastAnalyzeResult = snap.result;
+        state.lastAnomalySigma = body.anomaly_sigma;
         state.showSurvivorsOnly = false;
         state.expandedGroups = {};
         renderAnalyzeOutput();
         renderStepper();
+        document.getElementById("analyze-reset-btn").style.display = "inline-block";
+        document.getElementById("review-next-btn").style.display = "inline-block";
       },
     });
   } catch (e) {
@@ -559,6 +734,36 @@ async function runAnalyze() {
 
 document.getElementById("analyze-run-btn").addEventListener("click", runAnalyze);
 document.getElementById("analyze-rerun-btn").addEventListener("click", runAnalyze);
+
+document.getElementById("analyze-accept-recommended-btn").addEventListener("click", () => {
+  if (!state.lastAnalyzeResult) return;
+  for (const frames of Object.values(state.lastAnalyzeResult.nights)) {
+    for (const f of frames) {
+      if (f.flagged) state.excludeFrames.add(f.filename);
+    }
+  }
+  refreshExcludeDisplay();
+  renderAnalyzeOutput();
+});
+
+document.getElementById("analyze-reset-btn").addEventListener("click", () => {
+  if (!confirm("Start over? This clears all excluded frames and this session's analysis results.")) return;
+  state.excludeFrames.clear();
+  state.lastAnalyzeResult = null;
+  state.analyzed = false;
+  state.showSurvivorsOnly = false;
+  state.expandedGroups = {};
+  refreshExcludeDisplay();
+  document.getElementById("analyze-output").innerHTML = "";
+  document.getElementById("analyze-result").innerHTML = "";
+  document.getElementById("analyze-actions").style.display = "none";
+  document.getElementById("analyze-reset-btn").style.display = "none";
+  document.getElementById("analyze-rerun-btn").style.display = "none";
+  document.getElementById("review-next-btn").style.display = "none";
+  setStepBadge("review-status-badge", null, "not analyzed");
+  refreshStackNightsChecklist();
+  renderStepper();
+});
 
 // ---------- Stack section ----------
 
@@ -585,6 +790,9 @@ function stackBody() {
   if (flat) body.master_flat = flat;
   return body;
 }
+
+attachFileBrowser(document.getElementById("stack-master-dark"), document.getElementById("stack-master-dark-browse"), "process");
+attachFileBrowser(document.getElementById("stack-master-flat"), document.getElementById("stack-master-flat-browse"), "process");
 
 wireToggleButton("stack-render-btn", "stack", () =>
   api("POST", `/projects/${encodeURIComponent(state.project)}/stack/render`, stackBody())
@@ -624,30 +832,51 @@ function currentResultPath() {
   return state.status.merged_result_path || (state.status.nights.find((n) => n.result_path) || {}).result_path || null;
 }
 
+function stackPreviewUrl(path) {
+  return `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(path)}&stretch=${state.stretchMode}&t=${Date.now()}`;
+}
+
 function showStackPreview() {
   const previewEl = document.getElementById("stack-preview");
-  previewEl.innerHTML = "";
   const path = currentResultPath();
-  if (!path) return;
-
-  const controls = el("div", { class: "preview-controls" }, []);
-  const toggle = el("div", { class: "stretch-toggle" }, []);
-  for (const mode of ["none", "linked", "unlinked"]) {
-    toggle.appendChild(el("button", {
-      class: mode === state.stretchMode ? "active" : "",
-      type: "button",
-      onclick: () => { state.stretchMode = mode; showStackPreview(); },
-    }, [mode]));
+  if (!path) {
+    previewEl.innerHTML = "";
+    previewEl.dataset.builtFor = "";
+    return;
   }
-  controls.appendChild(toggle);
-  controls.appendChild(el("a", {
-    href: `/projects/${encodeURIComponent(state.project)}/download?path=${encodeURIComponent(path)}`,
-    class: "mono",
-  }, [el("button", { type: "button" }, ["⬇ Download full-resolution .fit"])]));
-  previewEl.appendChild(controls);
 
-  const url = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(path)}&stretch=${state.stretchMode}&t=${Date.now()}`;
-  previewEl.appendChild(el("div", { class: "preview-frame" }, [el("img", { src: url }, [])]));
+  // Only rebuild the whole block (controls + frame) the first time, or
+  // when the result path itself changes (a fresh stack ran). Switching
+  // stretch mode just swaps the existing <img>'s src - rebuilding the
+  // whole subtree each time briefly collapsed the frame to 0 height
+  // (nothing to reserve space until the new PNG decoded), which yanked
+  // the page up and buried the image below the fold until it reloaded.
+  // The CSS aspect-ratio on .preview-frame is a second safety net for
+  // this same problem; keeping the DOM node in place avoids it outright.
+  if (previewEl.dataset.builtFor !== path) {
+    previewEl.innerHTML = "";
+    const controls = el("div", { class: "preview-controls" }, []);
+    const toggle = el("div", { class: "stretch-toggle" }, []);
+    for (const mode of ["none", "linked", "unlinked"]) {
+      toggle.appendChild(el("button", {
+        class: mode === state.stretchMode ? "active" : "",
+        type: "button",
+        onclick: () => {
+          state.stretchMode = mode;
+          toggle.querySelectorAll("button").forEach((b) => b.classList.toggle("active", b.textContent === mode));
+          previewEl.querySelector("img").src = stackPreviewUrl(path);
+        },
+      }, [mode]));
+    }
+    controls.appendChild(toggle);
+    controls.appendChild(el("a", {
+      href: `/projects/${encodeURIComponent(state.project)}/download?path=${encodeURIComponent(path)}`,
+      class: "mono",
+    }, [el("button", { type: "button" }, ["⬇ Download full-resolution .fit"])]));
+    previewEl.appendChild(controls);
+    previewEl.appendChild(el("div", { class: "preview-frame" }, [el("img", { src: stackPreviewUrl(path) }, [])]));
+    previewEl.dataset.builtFor = path;
+  }
 }
 
 // ---------- stepper ----------
@@ -711,14 +940,22 @@ async function loadProjectStatus() {
   state.status = await api("GET", `/projects/${encodeURIComponent(state.project)}/status`);
   const nights = state.status.nights;
 
-  document.getElementById("stage-status-badge").textContent =
-    nights.length ? `${nights.length} night(s) staged` : "not staged";
-  document.getElementById("stage-status-badge").className =
-    `badge ${nights.length ? "ok" : ""}`;
+  setStepBadge("stage-status-badge", nights.length ? "ok" : null, nights.length ? `${nights.length} night(s) staged` : "not staged");
+  document.getElementById("stage-next-btn").style.display = nights.length ? "inline-block" : "none";
+
+  const mastersDone = stepStatus("masters").complete;
+  setStepBadge("masters-status-badge", mastersDone ? "ok" : null, mastersDone ? "masters built" : "not built");
+  document.getElementById("masters-next-btn").style.display = mastersDone ? "inline-block" : "none";
+
+  const stackDone = stepStatus("stack").complete;
+  setStepBadge("stack-status-badge", stackDone ? "ok" : null, stackDone ? "stack complete" : "not stacked");
 
   renderChecklist("masters-nights", nights, mastersSelected);
   renderChecklist("analyze-nights", nights, analyzeSelected);
-  renderChecklist("stack-nights", nights, stackSelected);
+  refreshStackNightsChecklist();
+
+  document.getElementById("stage-is-osc").checked = state.status.is_osc !== false;
+  document.getElementById("stack-is-osc").checked = state.status.is_osc !== false;
 
   showStackPreview();
   renderStepper();
@@ -745,6 +982,23 @@ document.getElementById("project-select").addEventListener("change", async (e) =
   document.getElementById("analyze-result").innerHTML = "";
   document.getElementById("masters-result").innerHTML = "";
   document.getElementById("stack-result").innerHTML = "";
+  document.getElementById("analyze-actions").style.display = "none";
+  document.getElementById("analyze-reset-btn").style.display = "none";
+  document.getElementById("analyze-rerun-btn").style.display = "none";
+  document.getElementById("stage-next-btn").style.display = "none";
+  document.getElementById("masters-next-btn").style.display = "none";
+  document.getElementById("review-next-btn").style.display = "none";
+  document.getElementById("stack-master-dark").value = "";
+  document.getElementById("stack-master-flat").value = "";
+  setStepBadge("review-status-badge", null, "not analyzed");
+  // The stack preview's "only rebuild when the path changes" optimization
+  // (showStackPreview) keys off the result's path alone, which is
+  // relative and could coincidentally match between two different
+  // projects that both have a merged result - reset it so a project
+  // switch always rebuilds instead of risking a stale image left over
+  // from whichever project was open before.
+  document.getElementById("stack-preview").innerHTML = "";
+  document.getElementById("stack-preview").dataset.builtFor = "";
   showActiveStep();
   if (state.project) await loadProjectStatus();
 });

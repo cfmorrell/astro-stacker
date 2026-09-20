@@ -384,8 +384,21 @@ button.small {
   color: var(--text-muted);
   margin-top: 5px;
   display: flex;
-  justify-content: space-between;
+  gap: 10px;
   font-family: ui-monospace, monospace;
+}
+
+.progress-label .pct {
+  flex: 0 0 auto;
+}
+
+.progress-label .msg {
+  flex: 1;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  text-align: right;
 }
 
 .status-line {
@@ -399,6 +412,33 @@ button.small {
 
 .log-toggle-btn {
   font-size: 12px;
+}
+
+.script-toggle-btn .arrow {
+  display: inline-block;
+  font-size: 16px;
+  line-height: 1;
+  transform: translateY(1px);
+  margin-right: 2px;
+}
+
+input[readonly] {
+  cursor: pointer;
+  color: var(--text-muted);
+}
+
+input[readonly]:hover {
+  border-color: var(--accent);
+}
+
+button.danger-outline {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: transparent;
+}
+
+button.danger-outline:hover {
+  background: rgba(239, 68, 68, 0.1);
 }
 
 .log-view {
@@ -568,21 +608,56 @@ button.small {
   color: var(--text);
 }
 
+.metric-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+@media (max-width: 700px) {
+  .metric-grid { grid-template-columns: 1fr; }
+}
+
 .metric-strip {
-  margin-bottom: 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
 }
 
 .metric-strip .metric-label {
   font-size: 11px;
   color: var(--text-muted);
-  margin-bottom: 3px;
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+
+.metric-strip-body {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.metric-axis {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  font-size: 9px;
+  color: var(--text-dim);
+  font-family: ui-monospace, monospace;
+  flex: 0 0 auto;
+  text-align: right;
+  padding-bottom: 1px;
 }
 
 .metric-bars {
   display: flex;
   align-items: flex-end;
   gap: 2px;
-  height: 32px;
+  height: 72px;
+  flex: 1;
+  min-width: 0;
 }
 
 .metric-bars .bar {
@@ -590,7 +665,7 @@ button.small {
   background: var(--success);
   border-radius: 2px 2px 0 0;
   min-width: 3px;
-  opacity: 0.55;
+  opacity: 0.6;
 }
 
 .metric-bars .bar.flagged {
@@ -631,18 +706,46 @@ button.small {
   align-items: center;
   justify-content: center;
   z-index: 200;
-  cursor: zoom-out;
 }
 
 .lightbox-overlay.open {
   display: flex;
 }
 
-.lightbox-overlay img {
+.lightbox-scroll {
   max-width: 92vw;
   max-height: 92vh;
+  overflow: auto;
   border-radius: 6px;
   border: 1px solid var(--border);
+  cursor: zoom-in;
+}
+
+.lightbox-scroll.zoomed {
+  cursor: zoom-out;
+}
+
+.lightbox-overlay img {
+  display: block;
+  max-width: 92vw;
+  max-height: 92vh;
+  width: auto;
+  transition: width 0.15s ease;
+}
+
+.lightbox-scroll.zoomed img {
+  max-width: none;
+  width: 220%;
+}
+
+.lightbox-hint {
+  position: absolute;
+  top: 18px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 11px;
 }
 
 .lightbox-caption {
@@ -663,10 +766,19 @@ button.small {
   border-radius: 8px;
   overflow: hidden;
   border: 1px solid var(--border);
+  /* Real stack results are ~6248x4176 (~3:2) — reserving that ratio up
+     front means switching stretch modes swaps the image in place instead
+     of the frame collapsing to 0 height while the new PNG decodes, which
+     was yanking the whole page up and burying the image below the fold
+     until it reloaded and the page had to be scrolled back down to it. */
+  aspect-ratio: 3 / 2;
+  background: #000;
 }
 
 .preview-frame img {
   width: 100%;
+  height: 100%;
+  object-fit: contain;
   display: block;
 }
 

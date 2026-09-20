@@ -50,26 +50,31 @@
           <div class="field">
             <label>Biases dir (relative to captures)</label>
             <div style="display:flex; gap:6px;">
-              <input type="text" id="biases-dir" value="biases" style="flex:1;" />
+              <input type="text" id="biases-dir" value="biases" style="flex:1;" readonly />
               <button type="button" class="small" id="biases-browse">…</button>
             </div>
           </div>
           <div class="field">
             <label>Darks dir (relative to captures)</label>
             <div style="display:flex; gap:6px;">
-              <input type="text" id="darks-dir" value="darks" style="flex:1;" />
+              <input type="text" id="darks-dir" value="darks" style="flex:1;" readonly />
               <button type="button" class="small" id="darks-browse">…</button>
             </div>
           </div>
         </div>
 
+        <div class="field">
+          <label><input type="checkbox" id="stage-is-osc" checked /> OSC / Bayer color camera (e.g. ASI2600MC) — used to debayer review thumbnails/previews</label>
+        </div>
+
         <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Sessions (each night's lights + matching flats)</label>
         <div id="stage-nights"></div>
         <button id="add-night-btn" class="small">+ Add session</button>
-        <p class="hint">Sessions are numbered automatically (Session 1, Session 2, …) — you never need to name them; internally they're stored as night1, night2, etc.</p>
+        <p class="hint">Sessions are numbered automatically (Session 1, Session 2, …) — you never need to name them; internally they're stored as night1, night2, etc. Checkboxes elsewhere show whatever your source folder was actually called.</p>
 
         <div class="progress-wrap">
           <button id="stage-btn" class="primary">Stage files</button>
+          <button id="stage-next-btn" class="ghost" style="display:none;">Next: Calibration Frames →</button>
           <div id="stage-summary"></div>
         </div>
       </div>
@@ -80,6 +85,7 @@
       <div class="card">
         <div class="card-header">
           <div class="card-title">Build shared bias/dark + per-night flats</div>
+          <div id="masters-status-badge" class="badge">not built</div>
         </div>
 
         <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Nights to build flats for</label>
@@ -106,8 +112,9 @@
           </div>
         </div>
 
-        <button id="masters-render-btn">▾ Preview script</button>
+        <button id="masters-render-btn" class="script-toggle-btn"><span class="arrow">▾</span> Preview script</button>
         <button id="masters-run-btn" class="primary">Build masters</button>
+        <button id="masters-next-btn" class="ghost" style="display:none;">Next: Review Light Frames →</button>
 
         <div id="masters-progress" class="progress-wrap" style="display:none;">
           <div class="progress-bar"><div class="progress-fill"></div></div>
@@ -123,6 +130,7 @@
       <div class="card">
         <div class="card-header">
           <div class="card-title">Per-frame quality check (astropy + photutils, no Siril)</div>
+          <div id="review-status-badge" class="badge">not analyzed</div>
         </div>
 
         <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Nights to analyze</label>
@@ -132,22 +140,29 @@
         <div class="adv-fields" data-adv="analyze">
           <div class="field-row">
             <div class="field">
+              <label>Star detection threshold (σ)</label>
+              <input type="number" id="analyze-threshold" value="8.0" step="0.5" />
+            </div>
+            <div class="field">
               <label>Bin factor</label>
               <input type="number" id="analyze-bin" value="4" min="1" />
             </div>
             <div class="field">
-              <label>Threshold (σ)</label>
-              <input type="number" id="analyze-threshold" value="8.0" step="0.5" />
+              <label>Outlier sensitivity (σ)</label>
+              <input type="number" id="analyze-anomaly-sigma" value="3.0" step="0.5" min="0.5" />
             </div>
           </div>
           <div class="help-box">
+            <b>Star detection threshold (σ)</b> controls how bright a spot must be, relative to the background noise, to count as a star. Lower finds more (fainter) stars but also more false positives from noise.<br /><br />
             <b>Bin factor</b> downsamples each frame before measuring it (4 = average every 4×4 block into one pixel). Higher is faster but <span class="warn-text">less precise</span> — FWHM/star detection get coarser and small anomalies can be missed entirely. 4 is a good default for a quick review; drop to 1 (full resolution, slower) if you suspect subtle issues aren't showing up.<br /><br />
-            <b>Threshold (σ)</b> controls how bright a spot must be, relative to the background noise, to count as a star. Lower finds more (fainter) stars but also more false positives from noise.
+            <b>Outlier sensitivity (σ)</b> is how many standard deviations a frame's stats must be from the rest of that night's own frames before it's flagged. Lower flags more frames (including borderline/noisy differences); higher only flags the clearest outliers. Default 3.0 — raise it if flagged frames don't look meaningfully worse than their neighbors.
           </div>
         </div>
 
         <button id="analyze-run-btn" class="primary">Analyze</button>
         <button id="analyze-rerun-btn" class="ghost" style="display:none;">↻ Re-analyze survivors</button>
+        <button id="analyze-reset-btn" class="danger-outline" style="display:none;">⟲ Start over</button>
+        <button id="review-next-btn" class="ghost" style="display:none;">Next: Stack →</button>
 
         <div id="analyze-progress" class="progress-wrap" style="display:none;">
           <div class="progress-bar"><div class="progress-fill"></div></div>
@@ -155,6 +170,9 @@
         </div>
         <div id="analyze-result"></div>
 
+        <div id="analyze-actions" style="display:none; margin:10px 0;">
+          <button id="analyze-accept-recommended-btn" class="small">✓ Accept recommended exclusions</button>
+        </div>
         <div id="analyze-output"></div>
         <p class="hint">Flags are recommendations only — nothing is excluded unless you check it below. FWHM/eccentricity use photutils' own conventions (eccentricity here = "roundness": 0 = round, higher = more elongated) and are not comparable to Siril's.</p>
       </div>
@@ -165,6 +183,7 @@
       <div class="card">
         <div class="card-header">
           <div class="card-title">Calibrate, register, stack into result.fit</div>
+          <div id="stack-status-badge" class="badge">not stacked</div>
         </div>
 
         <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Nights to stack</label>
@@ -198,12 +217,18 @@
         <div class="adv-fields" data-adv="stack">
           <div class="field-row">
             <div class="field">
-              <label>Master dark override (absolute path)</label>
-              <input type="text" id="stack-master-dark" placeholder="default: shared master_dark" />
+              <label>Master dark override</label>
+              <div style="display:flex; gap:6px;">
+                <input type="text" id="stack-master-dark" placeholder="default: shared master_dark" style="flex:1;" readonly />
+                <button type="button" class="small" id="stack-master-dark-browse">…</button>
+              </div>
             </div>
             <div class="field">
-              <label>Master flat override (absolute path)</label>
-              <input type="text" id="stack-master-flat" placeholder="default: per-night master_flat" />
+              <label>Master flat override</label>
+              <div style="display:flex; gap:6px;">
+                <input type="text" id="stack-master-flat" placeholder="default: per-night master_flat" style="flex:1;" readonly />
+                <button type="button" class="small" id="stack-master-flat-browse">…</button>
+              </div>
             </div>
           </div>
           <p class="hint">Master flat override applies to ALL selected nights uniformly — use only if a night is missing its own flats. See Handoff.md.</p>
@@ -214,7 +239,7 @@
           <div id="exclude-list" class="hint">none</div>
         </div>
 
-        <button id="stack-render-btn">▾ Preview script</button>
+        <button id="stack-render-btn" class="script-toggle-btn"><span class="arrow">▾</span> Preview script</button>
         <button id="stack-run-btn" class="primary">Run stack</button>
 
         <div id="stack-pipeline" class="pipeline-steps" style="display:none;"></div>
@@ -232,7 +257,10 @@
 </main>
 
 <div class="lightbox-overlay" id="lightbox">
-  <img id="lightbox-img" src="" alt="" />
+  <div class="lightbox-hint">click image to zoom · scroll to pan</div>
+  <div class="lightbox-scroll" id="lightbox-scroll">
+    <img id="lightbox-img" src="" alt="" />
+  </div>
   <div class="lightbox-caption" id="lightbox-caption"></div>
 </div>
 
