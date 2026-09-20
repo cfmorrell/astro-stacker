@@ -36,177 +36,205 @@
 
   <div id="project-panels" style="display:none;">
 
-    <div class="section-title">1 · Stage</div>
-    <div class="card">
-      <div class="card-header">
-        <div class="card-title">Import raw frames from captures</div>
-        <div id="stage-status-badge" class="badge">not staged</div>
-      </div>
+    <div class="stepper" id="stepper"></div>
 
-      <div class="field-row">
-        <div class="field">
-          <label>Biases dir (relative to captures)</label>
-          <input type="text" id="biases-dir" value="biases" />
+    <!-- ============ STAGE ============ -->
+    <section class="step-panel" data-step="stage">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">Import raw frames from captures</div>
+          <div id="stage-status-badge" class="badge">not staged</div>
         </div>
-        <div class="field">
-          <label>Darks dir (relative to captures)</label>
-          <input type="text" id="darks-dir" value="darks" />
-        </div>
-      </div>
 
-      <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Nights (sessions)</label>
-      <div id="stage-nights"></div>
-      <button id="add-night-btn" class="small">+ Add night</button>
-
-      <div class="progress-wrap">
-        <button id="stage-btn" class="primary">Stage files</button>
-        <div id="stage-result" class="status-line"></div>
-      </div>
-    </div>
-
-    <div class="section-title">2 · Masters</div>
-    <div class="card">
-      <div class="card-header">
-        <div class="card-title">Build shared bias/dark + per-night flats</div>
-      </div>
-
-      <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Nights to build flats for</label>
-      <div id="masters-nights" class="checklist"></div>
-
-      <div class="field-row">
-        <div class="field">
-          <label>Stack method</label>
-          <select id="masters-method">
-            <option value="rej">Rejection (sigma)</option>
-            <option value="med">Median</option>
-            <option value="sum">Sum</option>
-            <option value="max">Max</option>
-            <option value="min">Min</option>
-          </select>
-        </div>
-        <div class="field">
-          <label>Sigma low</label>
-          <input type="number" id="masters-sigma-low" value="3.0" step="0.1" />
-        </div>
-        <div class="field">
-          <label>Sigma high</label>
-          <input type="number" id="masters-sigma-high" value="3.0" step="0.1" />
-        </div>
-      </div>
-
-      <button id="masters-render-btn" class="ghost">Preview script</button>
-      <button id="masters-run-btn" class="primary">Build masters</button>
-
-      <div id="masters-progress" class="progress-wrap" style="display:none;">
-        <div class="progress-bar"><div class="progress-fill"></div></div>
-        <div class="progress-label"><span class="pct">0%</span><span class="msg"></span></div>
-      </div>
-      <div id="masters-result" class="status-line"></div>
-      <div class="log-toggle" data-log-for="masters">show script / log</div>
-      <div class="log-view" data-log-view="masters"></div>
-    </div>
-
-    <div class="section-title">3 · Review lights</div>
-    <div class="card">
-      <div class="card-header">
-        <div class="card-title">Per-frame quality check (astropy + photutils, no Siril)</div>
-      </div>
-
-      <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Nights to analyze</label>
-      <div id="analyze-nights" class="checklist"></div>
-
-      <span class="toggle-adv" data-adv-for="analyze">advanced options</span>
-      <div class="adv-fields field-row" data-adv="analyze">
-        <div class="field">
-          <label>Bin factor</label>
-          <input type="number" id="analyze-bin" value="4" min="1" />
-        </div>
-        <div class="field">
-          <label>Threshold (σ)</label>
-          <input type="number" id="analyze-threshold" value="8.0" step="0.5" />
-        </div>
-      </div>
-
-      <button id="analyze-run-btn" class="primary">Analyze</button>
-
-      <div id="analyze-progress" class="progress-wrap" style="display:none;">
-        <div class="progress-bar"><div class="progress-fill"></div></div>
-        <div class="progress-label"><span class="pct">0%</span><span class="msg"></span></div>
-      </div>
-      <div id="analyze-result" class="status-line"></div>
-
-      <div id="analyze-output"></div>
-      <p class="hint">Flags are recommendations only — nothing is excluded unless you check it below. Numbers use photutils' own conventions (roundness: 0 = round, higher = more elongated) and are not comparable to Siril's.</p>
-    </div>
-
-    <div class="section-title">4 · Stack</div>
-    <div class="card">
-      <div class="card-header">
-        <div class="card-title">Calibrate, register, stack into result.fit</div>
-      </div>
-
-      <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Nights to stack</label>
-      <div id="stack-nights" class="checklist"></div>
-
-      <div class="field-row">
-        <div class="field">
-          <label>Stack method</label>
-          <select id="stack-method">
-            <option value="rej">Rejection (sigma)</option>
-            <option value="med">Median</option>
-            <option value="sum">Sum</option>
-            <option value="max">Max</option>
-            <option value="min">Min</option>
-          </select>
-        </div>
-        <div class="field">
-          <label>Sigma low</label>
-          <input type="number" id="stack-sigma-low" value="3.0" step="0.1" />
-        </div>
-        <div class="field">
-          <label>Sigma high</label>
-          <input type="number" id="stack-sigma-high" value="3.0" step="0.1" />
-        </div>
-      </div>
-      <div class="field">
-        <label><input type="checkbox" id="stack-is-osc" checked /> OSC / Bayer camera (debayer during calibration)</label>
-      </div>
-
-      <span class="toggle-adv" data-adv-for="stack">advanced options</span>
-      <div class="adv-fields" data-adv="stack">
         <div class="field-row">
           <div class="field">
-            <label>Master dark override (absolute path)</label>
-            <input type="text" id="stack-master-dark" placeholder="default: shared master_dark" />
+            <label>Biases dir (relative to captures)</label>
+            <div style="display:flex; gap:6px;">
+              <input type="text" id="biases-dir" value="biases" style="flex:1;" />
+              <button type="button" class="small" id="biases-browse">…</button>
+            </div>
           </div>
           <div class="field">
-            <label>Master flat override (absolute path)</label>
-            <input type="text" id="stack-master-flat" placeholder="default: per-night master_flat" />
+            <label>Darks dir (relative to captures)</label>
+            <div style="display:flex; gap:6px;">
+              <input type="text" id="darks-dir" value="darks" style="flex:1;" />
+              <button type="button" class="small" id="darks-browse">…</button>
+            </div>
           </div>
         </div>
-        <p class="hint">Master flat override applies to ALL selected nights uniformly — use only if a night is missing its own flats. See Handoff.md.</p>
-      </div>
 
-      <div class="field">
-        <label>Excluded frames (<span id="exclude-count">0</span> selected in Review above)</label>
-        <div id="exclude-list" class="hint">none</div>
-      </div>
+        <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Sessions (each night's lights + matching flats)</label>
+        <div id="stage-nights"></div>
+        <button id="add-night-btn" class="small">+ Add session</button>
+        <p class="hint">Sessions are numbered automatically (Session 1, Session 2, …) — you never need to name them; internally they're stored as night1, night2, etc.</p>
 
-      <button id="stack-render-btn" class="ghost">Preview script</button>
-      <button id="stack-run-btn" class="primary">Run stack</button>
-
-      <div id="stack-progress" class="progress-wrap" style="display:none;">
-        <div class="progress-bar"><div class="progress-fill"></div></div>
-        <div class="progress-label"><span class="pct">0%</span><span class="msg"></span></div>
+        <div class="progress-wrap">
+          <button id="stage-btn" class="primary">Stage files</button>
+          <div id="stage-summary"></div>
+        </div>
       </div>
-      <div id="stack-result" class="status-line"></div>
-      <div class="log-toggle" data-log-for="stack">show script / log</div>
-      <div class="log-view" data-log-view="stack"></div>
-      <div id="stack-preview"></div>
-    </div>
+    </section>
+
+    <!-- ============ MASTERS ============ -->
+    <section class="step-panel" data-step="masters">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">Build shared bias/dark + per-night flats</div>
+        </div>
+
+        <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Nights to build flats for</label>
+        <div id="masters-nights" class="checklist"></div>
+
+        <div class="field-row">
+          <div class="field">
+            <label>Stack method</label>
+            <select id="masters-method">
+              <option value="rej">Rejection (sigma)</option>
+              <option value="med">Median</option>
+              <option value="sum">Sum</option>
+              <option value="max">Max</option>
+              <option value="min">Min</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Sigma low</label>
+            <input type="number" id="masters-sigma-low" value="3.0" step="0.1" />
+          </div>
+          <div class="field">
+            <label>Sigma high</label>
+            <input type="number" id="masters-sigma-high" value="3.0" step="0.1" />
+          </div>
+        </div>
+
+        <button id="masters-render-btn">▾ Preview script</button>
+        <button id="masters-run-btn" class="primary">Build masters</button>
+
+        <div id="masters-progress" class="progress-wrap" style="display:none;">
+          <div class="progress-bar"><div class="progress-fill"></div></div>
+          <div class="progress-label"><span class="pct">0%</span><span class="msg"></span></div>
+        </div>
+        <div id="masters-result"></div>
+        <div class="log-view" data-log-view="masters"></div>
+      </div>
+    </section>
+
+    <!-- ============ REVIEW ============ -->
+    <section class="step-panel" data-step="review">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">Per-frame quality check (astropy + photutils, no Siril)</div>
+        </div>
+
+        <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Nights to analyze</label>
+        <div id="analyze-nights" class="checklist"></div>
+
+        <span class="toggle-adv" data-adv-for="analyze">advanced options</span>
+        <div class="adv-fields" data-adv="analyze">
+          <div class="field-row">
+            <div class="field">
+              <label>Bin factor</label>
+              <input type="number" id="analyze-bin" value="4" min="1" />
+            </div>
+            <div class="field">
+              <label>Threshold (σ)</label>
+              <input type="number" id="analyze-threshold" value="8.0" step="0.5" />
+            </div>
+          </div>
+          <div class="help-box">
+            <b>Bin factor</b> downsamples each frame before measuring it (4 = average every 4×4 block into one pixel). Higher is faster but <span class="warn-text">less precise</span> — FWHM/star detection get coarser and small anomalies can be missed entirely. 4 is a good default for a quick review; drop to 1 (full resolution, slower) if you suspect subtle issues aren't showing up.<br /><br />
+            <b>Threshold (σ)</b> controls how bright a spot must be, relative to the background noise, to count as a star. Lower finds more (fainter) stars but also more false positives from noise.
+          </div>
+        </div>
+
+        <button id="analyze-run-btn" class="primary">Analyze</button>
+        <button id="analyze-rerun-btn" class="ghost" style="display:none;">↻ Re-analyze survivors</button>
+
+        <div id="analyze-progress" class="progress-wrap" style="display:none;">
+          <div class="progress-bar"><div class="progress-fill"></div></div>
+          <div class="progress-label"><span class="pct">0%</span><span class="msg"></span></div>
+        </div>
+        <div id="analyze-result"></div>
+
+        <div id="analyze-output"></div>
+        <p class="hint">Flags are recommendations only — nothing is excluded unless you check it below. FWHM/eccentricity use photutils' own conventions (eccentricity here = "roundness": 0 = round, higher = more elongated) and are not comparable to Siril's.</p>
+      </div>
+    </section>
+
+    <!-- ============ STACK ============ -->
+    <section class="step-panel" data-step="stack">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">Calibrate, register, stack into result.fit</div>
+        </div>
+
+        <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Nights to stack</label>
+        <div id="stack-nights" class="checklist"></div>
+
+        <div class="field-row">
+          <div class="field">
+            <label>Stack method</label>
+            <select id="stack-method">
+              <option value="rej">Rejection (sigma)</option>
+              <option value="med">Median</option>
+              <option value="sum">Sum</option>
+              <option value="max">Max</option>
+              <option value="min">Min</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Sigma low</label>
+            <input type="number" id="stack-sigma-low" value="3.0" step="0.1" />
+          </div>
+          <div class="field">
+            <label>Sigma high</label>
+            <input type="number" id="stack-sigma-high" value="3.0" step="0.1" />
+          </div>
+        </div>
+        <div class="field">
+          <label><input type="checkbox" id="stack-is-osc" checked /> OSC / Bayer camera (debayer during calibration)</label>
+        </div>
+
+        <span class="toggle-adv" data-adv-for="stack">advanced options</span>
+        <div class="adv-fields" data-adv="stack">
+          <div class="field-row">
+            <div class="field">
+              <label>Master dark override (absolute path)</label>
+              <input type="text" id="stack-master-dark" placeholder="default: shared master_dark" />
+            </div>
+            <div class="field">
+              <label>Master flat override (absolute path)</label>
+              <input type="text" id="stack-master-flat" placeholder="default: per-night master_flat" />
+            </div>
+          </div>
+          <p class="hint">Master flat override applies to ALL selected nights uniformly — use only if a night is missing its own flats. See Handoff.md.</p>
+        </div>
+
+        <div class="field">
+          <label>Excluded frames (<span id="exclude-count">0</span> selected in Review)</label>
+          <div id="exclude-list" class="hint">none</div>
+        </div>
+
+        <button id="stack-render-btn">▾ Preview script</button>
+        <button id="stack-run-btn" class="primary">Run stack</button>
+
+        <div id="stack-pipeline" class="pipeline-steps" style="display:none;"></div>
+        <div id="stack-progress" class="progress-wrap" style="display:none;">
+          <div class="progress-bar"><div class="progress-fill"></div></div>
+          <div class="progress-label"><span class="pct">0%</span><span class="msg"></span></div>
+        </div>
+        <div id="stack-result"></div>
+        <div class="log-view" data-log-view="stack"></div>
+        <div id="stack-preview"></div>
+      </div>
+    </section>
 
   </div>
 </main>
+
+<div class="lightbox-overlay" id="lightbox">
+  <img id="lightbox-img" src="" alt="" />
+  <div class="lightbox-caption" id="lightbox-caption"></div>
+</div>
 
 <script src="/app.js"></script>
 </body>

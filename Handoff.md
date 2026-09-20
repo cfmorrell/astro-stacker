@@ -374,8 +374,91 @@ Siril ones, but the same "don't rediscover this" spirit applies.
    requested `max_size`. The frontend requests `max_size=320` for the
    review grid and the full default (1024) for the one large stack
    result preview.
+4. **Two overlapping `/masters/run` or `/stack/run` calls against the same
+   project race on the same scratch directories.** Found by accident
+   while testing the redesigned frontend (2026-09-2x): fired a stack run,
+   then fired a second one against the same project before the first
+   finished. The second call's `ssf.prepare_fresh_dirs()` tried to
+   `shutil.rmtree()` a `process/nights/.../lights` dir the *first* run's
+   still-live `siril-cli` subprocess was actively writing into ->
+   `OSError: [Errno 39] Directory not empty`, an unhandled 500. Not fixed
+   at the API level (the job manager has no per-project lock) — mitigated
+   in the frontend instead: `app.js`'s `pollJob()` now disables the
+   triggering Run/Analyze button for the duration of that job
+   (`lockButtons` option), so a normal double-click or a second click
+   after navigating away and back can't trigger this through the UI.
+   Two different browser tabs, or a Swagger UI call made while the
+   frontend also has a job running, still can — a real gap, just a
+   narrower one than "any double-click breaks it."
+5. **HEAD requests 404 across this entire FastAPI app, not just one
+   route.** Discovered testing the new download button with
+   `fetch(url, {method: "HEAD"})` — got a 404 with Starlette's generic
+   `{"detail":"Not Found"}` body. Confirmed with `curl -I` against
+   `/health` itself: same 404. This is a property of the FastAPI/
+   Starlette versions pinned in this container, not a bug in any one
+   endpoint — GET still works normally (verified: `GET /projects/{name}/
+   download` returns 200 with correct `content-disposition`/
+   `content-length`/`accept-ranges` headers and the real file body). A
+   real browser download link (`<a href>` click, or `curl` with no
+   `-I`/`-X HEAD`) always issues GET, so this doesn't affect actual
+   users — just don't waste time debugging a "download is broken" report
+   that turns out to be a HEAD-based health check or test script.
 
-## Current validated status
+- ✅ **Frontend redesigned per Chris's 19-item live-usage feedback and
+  re-validated end-to-end (2026-09-2x)**, superseding the first-version
+  frontend described below. Chris used the first version, listed 19
+  specific issues in one message, and all 19 were addressed in this pass:
+  1) new indigo/blue/amber/green/red palette (no longer visually an
+  astrolab reskin — kept its dark theme); 2) a clickable step-wizard
+  (`#stepper` in `index.html`, driven by `renderStepper()`/`stepStatus()`
+  in `app.js`) showing Stage/Masters/Review/Stack, with only the active
+  step's panel visible, checkmarks on completed steps, and disabled
+  (unclickable) steps whose prerequisites aren't met yet; 3) an ellipsis
+  (`…`) folder-browse button on the biases/darks dir fields, reusing the
+  same picker built for staging's night rows; 4) sessions are auto-
+  numbered ("Session 1", "Session 2", ...) with no name field exposed —
+  internally still staged as `night1`/`night2`; 5) the stage result
+  renders as a clean checkmarked list (`.stage-summary`), not raw JSON;
+  6) masters' status/log display kept as-is (Chris confirmed it was
+  already right); 7) "Preview script" is now a single arrow-toggle button
+  (▾/▴) that shows/hides the script inline, replacing the old separate
+  show/hide links; 8) a green `.complete-banner`/red `.error-banner`
+  makes step completion or failure unambiguous everywhere a job finishes;
+  9) clicking a review thumbnail opens a full-size lightbox
+  (`#lightbox` overlay); 10) frame cards show `DATE-OBS` (via
+  `framestats.py`'s new `captured_at` field) and the backend now sorts
+  each night's frames chronologically before returning them, since bad
+  frames cluster in time (clouds, dusk/dawn); 11) flagged vs. clean is
+  now unambiguous green/red (frame-card left border, metric bars, badge)
+  instead of the old teal/orange; 12) a "↻ Re-analyze survivors" button
+  re-runs `/lights/analyze/run` with the current exclusions already
+  applied; 13) FWHM and eccentricity (`roundness`) are now shown per
+  frame alongside star count and SNR; 14) a `.help-box` explains bin
+  factor (with an explicit warning about the precision/speed tradeoff)
+  and threshold sigma; 15) an "Accept exclusions — show survivors only"
+  toggle filters the review grid down to what will actually reach Stack;
+  16) nights over 20 frames collapse to flagged frames ± 2 chronological
+  neighbors, with the hidden runs shown as a clickable "⋯ N more" tile
+  that expands in place (`computeVisibleItems()` in `app.js`) — logic
+  reviewed carefully but **not exercised against real data**, since no
+  test project currently has a night that large; 17) the Stack section
+  shows a live pipeline diagram (`#stack-pipeline`, driven by the job's
+  new `steps`/`current_step_index` fields — see `app/jobs.py`) alongside
+  the percent bar; 18) a none/linked/unlinked stretch-mode toggle on the
+  final stack preview (`app/imaging.py`'s `render_preview_png(...,
+  stretch=...)`, backed by `AsinhStretch`+`PercentileInterval`); 19) a
+  working download button (`GET /projects/{name}/download`) for the
+  full-resolution `.fit`, verified to return the correct
+  `content-disposition`/`content-length` and actual file bytes. All of
+  this (except item 16, per above) was driven through a real, scripted
+  headless-Chrome session against `multi1`'s real two-night data and a
+  disposable clone project (`uitest`, since deleted) — including running
+  a real ~185s two-night stack to completion and confirming the download
+  actually serves the resulting 313MB `result.fit`. This session's
+  testing also found and fixed a real bug — see Frontend/web gotcha #4
+  (concurrent-run race) — and ruled out a false alarm — gotcha #5
+  (HEAD requests 404 globally in this environment; irrelevant to real
+  browser downloads, which use GET).
 - ✅ **First-version frontend built and validated end-to-end against real
   data (2026-09-2x)**: `app/static/` (`index.html`/`app.js`/`styles.css`),
   served by FastAPI. Covers the full flow — stage (with a `/captures`
@@ -394,8 +477,9 @@ Siril ones, but the same "don't rediscover this" spirit applies.
   caught both bugs in the Frontend/web gotchas section above before
   Chris ever saw them. Styling follows astrolab's dark card-based look;
   functionality follows Siril's own OSC Multi-Night Stacking tool
-  (per Chris) rather than astrolab's much larger pipeline. See Immediate
-  next steps for what this first pass doesn't cover yet.
+  (per Chris) rather than astrolab's much larger pipeline. Superseded by
+  the redesign above — kept here for the backend endpoints it introduced,
+  which are still current.
 - ✅ Docker build/run/exec loop works on the NAS.
 - ✅ git push works with the repo-local SSH key.
 - ✅ `siril-cli` invocation confirmed correct (gotcha #1 above).
@@ -640,25 +724,32 @@ lights phases, FastAPI render/run + background jobs, progress parsing,
 real multi-night validation, a staging endpoint, frame review/filtering
 (recommend-only, on astropy+photutils, with anomaly-based flagging
 validated against real known-bad frames), both Siril gotcha #6/#8 fixes
-in `/masters/run` and `/stack/run`, and now a first-version frontend (see
-"Current validated status" for all of it). Crop is permanently out of
-scope (Architecture decisions), not deferred. Archive/cleanup is
+in `/masters/run` and `/stack/run`, a first-version frontend, and now a
+full redesign addressing all 19 items from Chris's live-usage feedback
+(see "Current validated status" for all of it). Crop is permanently out
+of scope (Architecture decisions), not deferred. Archive/cleanup is
 explicitly deferred per Chris, not started. What's actually left:
 
-1. **The frontend is a first pass, not a finished UI.** Chris said "let's
-   see where we land" — this is that first landing, not the destination.
-   Known gaps, roughly in order of what'll be noticed first: no way to
-   *remove* a staged night or re-stage over one that already exists from
-   the UI (the API supports re-running `/stage`, the form just doesn't
-   pre-fill from what's already there); the folder browser
-   (`/captures/browse`) has no breadcrumb trail, just an "← up" button;
-   no polling/auto-refresh of project status while a job from *another*
-   browser tab or the Swagger UI is running; the exclude-frames list is
-   global across nights in one request (matches the API's own semantics,
-   see gotcha-adjacent note in `StackLightsRequest`, but worth a UI hint
-   if it ever causes confusion); no way to browse job history (only the
-   most recently started job's progress is shown per section, nothing
-   persists across a page reload). None of these are hard, just not done.
+1. **The redesigned frontend is still not a finished UI** — closer to
+   done, but real gaps remain: no way to *remove* a staged night or
+   re-stage over one that already exists from the UI (the API supports
+   re-running `/stage`, the form just doesn't pre-fill from what's
+   already there); the folder browser (`/captures/browse`) has no
+   breadcrumb trail, just an "← up" button; no polling/auto-refresh of
+   project status while a job from *another* browser tab or the Swagger
+   UI is running — combined with Frontend/web gotcha #4, two tabs
+   running jobs against the same project at once can still 500; the
+   exclude-frames list is global across nights in one request (matches
+   the API's own semantics, see gotcha-adjacent note in
+   `StackLightsRequest`, but worth a UI hint if it ever causes
+   confusion); no way to browse job history (only the most recently
+   started job's progress is shown per section, nothing persists across
+   a page reload); the large-night collapsing behavior (item 16 of
+   Chris's feedback — flagged frames ± 2 neighbors, rest collapsed to an
+   expandable "N more") is implemented but has never been exercised
+   against a real >20-frame night, since no current test project has one
+   — worth a specific look once real data that size exists. None of
+   these are hard, just not done.
 2. **No image thumbnails for the *stack* preview's intermediate steps** —
    only the raw lights (Review) and the final `result.fit` (Stack) get
    previews. A real "blink through everything" experience closer to the
