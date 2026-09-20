@@ -6,11 +6,11 @@ requires 1.4.0
 # and merge's bare positional paths stay quoted.
 
 {% for night in nights %}
-# ---- Lights: {{ night.raw_lights }} ----
+# ---- Lights: {{ night.key }} ({{ night.raw_lights }}) ----
 cd "{{ night.raw_lights }}"
 convert light -out={{ night.process_dir }}
 cd "{{ night.process_dir }}"
-calibrate light -dark={{ dark_master }} -flat={{ flat_master }}{{ cc_flag }}{{ osc_flags }}
+calibrate light -dark={{ dark_master }} -flat={{ night.flat_master }}{{ cc_flag }}{{ osc_flags }}
 {% endfor %}
 # ---- Registration & stack ----
 {% if single %}

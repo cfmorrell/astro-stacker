@@ -1,24 +1,36 @@
 """Renders .ssf scripts from the templates/ dir.
 
-The single-night path in render_stack_lights() is deliberately kept
-identical in structure to the hand-validated script in Handoff.md
-("Validated .ssf script" section) — convert -> calibrate -> register
-pp_light -> stack r_pp_light — just with the stack method and master
-paths parameterized. Multi-night stacking is new (not yet validated
-against real multi-night data) and uses Siril's `merge` across each
-night's pp_light sequence, following the pattern in rolandet's
-osc-multi-night-stacking script (GPLv3, referenced for structure only,
-per Handoff.md's licensing note).
+The single-night path is deliberately kept identical in structure to the
+hand-validated script in Handoff.md ("Validated .ssf script" section) —
+convert -> calibrate -> register pp_light -> stack r_pp_light — just with
+the stack method and master paths parameterized. Multi-night stacking uses
+Siril's `merge` across each night's pp_light sequence, following the
+pattern in rolandet's osc-multi-night-stacking script (GPLv3, referenced
+for structure only, per Handoff.md's licensing note).
+
+Raw/process layout:
+    raw/biases, raw/darks              — shared across the whole project
+    raw/flats, raw/lights              — legacy single-night layout
+    raw/nights/<name>/{lights,flats}   — multi-night layout
+    process/master_bias, process/master_dark        — always shared
+    process/master_flat                              — legacy single-night
+    process/nights/<name>/master_flat                — per-night (multi)
 """
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
 
-from .models import BuildMastersRequest, StackLightsRequest
+from .models import (
+    AnalyzeLightsRequest,
+    BuildMastersRequest,
+    LightsSelectionRequest,
+    StackLightsRequest,
+)
 
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
 
@@ -28,6 +40,22 @@ _env = Environment(
     lstrip_blocks=True,
     keep_trailing_newline=True,
 )
+
+_FIT_SUFFIXES = {".fit", ".fits"}
+
+
+@dataclass
+class LightSelection:
+    """Describes a human-filtered subset of a night's raw lights: symlink
+    every file in source_dir except those named in `exclude` into
+    dest_dir. Built by _resolve_nights() when exclude_frames is non-empty;
+    applied by apply_light_selections() right before a job runs (never
+    inside render_*(), which stays a side-effect-free dry run).
+    """
+
+    source_dir: Path
+    dest_dir: Path
+    exclude: frozenset[str]
 
 
 @dataclass
@@ -39,42 +67,147 @@ class RenderedScript:
     # `cd` itself needs its target to already exist and be writable
     # (Handoff.md gotcha #2). The caller must mkdir these before running
     # the script; render_*() itself stays a pure, side-effect-free dry run.
+    # Used for directories that hold PERSISTENT output (master_bias.fit
+    # etc.) that must survive across runs — never wiped.
     ensure_dirs: list[Path] = field(default_factory=list)
+    # Disposable per-run scratch workspaces (light conversion/registration)
+    # that the caller must wipe-and-recreate via prepare_fresh_dirs() before
+    # running the script — see gotcha #6 in Handoff.md: Siril's `calibrate`
+    # rescans its whole cwd by filename pattern, so any files left over
+    # from a *previous* run with a different frame count get silently
+    # folded into the new sequence. Never reuse these across runs.
+    fresh_dirs: list[Path] = field(default_factory=list)
+    # Frame-exclusion symlink trees the caller must populate (via
+    # apply_light_selections()) before running the script — see
+    # LightSelection above.
+    light_selections: list[LightSelection] = field(default_factory=list)
+    # Resolved per-night {key, raw_lights, process_dir} dicts, for callers
+    # that need to locate output after the job runs (e.g. main.py parsing
+    # each night's r_pp_light_.seq for /lights/analyze results).
+    nights: list[dict] = field(default_factory=list)
+
+
+def apply_light_selections(selections: list[LightSelection]) -> None:
+    """Populate each LightSelection's dest_dir from scratch (removing any
+    stale symlinks from a previous run with a different exclude list),
+    symlinking every raw light frame except the excluded basenames.
+    """
+    for sel in selections:
+        if sel.dest_dir.exists():
+            shutil.rmtree(sel.dest_dir)
+        sel.dest_dir.mkdir(parents=True, exist_ok=True)
+        for src in sorted(sel.source_dir.iterdir()):
+            if src.suffix.lower() not in _FIT_SUFFIXES:
+                continue
+            if src.name in sel.exclude:
+                continue
+            (sel.dest_dir / src.name).symlink_to(src.resolve())
+
+
+def prepare_fresh_dirs(dirs: list[Path]) -> None:
+    """Wipe and recreate each directory from scratch. Used for the
+    disposable light-conversion workspace (process/lights or
+    process/nights/<name>/lights) right before every /stack/run or
+    /lights/analyze/run — never for directories holding persistent master
+    files. See RenderedScript.fresh_dirs and Handoff.md gotcha #6.
+    """
+    for d in dirs:
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True, exist_ok=True)
 
 
 def render_build_masters(project: Path, req: BuildMastersRequest) -> RenderedScript:
     raw = project / "raw"
     process = project / "process"
     build_bias = (raw / "biases").is_dir()
+    build_dark = (raw / "darks").is_dir()
+
+    flat_targets: list[dict] = []
+    ensure_dirs = [process]
+
+    if not req.nights:
+        flats_dir = raw / "flats"
+        if flats_dir.is_dir():
+            flat_targets.append(
+                {
+                    "label": "(single night)",
+                    "raw_flats": str(flats_dir),
+                    "process_dir": str(process),
+                    # Relative: read back from the same process_dir the
+                    # flat conversion just cd'd into (matches the
+                    # hand-validated script exactly).
+                    "bias_arg": "master_bias" if build_bias else None,
+                }
+            )
+    else:
+        # Absolute: each night's flats are calibrated from a *different*
+        # process_dir than the shared master_bias lives in.
+        bias_arg_abs = str(process / "master_bias") if build_bias else None
+        for name in req.nights:
+            if not name or "/" in name or name in (".", ".."):
+                raise ValueError(f"invalid night name: {name!r}")
+            flats_dir = raw / "nights" / name / "flats"
+            if flats_dir.is_dir():
+                night_process = process / "nights" / name
+                flat_targets.append(
+                    {
+                        "label": name,
+                        "raw_flats": str(flats_dir),
+                        "process_dir": str(night_process),
+                        "bias_arg": bias_arg_abs,
+                    }
+                )
+                ensure_dirs.append(night_process)
+
     template = _env.get_template("build_masters.ssf.j2")
     text = template.render(
         build_bias=build_bias,
-        build_dark=(raw / "darks").is_dir(),
-        build_flat=(raw / "flats").is_dir(),
+        build_dark=build_dark,
         raw_biases=str(raw / "biases"),
         raw_darks=str(raw / "darks"),
-        raw_flats=str(raw / "flats"),
         process_dir=str(process),
         stack_cmd=req.stack.to_ssf(),
-        # Flat calibration wants the bias we just built, if any; -bias here
-        # is relative because it's read back from the same process_dir the
-        # flat conversion just cd'd into.
-        bias_arg="master_bias" if build_bias else None,
+        flat_targets=flat_targets,
     )
-    return RenderedScript(text=text, ensure_dirs=[process])
+    return RenderedScript(text=text, ensure_dirs=ensure_dirs)
 
 
-def render_stack_lights(project: Path, req: StackLightsRequest) -> RenderedScript:
+def _resolve_nights(
+    project: Path, req: LightsSelectionRequest
+) -> tuple[list[dict], str, bool, list[LightSelection], Path | None]:
+    """Shared night/master resolution for stacking and analysis. Returns
+    (nights, dark_master, single, light_selections, merge_dir), raising
+    ValueError (-> HTTP 400 in main.py) for anything that would otherwise
+    reach siril-cli as a silent, confusing failure: a bad night name, a
+    missing lights directory, or a missing master file (see Handoff.md
+    gotcha #4 and the 2026-09-20 "string" placeholder incident this
+    validation was added for).
+
+    Each night's `process_dir` is a disposable conversion workspace
+    (process/lights or process/nights/<name>/lights) — deliberately
+    *separate* from wherever that night's persistent master_flat.fit
+    lives, and always wiped fresh by prepare_fresh_dirs() before a run
+    (see gotcha #6: reusing a directory that still has a *previous* run's
+    numbered frame files in it gets them silently folded into the new
+    sequence by Siril's own directory rescan). `merge_dir` is an
+    additional disposable workspace for the final merge/register/stack
+    step in multi-night mode (None for single-night, where that step just
+    reuses the one night's own process_dir).
+    """
     raw = project / "raw"
     process = project / "process"
-    single = len(req.nights) == 1 and req.nights[0] == ""
+    single = not req.nights or (len(req.nights) == 1 and req.nights[0] == "")
 
-    nights = []
+    nights: list[dict] = []
+    merge_dir: Path | None = None
     if single:
         nights.append(
             {
-                "raw_lights": str(raw / "lights"),
-                "process_dir": str(process),
+                "key": "single",
+                "raw_lights": raw / "lights",
+                "process_dir": process / "lights",
+                "flat_master": req.master_flat or str(process / "master_flat"),
             }
         )
     else:
@@ -83,52 +216,92 @@ def render_stack_lights(project: Path, req: StackLightsRequest) -> RenderedScrip
                 raise ValueError(f"invalid night name: {name!r}")
             nights.append(
                 {
-                    "raw_lights": str(raw / name / "lights"),
-                    "process_dir": str(process / "lights" / name),
+                    "key": name,
+                    "raw_lights": raw / "nights" / name / "lights",
+                    "process_dir": process / "nights" / name / "lights",
+                    "flat_master": req.master_flat or str(process / "nights" / name / "master_flat"),
                 }
             )
+        merge_dir = process / "lights" / "_merged"
 
-    # Fail fast with a clear message instead of handing siril-cli a path
-    # that doesn't exist — a `cd` into a missing dir buries the real
-    # problem 20+ lines into Siril's own log output (see Handoff.md
-    # gotcha #2). This is also what catches a Swagger UI "Try it out"
-    # request sent with its auto-filled placeholder values unedited
-    # (e.g. nights=["string"]) before it ever reaches siril-cli.
-    for night in nights:
-        if not Path(night["raw_lights"]).is_dir():
-            raise ValueError(
-                f"lights directory not found: {night['raw_lights']!r} "
-                "(check the project's raw/ layout, or the `nights` list "
-                "if this is a multi-night request)"
-            )
-
-    # No extension: Siril's calibrate -dark=/-flat= take a bare name and
-    # resolve the .fit/.fits/.fit.fz file themselves, matching how the
-    # validated script references "master_dark"/"master_flat" (produced by
-    # `stack ... -out=master_dark`, never written with an extension in the
-    # command itself).
     dark_master = req.master_dark or str(process / "master_dark")
-    flat_master = req.master_flat or str(process / "master_flat")
 
-    for label, master in (("dark", dark_master), ("flat", flat_master)):
-        if not (Path(master).exists() or Path(master + ".fit").exists()):
+    selections: list[LightSelection] = []
+    for night in nights:
+        raw_lights: Path = night["raw_lights"]
+        if not raw_lights.is_dir():
             raise ValueError(
-                f"master {label} not found at {master!r} (or {master}.fit) — "
-                "build masters first via /masters/run, or pass an explicit "
-                f"master_{label} override that points at a real file"
+                f"lights directory not found: {str(raw_lights)!r} (check the "
+                "project's raw/ layout, or the `nights` list if this is a "
+                "multi-night request)"
+            )
+        if req.exclude_frames:
+            selected_dir = process / "_selected" / night["key"] / "lights"
+            selections.append(
+                LightSelection(
+                    source_dir=raw_lights,
+                    dest_dir=selected_dir,
+                    exclude=frozenset(req.exclude_frames),
+                )
+            )
+            night["raw_lights"] = selected_dir
+        else:
+            night["raw_lights"] = raw_lights
+
+    def _master_exists(master: str) -> bool:
+        return Path(master).exists() or Path(master + ".fit").exists()
+
+    if not _master_exists(dark_master):
+        raise ValueError(
+            f"master dark not found at {dark_master!r} (or {dark_master}.fit) "
+            "— build masters first via /masters/run, or pass an explicit "
+            "master_dark override"
+        )
+    for night in nights:
+        flat_master = night["flat_master"]
+        if not _master_exists(flat_master):
+            raise ValueError(
+                f"master flat not found at {flat_master!r} (or {flat_master}.fit) "
+                f"for night {night['key']!r} — build masters first via "
+                "/masters/run (with matching `nights`), or pass an explicit "
+                "master_flat override"
             )
 
+    return nights, dark_master, single, selections, merge_dir
+
+
+def render_stack_lights(project: Path, req: StackLightsRequest) -> RenderedScript:
+    nights, dark_master, single, selections, merge_dir = _resolve_nights(project, req)
     osc_flags = " -cfa -equalize_cfa -debayer" if req.is_osc else ""
+    base_process_dir = nights[0]["process_dir"] if single else merge_dir
 
     template = _env.get_template("calibrate_stack.ssf.j2")
     text = template.render(
         nights=nights,
         single=single,
         dark_master=dark_master,
-        flat_master=flat_master,
         cc_flag=" -cc=dark",
         osc_flags=osc_flags,
         stack_cmd=req.stack.to_ssf(),
-        base_process_dir=nights[0]["process_dir"],
+        base_process_dir=str(base_process_dir),
     )
-    return RenderedScript(text=text, ensure_dirs=[Path(n["process_dir"]) for n in nights])
+    fresh_dirs = [Path(n["process_dir"]) for n in nights]
+    if merge_dir is not None:
+        fresh_dirs.append(merge_dir)
+    return RenderedScript(text=text, fresh_dirs=fresh_dirs, light_selections=selections, nights=nights)
+
+
+def render_analyze_lights(project: Path, req: AnalyzeLightsRequest) -> RenderedScript:
+    nights, dark_master, single, selections, _merge_dir = _resolve_nights(project, req)
+    osc_flags = " -cfa -equalize_cfa -debayer" if req.is_osc else ""
+
+    template = _env.get_template("analyze_lights.ssf.j2")
+    text = template.render(
+        nights=nights,
+        single=single,
+        dark_master=dark_master,
+        cc_flag=" -cc=dark",
+        osc_flags=osc_flags,
+    )
+    fresh_dirs = [Path(n["process_dir"]) for n in nights]
+    return RenderedScript(text=text, fresh_dirs=fresh_dirs, light_selections=selections, nights=nights)

@@ -46,6 +46,28 @@ post-processing elsewhere.
 - GPU: CPU-only (`:cpu`, no NVIDIA Container Toolkit on this box).
 - Single repo, not split into "app" + "container" repos — one maintainer,
   one deployable, no independent lifecycle for the Dockerfile.
+- **No crop, ever, before stacking is complete** (settled 2026-09-20, not
+  just deferred): the Endstate is the raw stacked `.fit`. Cropping the
+  ragged registration border — like all other post-processing (stretch,
+  color, star removal) — happens in other software, downstream of this
+  tool. Don't relitigate adding a crop step "once it's easy"; it's out of
+  scope by design, not by lack of time.
+- **Bias/dark are shared across the whole project; flats are per-night.**
+  Chris: "usually a single set of bias and dark images that will apply
+  across all nights... for each night, there should be a unique set of
+  lights and their matching flats." `process/master_{bias,dark}.fit` are
+  always project-wide; `process/nights/<name>/master_flat.fit` is built
+  per night. Don't collapse this back to one shared flat for "simplicity"
+  — sky conditions/dust change night to night, which is the whole reason
+  flats get retaken.
+- **Frame review recommends, never auto-filters.** Chris: "we want to
+  provide recommendations, but not automatically filter anything out"
+  (asked for something in the spirit of astropup-blink — a per-frame
+  quality *inspector*, not an auto-reject step). `/lights/analyze`
+  computes and returns FWHM/roundness/background/star-count per frame and
+  excludes nothing; a human picks `exclude_frames` for `/stack/run`
+  afterward. Don't add an auto-reject threshold later without Chris
+  explicitly asking for one — it would invert this decision.
 
 ## Reference material already pulled (don't re-derive from scratch)
 - `bscholer/astrolab`'s `templates/calibrate_register_stack.yaml` — the
@@ -64,6 +86,31 @@ post-processing elsewhere.
 - **Licensing:** rolandet's and free-astro's scripts are GPLv3. If this
   repo goes public and substantially reuses their logic, it inherits that
   obligation. Currently private on GitHub for this reason.  Assume eventual GPLv3.
+- `rolandet/siril-scripts`' `osc-multi-night-stacking-v1.2.py` (a PyQt6
+  desktop app, not something to port wholesale) has a `SirilCommandBuilder`
+  class showing the `merge`-based multi-night pattern this project's
+  multi-night stacking follows structurally (per-session `pp_light`, then
+  `merge "session/pp_light" ... all_sessions`) — referenced for that
+  pattern only, not copied; this project stays headless-CLI/.ssf, not
+  sirilpy.
+- **astropup-blink** (`astropup.app/#app-blink`, mentioned by Chris as the
+  UX reference for frame review) — its actual page content wasn't
+  fetchable when researched (2026-09-20; the page appears to be a
+  JS-rendered SPA that returned nothing to a plain fetch). `/lights/analyze`
+  was designed from Siril's own native capabilities plus Chris's explicit
+  requirement ("recommendations, not automatic filtering") rather than
+  from a real look at astropup-blink's UI — worth an actual look
+  (screenshot/manual walkthrough) before building any UI on top of this,
+  in case its specific presentation (e.g. how it visualizes outliers) is
+  worth matching more closely than a guess got us.
+- **Siril's `.seq` registration-data format** (undocumented anywhere
+  found — reverse-engineered from real output): after `register`, a `R<layer>`
+  line per frame holds `fwhm wfwhm roundness quality background nb_stars`,
+  in that column order — confirmed by matching 1:1 against `seqapplyreg`'s
+  documented filter flags (`-filter-fwhm/-filter-wfwhm/-filter-round/
+  -filter-quality/-filter-bkg/-filter-nbstars`). `quality` has read `0` for
+  every frame tested so far (deep-sky Global Star Alignment doesn't seem
+  to populate it). Parsed by `app/seqstats.py`; see its module docstring.
 
 ## Environment / paths (confirmed, don't ask again)
 - NAS: UnRAID, host `FractalR5Tower`, SSH alias `unraid`.
@@ -122,6 +169,32 @@ post-processing elsewhere.
    `RenderedScript.ensure_dirs` list exists for exactly this: callers
    `mkdir -p` every directory a script will `cd`/write into *before*
    invoking siril-cli, rather than relying on Siril to create anything.
+6. **`calibrate` (and presumably other sequence commands) rescans its
+   *entire* cwd by filename pattern, not just the sequence it was just
+   handed.** Confirmed the hard way (2026-09-20) building `/lights/analyze`:
+   re-running an excluded-frame review against a `process/` directory that
+   still had a *previous* run's `light_00001.fit`...`light_NNNNN.fit`
+   sitting in it caused Siril to silently rebuild `light_.seq` from
+   *whatever numbered files it found on disk* — mixing this run's fresh
+   conversions with the last run's leftovers — then fail trying to open
+   frames that no longer existed. This has nothing to do with the
+   exclude-frames feature specifically; it will bite *any* repeated
+   `convert`/`calibrate` into a directory that isn't cleared first.
+   **Consequence:** light conversion/registration/stacking now happens in
+   a disposable per-run workspace (`process/lights/` for single-night,
+   `process/nights/<name>/lights/` per night for multi-night, plus
+   `process/lights/_merged/` for the final multi-night merge/register/
+   stack step) that gets fully wiped and recreated — not just `mkdir -p`'d
+   — before every run, via `app/ssf.py`'s `prepare_fresh_dirs()`
+   (`shutil.rmtree` + recreate). This is deliberately a *separate*
+   directory from wherever that scope's master files live
+   (`process/master_{bias,dark}.fit`, `process/nights/<name>/master_flat.fit`),
+   which must never be wiped. **`/masters/run` has this same latent risk
+   and does not yet have the fix** — it still converts straight into the
+   shared `process/`(`/nights/<name>`) dir with no cleanup, so re-running
+   it a second time against a *different* frame count in `raw/biases`
+   `raw/darks`, or a night's `raw/.../flats` is unverified and should be
+   assumed unsafe until it gets the same treatment.
 
 ## Current validated status
 - ✅ Docker build/run/exec loop works on the NAS.
@@ -157,26 +230,72 @@ post-processing elsewhere.
   same dimensions as `test1`'s). Found and fixed two new Siril gotchas in
   the process (#4 and #5 above) that the original manual walkthrough
   didn't hit because it never varied the working directory structure.
-- ✅ Multi-night stacking implemented in `ssf.py`/`calibrate_stack.ssf.j2`
-  (per-night `pp_light` sequences merged via Siril's `merge`, following
-  the pattern in rolandet's v1.2/v3.0 scripts) but **not yet validated
-  against real multi-night data** — only render-tested (syntax checked,
-  never actually run through siril-cli). Single-night path is the
-  well-trodden one; treat multi-night as unverified until run for real.
-- ❌ No `crop` step yet (trims the ragged registration border) — still
-  deliberately deferred. Punted again because Siril's actual crop syntax
-  (region-based `crop x y width height`, not a margin-trim) needs to be
-  verified against a real registered frame's dimensions before wiring it
-  in; guessing at the arguments for a destructive image op isn't worth
-  the risk of silently producing wrong output.
-- ❌ No project-creation/staging endpoint — `mkdir` + `stage_captures.sh`
-  still have to be run by hand before `/masters/run`. Fine for now (no
-  file-browser UI is a stated v1 non-goal), but worth wrapping once a
-  real UI shows up.
-- ❌ No log-based progress/ETA parsing — `/jobs/{id}` exposes the raw
-  current log line (siril-cli does print `progress: N%` lines) but
-  nothing turns that into the "aware of steps/percentages/time" UX the
-  Endstate asks for. The raw signal is there; nobody's parsed it yet.
+- ✅ **Multi-night stacking validated end-to-end against real two-night
+  data (2026-09-20)**: Chris added real "Night 1"/"Night 2" test captures
+  (Elephant Trunk Nebula) to `/captures` — shared `biases`/`darks` at the
+  top level, per-night `lights`/`flats` each. Staged via the new
+  `/projects/{name}/stage` endpoint, built shared master bias/dark + one
+  master flat per night via `/masters/run` with `nights=[...]`, then ran
+  `/stack/run` with the same `nights` — `merge` (never previously
+  executed, only render-tested) combined both nights' 10-frame `pp_light`
+  sequences into a 20-frame `all_lights`, registered, and stacked
+  correctly into a real, correctly-sized `result.fit`. This is now proven
+  working, not just structurally plausible.
+- ✅ **Per-night master flats + shared master bias/dark implemented**:
+  `BuildMastersRequest`/`render_build_masters` now take the same `nights`
+  list as stacking — bias/dark always build once at `process/master_{bias,
+  dark}.fit`; each named night gets its own `process/nights/<name>/
+  master_flat.fit`, calibrated against the shared master bias. Matches
+  Chris's real workflow ("usually a single set of bias and dark... for
+  each night, a unique set of lights and their matching flats").
+- ✅ **`POST /projects/{name}/stage` replaces manual `mkdir` +
+  `scripts/stage_captures.sh`** (`app/staging.py`): symlinks
+  biases/darks/per-night lights+flats from `CAPTURES_DIR` into a
+  project's `raw/` tree in one call, validated against the real
+  multi-night captures folder above. Source folder names (e.g. the literal
+  "Night 1", with a space) never need to match any convention — the
+  caller picks the internal name (`NightSource.name`) that actually lands
+  on disk, per Chris's flexibility requirement. Rejects path traversal
+  (absolute paths, `..`) since these are strings straight off an HTTP
+  request body — see `_resolve_capture_dir()`'s docstring for the
+  `Path("/a") / "/b"` gotcha this guards against.
+- ✅ **`/jobs/{id}` now exposes `percent_complete` and `current_command`**,
+  parsed from siril-cli's own `progress: N%` and `Running command: X` log
+  lines (`app/jobs.py`). Closes the "aware of steps/percentages" half of
+  the Endstate's process-visibility ask; a real wall-clock ETA is still
+  nobody's job (would need per-step historical timing, not attempted).
+- ✅ **Frame review implemented: `/projects/{name}/lights/analyze`**
+  (render + run), calibrating and registering each night's lights
+  *independently* (no stacking, no merge) purely to harvest Siril's own
+  per-frame FWHM/weighted-FWHM/roundness (the eccentricity proxy Chris
+  asked for)/background/star-count from the resulting `.seq` file
+  (`app/seqstats.py`, format reverse-engineered — see Reference material).
+  Validated for real against the two-night data: real per-frame numbers,
+  correctly correlated back to original filenames. **Recommends, never
+  auto-filters**, per Chris's explicit direction — nothing is excluded
+  unless a human passes `exclude_frames` to `/stack/run` or
+  `/lights/analyze/run` afterward (`LightSelection`/
+  `apply_light_selections()` stage a filtered symlink copy of just the
+  kept frames; the excluded ones are never touched, moved, or deleted).
+  astropup-blink itself wasn't actually inspectable when researched (see
+  Reference material) — this was designed from Siril's native output plus
+  Chris's stated requirement, not from a real look at that app's UI.
+- ✅ **Fixed a real staleness bug found while validating the above**
+  (gotcha #6): light conversion/registration/stacking now happens in a
+  disposable per-run workspace, wiped clean before every run
+  (`prepare_fresh_dirs()`), separate from wherever that scope's master
+  files live. Verified by running `/lights/analyze/run` twice in a row
+  against the same night with two *different* `exclude_frames` sets and
+  confirming the second run's result reflected only the second run's
+  input, with zero bleed-through from the first.
+- ❌ `/masters/run` does **not** have the gotcha #6 fix yet — re-running it
+  against a changed frame count in `raw/biases`/`raw/darks`/a night's
+  `raw/.../flats` is unverified and should be assumed unsafe (see gotcha
+  #6's note) until it gets the same disposable-workspace treatment.
+- ❌ **Crop is permanently out of scope**, not deferred — see Architecture
+  decisions. Don't reopen this.
+- ❌ Archive/cleanup (the Endstate's last bullet) is explicitly deferred
+  per Chris (2026-09-20) — no design work done, intentionally.
 
 ## Validated `.ssf` script (known-good reference — don't rederive)
 Tested against staged raw frames at `data/projects/test1/raw/{lights,darks,flats,biases}`
@@ -218,10 +337,22 @@ stack r_pp_light rej 3 3 -norm=addscale -output_norm -out=result
 close
 ```
 
+**2026-09-20 update:** the Python implementation (`app/ssf.py`) now
+diverges from this script in exactly one respect — lights convert into
+their own disposable `process/lights/` workspace rather than directly
+into `process/` alongside the masters — per gotcha #6 (a directory-wide
+rescan bug that bites exactly the "review lights, exclude some, re-run"
+workflow this tool exists to support). The *command sequence itself*
+(convert → calibrate → register → stack, same flags) is unchanged and
+still the reference; only where things land on disk changed. `test1`'s
+original `process/result.fit` (this exact flat layout) still exists
+untouched as the original manual validation.
+
 Notes for whoever templates this in Python (see gotcha #2/#3 above for why
 the `raw/` staging layer exists at all — don't collapse it away):
 - All four frame types convert into the same `process/` dir — matches the
   official Siril `OSC_Preprocessing.ssf` convention, not an invented layout.
+  (Superseded for lights specifically by the 2026-09-20 update above.)
 - `-cc=dark -cfa -equalize_cfa -debayer` on the light calibration line are
   OSC-specific (this camera is Bayer/RGGB). A mono-camera path would drop
   `-cfa`/`-equalize_cfa`/`-debayer`.
@@ -230,25 +361,37 @@ the `raw/` staging layer exists at all — don't collapse it away):
   rejection method, that's the whole parameterization surface.
 
 ## Immediate next steps
-Steps 1–3 from the prior handoff (split masters/lights phases into
-Python, reference rolandet's master-builder scripts, FastAPI skeleton
-with render/run + background jobs) are **done** — see "Current validated
-status" above. What's next:
+Everything from the prior handoff's list is **done** — split masters/
+lights phases, FastAPI render/run + background jobs, progress parsing,
+real multi-night validation, a staging endpoint, and frame review/
+filtering (recommend-only) — see "Current validated status" above. Crop
+is permanently out of scope (Architecture decisions), not deferred.
+Archive/cleanup is explicitly deferred per Chris, not started. What's
+actually next:
 
-1. Parse siril-cli's `progress: N%` log lines in `jobs.py`/`Job` into a
-   proper `percent_complete` field on `/jobs/{id}` (the raw line is
-   already captured as `current_line`; this is just extracting the number
-   and exposing it more usefully) — closes the gap on the Endstate's
-   "aware of steps/percentages/time" requirement.
-2. Run the multi-night (`merge`) path against real multi-night capture
-   data at least once — it's only been render-tested so far, never
-   actually executed through siril-cli.
-3. Wrap project creation + `stage_captures.sh` in an endpoint (e.g.
-   `POST /projects/{name}` that stages from `/captures`) so a project
-   doesn't require manual shell setup before the API can touch it.
-4. Research Siril's actual `crop` syntax against a real registered
-   frame's dimensions (region-based `x y width height`, not a
-   margin-trim) before wiring it in — don't guess at this one.
-5. Frame review/filtering (FWHM, star count, eccentricity, SNR) and
-   archival/cleanup are still fully unstarted — they're the two Endstate
-   bullets with no design work behind them yet.
+1. **Give `/masters/run` the gotcha #6 fix** (disposable workspace,
+   wiped before each run) that `/stack/run` and `/lights/analyze/run`
+   already have. Currently the only piece of the pipeline still writing
+   straight into a persistent directory with no cleanup — low risk in the
+   common "build once" workflow, but unverified and should be fixed
+   before anyone relies on rebuilding masters repeatedly.
+2. **No UI consumes any of this yet** — `/docs` (Swagger) is the only way
+   to drive it today. The natural next slice is a real frontend: stage a
+   project, kick off masters/stack jobs and watch `percent_complete`/
+   `current_command`, and — the interesting part — a `/lights/analyze`
+   review screen (thumbnails or a plot of FWHM/roundness/background per
+   frame, letting a human pick `exclude_frames` before stacking). Take an
+   actual look at astropup-blink's UI before building this — it wasn't
+   inspectable when researched this round (see Reference material) and
+   might have a specific presentation worth matching.
+3. `master_flat`/`master_dark` overrides in `StackLightsRequest` currently
+   apply uniformly to *all* nights if given (see `LightsSelectionRequest`
+   docstring) — fine for now, but if a real workflow needs a *per-night*
+   override too (e.g. reusing one specific night's master library entry),
+   that's not wired up.
+4. Frame-review numbers (FWHM/roundness/background/star-count) are
+   returned raw with no computed "this one looks off" flag — Chris asked
+   for recommendations, and right now a human has to eyeball the numbers
+   themselves. A simple z-score-per-metric flag (still purely advisory,
+   never auto-excluding) would close that gap without contradicting the
+   recommend-don't-filter decision.

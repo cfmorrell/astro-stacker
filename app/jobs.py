@@ -2,24 +2,35 @@
 
 Stacking runs can take an hour+ (see Handoff.md), so /masters/run and
 /stack/run can't block the request thread. This runs siril-cli in a
-background thread and exposes status + a rolling "current_line" plus the
-full log file for polling from the UI. It's intentionally simple (no
-persistence, no multi-worker coordination) — good enough for a single-user,
-single-process FastAPI app on one NAS box. If this ever needs to survive a
-server restart or run across multiple workers, swap this for a real queue
-(e.g. a SQLite-backed job table) rather than growing this module in place.
+background thread and exposes status, parsed progress, and a rolling
+"current_line" plus the full log file for polling from the UI. It's
+intentionally simple (no persistence, no multi-worker coordination) — good
+enough for a single-user, single-process FastAPI app on one NAS box. If
+this ever needs to survive a server restart or run across multiple
+workers, swap this for a real queue (e.g. a SQLite-backed job table)
+rather than growing this module in place.
 """
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 from . import siril_runner
+
+# siril-cli prints lines like:
+#   progress: 96.89%
+#   progress: Finalizing stacking..., 99.95%
+#   progress: Script execution failed., 100.00%
+# and, for every command it executes:
+#   log: Running command: stack
+_PROGRESS_RE = re.compile(r"progress:.*?(\d+(?:\.\d+)?)\s*%\s*$")
+_COMMAND_RE = re.compile(r"log: Running command: (\S+)")
 
 
 @dataclass
@@ -32,6 +43,9 @@ class Job:
     started_at: Optional[float] = None
     ended_at: Optional[float] = None
     current_line: str = ""
+    current_command: Optional[str] = None  # last siril command started (e.g. "convert", "register", "stack")
+    percent_complete: Optional[float] = None
+    result: Optional[dict] = None  # set by on_success(), e.g. parsed frame-quality stats
     error: Optional[str] = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -43,7 +57,10 @@ class Job:
                 "return_code": self.return_code,
                 "started_at": self.started_at,
                 "ended_at": self.ended_at,
+                "current_command": self.current_command,
+                "percent_complete": self.percent_complete,
                 "current_line": self.current_line,
+                "result": self.result,
                 "error": self.error,
             }
 
@@ -52,7 +69,20 @@ _jobs: Dict[str, Job] = {}
 _registry_lock = threading.Lock()
 
 
-def create_job(script_text: str, workdir: Path, log_dir: Path) -> Job:
+def create_job(
+    script_text: str,
+    workdir: Path,
+    log_dir: Path,
+    on_success: Optional[Callable[[], dict]] = None,
+) -> Job:
+    """Run script_text via siril-cli in a background thread.
+
+    If given, on_success() is called after a zero exit code, and its
+    return value is stored on job.result — e.g. parsing per-frame quality
+    stats out of a .seq file for /lights/analyze. A failure in on_success
+    itself doesn't flip a successful siril run to "failed"; it's recorded
+    in job.error instead, since siril-cli did succeed.
+    """
     job_id = uuid.uuid4().hex[:12]
     log_path = log_dir / f"{job_id}.log"
     job = Job(id=job_id, workdir=workdir, log_path=log_path)
@@ -62,6 +92,16 @@ def create_job(script_text: str, workdir: Path, log_dir: Path) -> Job:
     def on_line(line: str) -> None:
         with job._lock:
             job.current_line = line
+            m = _COMMAND_RE.search(line)
+            if m:
+                job.current_command = m.group(1)
+                # A new command starting resets the previous command's
+                # progress rather than leaving e.g. "100.00%" from
+                # `convert` displayed while `register` is just beginning.
+                job.percent_complete = 0.0
+            m = _PROGRESS_RE.search(line)
+            if m:
+                job.percent_complete = float(m.group(1))
 
     def _run() -> None:
         with job._lock:
@@ -72,6 +112,14 @@ def create_job(script_text: str, workdir: Path, log_dir: Path) -> Job:
             with job._lock:
                 job.return_code = rc
                 job.status = "succeeded" if rc == 0 else "failed"
+            if rc == 0 and on_success is not None:
+                try:
+                    result = on_success()
+                    with job._lock:
+                        job.result = result
+                except Exception as exc:  # defensive: e.g. .seq parsing hiccup
+                    with job._lock:
+                        job.error = f"post-processing failed: {exc}"
         except Exception as exc:  # defensive: e.g. siril binary missing
             with job._lock:
                 job.status = "failed"
@@ -79,6 +127,8 @@ def create_job(script_text: str, workdir: Path, log_dir: Path) -> Job:
         finally:
             with job._lock:
                 job.ended_at = time.time()
+                if job.status == "succeeded":
+                    job.percent_complete = 100.0
 
     threading.Thread(target=_run, daemon=True, name=f"job-{job_id}").start()
     return job

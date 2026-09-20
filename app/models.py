@@ -1,4 +1,4 @@
-"""Request models for the /masters and /stack endpoints.
+"""Request models for the /masters, /stack, /lights, and /projects endpoints.
 
 The stacking-algorithm knob referenced in Handoff.md ("the few different
 stacking algorithms Chris wants in the web UI") is exactly the `stack ...`
@@ -34,60 +34,148 @@ class StackOptions(BaseModel):
 
 
 class BuildMastersRequest(BaseModel):
-    """Build master bias/dark/flat from project_dir/raw/{biases,darks,flats}.
+    """Build master bias/dark (always shared across the whole project) and
+    master flat(s) from project_dir/raw/{biases,darks,flats}.
 
-    Any of the three raw/ subdirectories that don't exist are skipped
-    (e.g. reusing an existing master_bias.fit from a prior run and only
-    rebuilding darks/flats).
+    `nights`: empty = legacy single flat/flats layout (raw/flats ->
+    process/master_flat, matches the hand-validated pipeline exactly).
+    Non-empty = one master flat per named night, built from
+    raw/nights/<name>/flats -> process/nights/<name>/master_flat, each
+    calibrated against the single shared master_bias. Bias/dark are never
+    per-night — per Chris: "usually a single set of bias and dark images
+    that will apply across all nights."
+
+    Any raw/ subdirectory that doesn't exist (including a given night's
+    flats/) is skipped rather than erroring, so re-running this only
+    rebuilds what's missing (e.g. adding a new night's flats later without
+    rebuilding the shared bias/dark).
     """
 
     stack: StackOptions = Field(default_factory=StackOptions)
+    nights: list[str] = Field(default_factory=list)
 
     model_config = {
-        # Without this, Swagger UI's "Example Value" falls back to a
-        # generic type-based placeholder for every field (learned the hard
-        # way: see StackLightsRequest below). Harmless here since the only
-        # field is a nested model with real defaults, but kept for symmetry
-        # and in case fields are added later.
         "json_schema_extra": {
-            "example": {"stack": {"method": "rej", "sigma_low": 3.0, "sigma_high": 3.0}}
+            "example": {
+                "stack": {"method": "rej", "sigma_low": 3.0, "sigma_high": 3.0},
+                "nights": [],
+            }
         }
     }
 
 
-class StackLightsRequest(BaseModel):
-    """Calibrate, register, and stack lights into project_dir/process/result.fit.
+class LightsSelectionRequest(BaseModel):
+    """Shared fields for anything that operates over a project's light
+    frames: calibrate+register+stack (StackLightsRequest) or calibrate+
+    register only, for human review (AnalyzeLightsRequest).
 
-    `nights`: for the common single-night layout (matches the validated
-    script and existing test1 project), leave this as [""] — lights are
-    read from raw/lights directly. For multi-night stacking, pass the
-    night subdirectory names (e.g. ["2026-08-29", "2026-08-30"]); each
-    night's lights must be staged at raw/<name>/lights, and its pp_light
-    sequence is registered/stacked together via Siril's `merge`.
+    `nights`: empty = legacy single flat layout — lights read from
+    raw/lights, calibrated against process/master_flat. Non-empty = each
+    name's lights are read from raw/nights/<name>/lights and calibrated
+    against ITS OWN process/nights/<name>/master_flat by default (flats
+    vary night to night), while `master_dark` stays a single shared value
+    across every night (see BuildMastersRequest's docstring). Sequences
+    from multiple nights are combined via Siril's `merge` before
+    registration/stacking.
     """
 
-    nights: list[str] = Field(default_factory=lambda: [""])
-    stack: StackOptions = Field(default_factory=StackOptions)
+    nights: list[str] = Field(default_factory=list)
     is_osc: bool = True  # False drops -cfa/-equalize_cfa/-debayer for mono cameras
-    master_dark: Optional[str] = None  # absolute path override; default process/master_dark
-    master_flat: Optional[str] = None  # absolute path override; default process/master_flat
+    master_dark: Optional[str] = None  # absolute path override; default process/master_dark (shared)
+    master_flat: Optional[str] = None  # override applied to ALL nights uniformly; default is per-night
+    exclude_frames: list[str] = Field(default_factory=list)  # raw light frame basenames to skip (see /lights/analyze)
+
+
+class StackLightsRequest(LightsSelectionRequest):
+    """Calibrate, register, and stack lights into project_dir/process/result.fit
+    (or process/nights/.../result.fit's merged equivalent for multi-night)."""
+
+    stack: StackOptions = Field(default_factory=StackOptions)
 
     model_config = {
-        # FastAPI/Swagger has no way to know [""] is a meaningful sentinel
+        # FastAPI/Swagger has no way to know [] is a meaningful sentinel
         # (single-night default) rather than an empty placeholder, and its
-        # auto-generated "Example Value" fills every plain str/list[str]
-        # field with the literal word "string" — which is a valid-looking
-        # night name and silently produces raw/string/lights, a directory
-        # that will never exist. This explicit example is what Swagger UI
-        # shows instead, so "Try it out" round-trips a request that actually
-        # works unedited.
+        # auto-generated "Example Value" otherwise fills every plain
+        # str/list[str] field with the literal word "string" — which is a
+        # valid-looking night name and silently produces raw/string/lights,
+        # a directory that will never exist (hit this for real 2026-09-20).
+        # This explicit example is what Swagger UI shows instead, so "Try
+        # it out" round-trips a request that actually works unedited.
         "json_schema_extra": {
             "example": {
-                "nights": [""],
+                "nights": [],
                 "stack": {"method": "rej", "sigma_low": 3.0, "sigma_high": 3.0},
                 "is_osc": True,
                 "master_dark": None,
                 "master_flat": None,
+                "exclude_frames": [],
+            }
+        }
+    }
+
+
+class AnalyzeLightsRequest(LightsSelectionRequest):
+    """Calibrate+register lights only (no stacking) purely to compute
+    per-frame quality metrics for human review — FWHM, roundness
+    (eccentricity proxy), background, and star count, all sourced from
+    Siril's own `register` step rather than reimplementing star detection.
+    Nothing is excluded automatically; see the /lights/analyze endpoint and
+    Handoff.md for the astropup-blink-style "recommend, don't auto-filter"
+    design this follows.
+    """
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "nights": [],
+                "is_osc": True,
+                "master_dark": None,
+                "master_flat": None,
+                "exclude_frames": [],
+            }
+        }
+    }
+
+
+class NightSource(BaseModel):
+    """One night's lights+flats to stage, as a source-folder -> internal-name
+    mapping. `name` is chosen by the caller and is what actually lands on
+    disk (raw/nights/<name>/...) — source folder names (e.g. "Night 1",
+    with a space) never need to match any naming convention.
+    """
+
+    name: str
+    lights_dir: str  # path relative to CAPTURES_DIR, e.g. "Night 1/lights"
+    flats_dir: str  # path relative to CAPTURES_DIR, e.g. "Night 1/flats"
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {"name": "night1", "lights_dir": "Night 1/lights", "flats_dir": "Night 1/flats"}
+        }
+    }
+
+
+class StageProjectRequest(BaseModel):
+    """Symlinks raw frames from CAPTURES_DIR into this project's raw/ tree
+    (creating the project directory if needed), replacing manual
+    `mkdir` + `scripts/stage_captures.sh` invocation. Bias/dark are shared
+    (staged once, at raw/biases and raw/darks); each entry in `nights`
+    stages its own lights+flats at raw/nights/<name>/{lights,flats}.
+    """
+
+    biases_dir: Optional[str] = "biases"  # relative to CAPTURES_DIR; None = skip staging biases
+    darks_dir: Optional[str] = "darks"  # relative to CAPTURES_DIR; None = skip staging darks
+    nights: list[NightSource] = Field(default_factory=list)
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "biases_dir": "biases",
+                "darks_dir": "darks",
+                "nights": [
+                    {"name": "night1", "lights_dir": "Night 1/lights", "flats_dir": "Night 1/flats"},
+                    {"name": "night2", "lights_dir": "Night 2/lights", "flats_dir": "Night 2/flats"},
+                ],
             }
         }
     }
