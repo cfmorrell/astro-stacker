@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse, Response
+from fastapi.responses import FileResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import config, framestats, imaging, jobs, ssf, staging, status
@@ -78,32 +78,55 @@ def browse_captures(path: str = ""):
     return {"path": path, "dirs": dirs, "fit_count": fit_count}
 
 
-@app.get("/projects/{name}/preview")
-def project_preview(name: str, path: str, max_size: int = imaging.DEFAULT_MAX_SIZE):
-    """Quick-look PNG for a FITS file inside this project (a raw light,
-    during review, or a finished result.fit) — see app/imaging.py. `path`
-    is relative to the project dir; rejects anything that would escape it.
-
-    Deliberately checks the LEXICAL path, not the symlink-resolved one:
-    every raw light/flat under raw/ is itself a symlink pointing outside
-    the project entirely, into CAPTURES_DIR (see app/staging.py) — that's
-    by design, not a traversal attempt. Resolving symlinks before the
-    containment check (an earlier version did this) rejected every raw
-    frame preview with "path escapes project directory", since the
-    resolved target is never actually under the project dir.
+def _project_relative_file(project: Path, path: str) -> Path:
+    """Resolve `path` as relative to `project`, rejecting anything that
+    would escape it. Deliberately checks the LEXICAL path, not the
+    symlink-resolved one: every raw light/flat under raw/ is itself a
+    symlink pointing outside the project entirely, into CAPTURES_DIR (see
+    app/staging.py) — that's by design, not a traversal attempt.
+    Resolving symlinks before the containment check (an earlier version
+    of the preview endpoint did this) rejected every raw frame preview
+    with "path escapes project directory", since the resolved target is
+    never actually under the project dir.
     """
-    project = _project_or_404(name)
     rel = Path(path)
     if rel.is_absolute() or ".." in rel.parts:
         raise HTTPException(status_code=400, detail="path escapes project directory")
     candidate = project / rel
     if not candidate.is_file():
         raise HTTPException(status_code=404, detail=f"file not found: {path!r}")
+    return candidate
+
+
+@app.get("/projects/{name}/preview")
+def project_preview(
+    name: str,
+    path: str,
+    max_size: int = imaging.DEFAULT_MAX_SIZE,
+    stretch: str = imaging.DEFAULT_STRETCH,
+):
+    """Quick-look PNG for a FITS file inside this project (a raw light,
+    during review, or a finished result.fit) — see app/imaging.py.
+    `stretch` is one of "none"/"linked"/"unlinked" (only meaningfully
+    different for multi-channel calibrated/stacked data).
+    """
+    project = _project_or_404(name)
+    candidate = _project_relative_file(project, path)
     try:
-        png_bytes = imaging.render_preview_png(candidate, max_size=max_size)
+        png_bytes = imaging.render_preview_png(candidate, max_size=max_size, stretch=stretch)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"could not render preview: {exc}") from exc
     return Response(content=png_bytes, media_type="image/png")
+
+
+@app.get("/projects/{name}/download")
+def project_download(name: str, path: str):
+    """Download the raw FITS file at `path` (e.g. the final result.fit)
+    at full resolution — see app/static/'s Stack section.
+    """
+    project = _project_or_404(name)
+    candidate = _project_relative_file(project, path)
+    return FileResponse(candidate, media_type="application/octet-stream", filename=candidate.name)
 
 
 @app.post("/projects/{name}/stage")
@@ -245,6 +268,12 @@ def run_analyze(name: str, req: AnalyzeLightsRequest):
             # THIS night only (see flag_anomalies' docstring) — done after
             # the whole night's stats are in, not per-frame.
             framestats.flag_anomalies(night_stats)
+            # Chronological, not filename, order: failed frames tend to
+            # come in clumps (clouds rolling through, dusk/dawn), which
+            # only reads clearly if the sequence is in actual capture
+            # order. Frames without a DATE-OBS (shouldn't happen for real
+            # captures) sort last rather than crashing the comparison.
+            night_stats.sort(key=lambda s: s.captured_at or "9999")
             result["nights"][target.key] = [s.__dict__ for s in night_stats]
         return result
 

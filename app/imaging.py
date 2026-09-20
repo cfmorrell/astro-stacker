@@ -3,10 +3,17 @@
 for eyeballing a finished result.fit. Not used anywhere in the actual
 calibration/stacking pipeline; purely a display convenience.
 
-Uses a simple percentile-clip + asinh stretch (the standard astropy
-approach for a quick linear-to-visual preview) — good enough to tell a
-good frame from a bad one at a glance, not a substitute for real
-post-processing (stretch/color work happens elsewhere, per Handoff.md).
+Three stretch modes (Chris asked for these on the final stack preview,
+matching a common astro-processing choice):
+- "none": percentile-clipped linear — no curve, closest to the raw data.
+- "linked": percentile + asinh stretch computed jointly across all
+  channels (one black/white point for R+G+B together) — preserves
+  relative color balance; the default.
+- "unlinked": percentile + asinh computed separately PER channel — can
+  correct color balance (each channel gets its own black/white point) at
+  the cost of it no longer reflecting the true relative color.
+Only "linked" vs "unlinked" differ for multi-channel (calibrated/stacked)
+data; a raw single-plane Bayer sub has no channels to link or not.
 """
 
 from __future__ import annotations
@@ -20,9 +27,25 @@ from astropy.visualization import AsinhStretch, PercentileInterval
 from PIL import Image
 
 DEFAULT_MAX_SIZE = 1024
+DEFAULT_STRETCH = "linked"
+_STRETCH_MODES = ("none", "linked", "unlinked")
 
 
-def render_preview_png(path: Path, max_size: int = DEFAULT_MAX_SIZE) -> bytes:
+def _apply_stretch(arr: np.ndarray, mode: str) -> np.ndarray:
+    interval = PercentileInterval(99.5)
+    if mode == "none":
+        return np.clip(interval(arr), 0.0, 1.0)
+    return np.clip(AsinhStretch(0.1)(interval(arr)), 0.0, 1.0)
+
+
+def render_preview_png(
+    path: Path,
+    max_size: int = DEFAULT_MAX_SIZE,
+    stretch: str = DEFAULT_STRETCH,
+) -> bytes:
+    if stretch not in _STRETCH_MODES:
+        raise ValueError(f"unknown stretch mode {stretch!r}, expected one of {_STRETCH_MODES}")
+
     with fits.open(path) as hdul:
         data = hdul[0].data
     data = np.asarray(data, dtype=np.float32)
@@ -51,9 +74,14 @@ def render_preview_png(path: Path, max_size: int = DEFAULT_MAX_SIZE) -> bytes:
     if stride > 1:
         rgb = rgb[::stride, ::stride] if rgb.ndim == 2 else rgb[::stride, ::stride, :]
 
-    interval = PercentileInterval(99.5)
-    stretch = AsinhStretch(0.1)
-    normed = np.clip(stretch(interval(rgb)), 0.0, 1.0)
+    if rgb.ndim == 3 and stretch == "unlinked":
+        # Per-channel: each gets its own percentile+asinh curve, i.e. its
+        # own black/white point — "linked" is what _apply_stretch(..,
+        # "linked") does to a single channel too, just called once per
+        # channel here instead of once across all of them jointly.
+        normed = np.stack([_apply_stretch(rgb[..., c], "linked") for c in range(rgb.shape[-1])], axis=-1)
+    else:
+        normed = _apply_stretch(rgb, stretch)
     img8 = (normed * 255).astype(np.uint8)
 
     image = Image.fromarray(img8)

@@ -80,6 +80,7 @@ class FrameStats:
     background: float  # median background level, raw ADU (uncalibrated — see module docstring)
     background_std: float
     snr: Optional[float] = None  # median star flux / background_std — relative, not calibrated
+    captured_at: Optional[str] = None  # FITS DATE-OBS (UTC), for chronological display/sort
     anomaly_z: dict = field(default_factory=dict)  # per-metric robust z-score vs. the rest of this night
     flagged: bool = False  # True if any metric's |z| >= ANOMALY_Z_THRESHOLD — a recommendation, not a decision
 
@@ -135,6 +136,7 @@ def analyze_frame(
     """Compute quality-review stats for a single light frame."""
     with fits.open(path) as hdul:
         data = hdul[0].data
+        captured_at = hdul[0].header.get("DATE-OBS")
     data = np.asarray(data, dtype=np.float32)
     if data.ndim == 3:
         # Already-debayered multi-layer data (e.g. a calibrated frame) —
@@ -161,6 +163,7 @@ def analyze_frame(
             background=float(median),
             background_std=float(std),
             snr=None,
+            captured_at=captured_at,
         )
 
     snr = float(np.median(sources["flux"])) / float(std) if std > 0 else None
@@ -174,6 +177,7 @@ def analyze_frame(
         background=float(median),
         background_std=float(std),
         snr=snr,
+        captured_at=captured_at,
     )
 
 

@@ -60,6 +60,13 @@ class Job:
     percent_complete: Optional[float] = None
     result: Optional[dict] = None  # set by on_success(), e.g. parsed frame-quality stats
     error: Optional[str] = None
+    # Full ordered pipeline for a create_multi_script_job() run (e.g.
+    # ["night1 calibrate", "night2 calibrate", "merge+register+stack"]) —
+    # known upfront, unlike current_command, so a frontend can draw the
+    # whole pipeline and highlight where the job currently is. Empty for
+    # single-script jobs (create_job()/create_python_job()).
+    steps: list = field(default_factory=list)
+    current_step_index: Optional[int] = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def snapshot(self) -> dict:
@@ -73,6 +80,8 @@ class Job:
                 "current_command": self.current_command,
                 "percent_complete": self.percent_complete,
                 "current_line": self.current_line,
+                "steps": self.steps,
+                "current_step_index": self.current_step_index,
                 "result": self.result,
                 "error": self.error,
             }
@@ -176,7 +185,12 @@ def create_multi_script_job(
     """
     job_id = uuid.uuid4().hex[:12]
     log_path = log_dir / f"{job_id}.log"
-    job = Job(id=job_id, workdir=steps[0].workdir if steps else log_dir, log_path=log_path)
+    job = Job(
+        id=job_id,
+        workdir=steps[0].workdir if steps else log_dir,
+        log_path=log_path,
+        steps=[s.label for s in steps],
+    )
     with _registry_lock:
         _jobs[job_id] = job
 
@@ -190,6 +204,8 @@ def create_multi_script_job(
             for i, step in enumerate(steps):
                 base = i / total * 100.0 if total else 0.0
                 span = 100.0 / total if total else 100.0
+                with job._lock:
+                    job.current_step_index = i
 
                 def on_line(line: str, base=base, span=span, label=step.label) -> None:
                     with job._lock:
