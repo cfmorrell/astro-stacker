@@ -36,7 +36,12 @@ post-processing elsewhere.
   itself, rather than only consuming pre-built masters. Chris explicitly
   chose this.
 - Backend: FastAPI, templates `.ssf` scripts, shells out to `siril-cli`.
-  No sirilpy live-session integration — headless CLI only.
+  No sirilpy live-session integration — headless CLI only. **Exception:
+  `/lights/analyze` (frame quality review) uses `astropy`+`photutils`
+  directly in Python instead, added 2026-09-2x** — see the dedicated
+  bullet below. Calibration/registration/stacking stay on Siril; it's
+  validated and does real geometric-transform/stacking work not worth
+  reimplementing.
 - No file-browser UI for v1 — typed directory paths.  Will eventually want to add some file management (pull lights/flats from telescope controller, darks/biases from server, copy remote/link local files into working directory for processing). Once complete, archive files as directed.
 - Long-running jobs (stacking can take an hour+) need background
   execution + log streaming, not a blocking HTTP request. Built as a
@@ -68,6 +73,19 @@ post-processing elsewhere.
   excludes nothing; a human picks `exclude_frames` for `/stack/run`
   afterward. Don't add an auto-reject threshold later without Chris
   explicitly asking for one — it would invert this decision.
+- **`/lights/analyze` uses astropy+photutils directly, not Siril**
+  (settled 2026-09-2x). Cause: a real, confirmed performance cliff running
+  multiple sequences in one Siril session (gotcha #8) — identical
+  calibrate+register work took 10s alone vs 90s as the second sequence in
+  one `siril-cli` process, and it compounds with more nights. Chris asked
+  to look at astropy/photutils as an alternative before accepting a
+  subprocess-per-night workaround; research + benchmarking against real
+  capture data showed pure-Python analysis is both immune to the problem
+  (stateless numpy per frame, no subprocess to degrade) *and* faster
+  outright (see `app/framestats.py`'s docstring for the numbers). This
+  fully replaced the Siril-based analyze path, not just patched it — see
+  "Current validated status." Calibration/registration/stacking are
+  untouched; this is scoped to the review step only.
 - **No separate single-night layout** (settled 2026-09-20, replacing an
   earlier design that had one): every project always uses
   `raw/nights/<name>/{lights,flats}`, even for a project with exactly one
@@ -125,7 +143,11 @@ post-processing elsewhere.
   documented filter flags (`-filter-fwhm/-filter-wfwhm/-filter-round/
   -filter-quality/-filter-bkg/-filter-nbstars`). `quality` has read `0` for
   every frame tested so far (deep-sky Global Star Alignment doesn't seem
-  to populate it). Parsed by `app/seqstats.py`; see its module docstring.
+  to populate it). **No longer used** — this was parsed by `app/seqstats.py`
+  for the original Siril-based `/lights/analyze`, since replaced by
+  astropy+photutils (see Architecture decisions); `app/seqstats.py` was
+  deleted along with it. Keeping this note in case `.seq` introspection is
+  ever needed again for something else (e.g. stacking progress).
 
 ## Environment / paths (confirmed, don't ask again)
 - NAS: UnRAID, host `FractalR5Tower`, SSH alias `unraid`.
@@ -222,6 +244,25 @@ post-processing elsewhere.
    place single-vs-multi still matters; the on-disk layout itself is
    identical either way (see the "no separate single-night layout" note
    below).
+8. **Running multiple sequences' `calibrate`+`register` in one Siril
+   session gets progressively, dramatically slower — not just additively
+   slower.** Confirmed with real timing (2026-09-2x, `/lights/analyze`
+   against real two-night data): identical calibrate+register work on the
+   same 10 frames took 3.02s+7.08s=10.27s in isolation, but 42.38s+48.17s
+   =90.55s when run as the *second* sequence in the same `siril-cli`
+   process right after a first one — an ~8.8x slowdown for the same work,
+   confirmed NOT to be about the specific data (isolating night2 alone
+   reproduced the fast time). Root cause not confirmed against Siril's
+   source, but "up to N threads can be used" gets reprinted before every
+   `register`, suggesting it re-evaluates available memory/thread
+   headroom each time and finds less of it left over from the previous
+   sequence's ~3GB of registered-image writes. **Consequence: this is why
+   `/lights/analyze` no longer uses Siril at all** — see the architecture
+   decision above and `app/framestats.py`. `/stack/run` and `/masters/run`
+   still shell out to Siril and still run every night sequentially in one
+   session, so they still carry this risk for large night counts; nobody
+   has hit it there yet only because analyze was the first thing pushing
+   many-sequences-per-session hard enough to notice.
 
 ## Current validated status
 - ✅ Docker build/run/exec loop works on the NAS.
@@ -292,29 +333,41 @@ post-processing elsewhere.
   the Endstate's process-visibility ask; a real wall-clock ETA is still
   nobody's job (would need per-step historical timing, not attempted).
 - ✅ **Frame review implemented: `/projects/{name}/lights/analyze`**
-  (render + run), calibrating and registering each night's lights
-  *independently* (no stacking, no merge) purely to harvest Siril's own
-  per-frame FWHM/weighted-FWHM/roundness (the eccentricity proxy Chris
-  asked for)/background/star-count from the resulting `.seq` file
-  (`app/seqstats.py`, format reverse-engineered — see Reference material).
-  Validated for real against the two-night data: real per-frame numbers,
-  correctly correlated back to original filenames. **Recommends, never
-  auto-filters**, per Chris's explicit direction — nothing is excluded
-  unless a human passes `exclude_frames` to `/stack/run` or
-  `/lights/analyze/run` afterward (`LightSelection`/
-  `apply_light_selections()` stage a filtered symlink copy of just the
-  kept frames; the excluded ones are never touched, moved, or deleted).
+  (render + run). First version (2026-09-20) calibrated+registered each
+  night's lights via Siril, no stacking/merge, harvesting per-frame stats
+  from the resulting `.seq` file. **Replaced entirely (2026-09-2x)** by a
+  pure Python astropy+photutils implementation (`app/framestats.py`) after
+  gotcha #8's session-degradation cliff turned up while validating it —
+  see the architecture decision above. The Siril-based version and
+  `app/seqstats.py` are gone, not kept as a fallback. Current version:
+  operates directly on RAW, uncalibrated lights (no masters needed, Siril
+  never invoked), block-mean bins 4x before detection (~11x faster,
+  benchmarked against real capture data — also acts as a free rough
+  debayer for OSC/Bayer sensors since a bin factor that's a multiple of 2
+  averages across a full RGGB tile), and uses `IRAFStarFinder` for
+  FWHM+roundness+star-count in one pass plus `sigma_clipped_stats` for
+  background. Real result against `multi1`'s two-night data: **7.9s total
+  for 20 frames**, vs the old Siril path's ~104s for the same data (and
+  that 104s was itself inflated by gotcha #8 — a clean run would've been
+  faster, still nowhere near this). **Recommends, never auto-filters**,
+  per Chris's explicit direction — nothing is excluded unless a human
+  passes `exclude_frames`, which is now just a plain filename filter
+  in Python (no symlink staging needed — that machinery was only ever
+  needed because Siril's `convert` operates on a whole directory).
   astropup-blink itself wasn't actually inspectable when researched (see
-  Reference material) — this was designed from Siril's native output plus
-  Chris's stated requirement, not from a real look at that app's UI.
-- ✅ **Fixed a real staleness bug found while validating the above**
-  (gotcha #6): light conversion/registration/stacking now happens in a
+  Reference material) — this was designed from photutils' capabilities
+  plus Chris's stated requirement, not from a real look at that app's UI.
+  **Numbers are not comparable to the old Siril-based ones** — different
+  tool, different convention (photutils' `roundness`: 0=round, higher=
+  more elongated; Siril's was the reverse, 1.0=round) — if either gets
+  looked at again, don't assume continuity with earlier analyze results.
+- ✅ **Fixed a real staleness bug in the Siril-based pipeline** (gotcha
+  #6, found while validating the *original* Siril-based analyze before it
+  was replaced): light conversion/registration/stacking happens in a
   disposable per-run workspace, wiped clean before every run
   (`prepare_fresh_dirs()`), separate from wherever that scope's master
-  files live. Verified by running `/lights/analyze/run` twice in a row
-  against the same night with two *different* `exclude_frames` sets and
-  confirming the second run's result reflected only the second run's
-  input, with zero bleed-through from the first.
+  files live. Still relevant to **`/stack/run`**, which still uses Siril;
+  moot for `/lights/analyze` now that it doesn't touch Siril at all.
 - ✅ **Collapsed the single-night/multi-night layout duality (2026-09-20,
   same day as the above)**: Chris hit the dual-layout bug directly —
   `multi1` only ever had `raw/nights/...`, and an analyze call with no
@@ -333,6 +386,15 @@ post-processing elsewhere.
   against a changed frame count in `raw/biases`/`raw/darks`/a night's
   `raw/.../flats` is unverified and should be assumed unsafe (see gotcha
   #6's note) until it gets the same disposable-workspace treatment.
+- ❌ `/stack/run` and `/masters/run` still carry gotcha #8's session-
+  degradation risk for projects with several nights — every night's
+  Siril work still runs sequentially in one `siril-cli` session. Nobody's
+  hit this in practice yet for stacking specifically (only 2-night
+  projects tested), but the mechanism is confirmed real (gotcha #8) and
+  should be assumed to compound with night count until proven otherwise
+  or fixed (e.g. one `siril-cli` invocation per night's calibrate step,
+  same idea originally proposed for analyze before photutils replaced it
+  outright).
 - ❌ **Crop is permanently out of scope**, not deferred — see Architecture
   decisions. Don't reopen this.
 - ❌ Archive/cleanup (the Endstate's last bullet) is explicitly deferred
@@ -405,34 +467,50 @@ the `raw/` staging layer exists at all — don't collapse it away):
 Everything from the prior handoff's list is **done** — split masters/
 lights phases, FastAPI render/run + background jobs, progress parsing,
 real multi-night validation, a staging endpoint, and frame review/
-filtering (recommend-only) — see "Current validated status" above. Crop
-is permanently out of scope (Architecture decisions), not deferred.
+filtering (recommend-only, now on astropy+photutils instead of Siril —
+see "Current validated status") — see that section above for detail.
+Crop is permanently out of scope (Architecture decisions), not deferred.
 Archive/cleanup is explicitly deferred per Chris, not started. What's
 actually next:
 
 1. **Give `/masters/run` the gotcha #6 fix** (disposable workspace,
-   wiped before each run) that `/stack/run` and `/lights/analyze/run`
-   already have. Currently the only piece of the pipeline still writing
-   straight into a persistent directory with no cleanup — low risk in the
-   common "build once" workflow, but unverified and should be fixed
-   before anyone relies on rebuilding masters repeatedly.
-2. **No UI consumes any of this yet** — `/docs` (Swagger) is the only way
+   wiped before each run) that `/stack/run` already has. Currently the
+   only piece of the pipeline still writing straight into a persistent
+   directory with no cleanup — low risk in the common "build once"
+   workflow, but unverified and should be fixed before anyone relies on
+   rebuilding masters repeatedly. (`/lights/analyze/run` no longer needs
+   this fix at all — it doesn't touch Siril or that workspace pattern
+   anymore.)
+2. **`/stack/run`/`/masters/run` still carry gotcha #8's session-
+   degradation risk** for many-night projects (every night's Siril work
+   runs sequentially in one session). Not yet a proven problem for
+   stacking specifically, but the mechanism is real and confirmed
+   elsewhere. If a project with several nights turns out slow, this is
+   the first thing to check — likely fix is one `siril-cli` invocation
+   per night's calibrate step instead of one script covering all nights.
+3. **No UI consumes any of this yet** — `/docs` (Swagger) is the only way
    to drive it today. The natural next slice is a real frontend: stage a
    project, kick off masters/stack jobs and watch `percent_complete`/
    `current_command`, and — the interesting part — a `/lights/analyze`
    review screen (thumbnails or a plot of FWHM/roundness/background per
-   frame, letting a human pick `exclude_frames` before stacking). Take an
-   actual look at astropup-blink's UI before building this — it wasn't
-   inspectable when researched this round (see Reference material) and
-   might have a specific presentation worth matching.
-3. `master_flat`/`master_dark` overrides in `StackLightsRequest` currently
-   apply uniformly to *all* nights if given (see `LightsSelectionRequest`
-   docstring) — fine for now, but if a real workflow needs a *per-night*
-   override too (e.g. reusing one specific night's master library entry),
-   that's not wired up.
-4. Frame-review numbers (FWHM/roundness/background/star-count) are
+   frame, letting a human pick `exclude_frames` before stacking — this is
+   now fast enough, ~8s for 20 frames, to feel interactive rather than
+   "kick off a job and wait"). Take an actual look at astropup-blink's UI
+   before building this — it wasn't inspectable when researched (see
+   Reference material) and might have a specific presentation worth
+   matching.
+4. `master_flat`/`master_dark` overrides in `StackLightsRequest` currently
+   apply uniformly to *all* nights if given — fine for now, but if a real
+   workflow needs a *per-night* override too (e.g. reusing one specific
+   night's master library entry), that's not wired up.
+5. Frame-review numbers (FWHM/roundness/background/star-count) are
    returned raw with no computed "this one looks off" flag — Chris asked
    for recommendations, and right now a human has to eyeball the numbers
    themselves. A simple z-score-per-metric flag (still purely advisory,
    never auto-excluding) would close that gap without contradicting the
    recommend-don't-filter decision.
+6. `IRAFStarFinder`'s `threshold_sigma`/`bin_factor` defaults (8.0 / 4)
+   were picked from one quick pass against real data (getting a sane,
+   non-saturated star count), not rigorously tuned — fine for a v1
+   review tool, but worth another look once there's more than one
+   target's worth of data to check them against.

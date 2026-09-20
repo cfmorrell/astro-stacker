@@ -65,36 +65,29 @@ class BuildMastersRequest(BaseModel):
     }
 
 
-class LightsSelectionRequest(BaseModel):
-    """Shared fields for anything that operates over a project's light
-    frames: calibrate+register+stack (StackLightsRequest) or calibrate+
-    register only, for human review (AnalyzeLightsRequest).
+class StackLightsRequest(BaseModel):
+    """Calibrate, register, and stack lights into project_dir/process/result.fit
+    (or process/nights/.../result.fit's merged equivalent for multi-night).
 
     `nights` is required — every project always uses the
     raw/nights/<name>/{lights,flats} layout (see /projects/{name}/stage
     and BuildMastersRequest), even for a project that only has one
     session; there is no separate single-night layout to remember or ask
-    about. Each named night's lights are read from raw/nights/<name>/lights
-    and calibrated against ITS OWN process/nights/<name>/master_flat by
-    default (flats vary night to night), while `master_dark` stays a
-    single shared value across every night. With exactly one name, that
-    night's own sequence is registered/stacked directly; with two or more,
-    they're combined first via Siril's `merge` (which — confirmed the hard
-    way — refuses to run with fewer than two inputs, hence the split).
+    about. Each named night's lights are calibrated against ITS OWN
+    process/nights/<name>/master_flat by default (flats vary night to
+    night), while `master_dark` stays a single shared value across every
+    night. With exactly one name, that night's own sequence is
+    registered/stacked directly; with two or more, they're combined first
+    via Siril's `merge` (which — confirmed the hard way — refuses to run
+    with fewer than two inputs, hence the split).
     """
 
     nights: list[str] = Field(..., min_length=1)
+    stack: StackOptions = Field(default_factory=StackOptions)
     is_osc: bool = True  # False drops -cfa/-equalize_cfa/-debayer for mono cameras
     master_dark: Optional[str] = None  # absolute path override; default process/master_dark (shared)
     master_flat: Optional[str] = None  # override applied to ALL nights uniformly; default is per-night
     exclude_frames: list[str] = Field(default_factory=list)  # raw light frame basenames to skip (see /lights/analyze)
-
-
-class StackLightsRequest(LightsSelectionRequest):
-    """Calibrate, register, and stack lights into project_dir/process/result.fit
-    (or process/nights/.../result.fit's merged equivalent for multi-night)."""
-
-    stack: StackOptions = Field(default_factory=StackOptions)
 
     model_config = {
         # FastAPI/Swagger has no way to know [] is a meaningful sentinel
@@ -118,24 +111,49 @@ class StackLightsRequest(LightsSelectionRequest):
     }
 
 
-class AnalyzeLightsRequest(LightsSelectionRequest):
-    """Calibrate+register lights only (no stacking) purely to compute
-    per-frame quality metrics for human review — FWHM, roundness
-    (eccentricity proxy), background, and star count, all sourced from
-    Siril's own `register` step rather than reimplementing star detection.
-    Nothing is excluded automatically; see the /lights/analyze endpoint and
-    Handoff.md for the astropup-blink-style "recommend, don't auto-filter"
-    design this follows.
+class AnalyzeLightsRequest(BaseModel):
+    """Compute per-frame quality-review stats — FWHM, roundness (an
+    eccentricity proxy), background, and star count — directly from raw
+    light frames via astropy+photutils (app/framestats.py). No Siril, no
+    masters needed; operates on raw/nights/<name>/lights directly.
+
+    Replaced a Siril-based implementation (2026-09-2x) after finding a
+    severe, confirmed performance cliff running multiple sequences in one
+    Siril session (identical work: 10s alone vs 90s as the 2nd sequence).
+    See Handoff.md. Note the numbers here use photutils' conventions, not
+    Siril's — e.g. `roundness` is 0 for a round star and grows for
+    elongated ones (Siril's own convention was the reverse: 1.0 = round).
+
+    Nothing is excluded automatically; a human passes `exclude_frames`
+    here or to /stack/run afterward. See Handoff.md for the
+    astropup-blink-style "recommend, don't auto-filter" design this
+    follows.
     """
+
+    nights: list[str] = Field(..., min_length=1)
+    exclude_frames: list[str] = Field(default_factory=list)  # raw light frame basenames to skip
+    bin_factor: int = Field(
+        default=4,
+        ge=1,
+        description=(
+            "Block-mean downsample factor applied before detection. Higher "
+            "is faster with less precision — 4 is ~11x faster than 1 "
+            "(full resolution) with negligible loss for a review tool."
+        ),
+    )
+    threshold_sigma: float = Field(
+        default=8.0,
+        gt=0,
+        description="Star-detection threshold, in multiples of background std above the median.",
+    )
 
     model_config = {
         "json_schema_extra": {
             "example": {
                 "nights": ["night1"],
-                "is_osc": True,
-                "master_dark": None,
-                "master_flat": None,
                 "exclude_frames": [],
+                "bin_factor": 4,
+                "threshold_sigma": 8.0,
             }
         }
     }

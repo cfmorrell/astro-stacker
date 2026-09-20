@@ -34,12 +34,7 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
 
-from .models import (
-    AnalyzeLightsRequest,
-    BuildMastersRequest,
-    LightsSelectionRequest,
-    StackLightsRequest,
-)
+from .models import BuildMastersRequest, StackLightsRequest
 
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
 
@@ -91,8 +86,7 @@ class RenderedScript:
     # LightSelection above.
     light_selections: list[LightSelection] = field(default_factory=list)
     # Resolved per-night {key, raw_lights, process_dir} dicts, for callers
-    # that need to locate output after the job runs (e.g. main.py parsing
-    # each night's r_pp_light_.seq for /lights/analyze results).
+    # that need to locate output after the job runs.
     nights: list[dict] = field(default_factory=list)
 
 
@@ -168,9 +162,9 @@ def render_build_masters(project: Path, req: BuildMastersRequest) -> RenderedScr
 
 
 def _resolve_nights(
-    project: Path, req: LightsSelectionRequest
+    project: Path, req: StackLightsRequest
 ) -> tuple[list[dict], str, list[LightSelection], Path | None]:
-    """Shared night/master resolution for stacking and analysis. Returns
+    """Night/master resolution for /stack/run. Returns
     (nights, dark_master, light_selections, merge_dir), raising
     ValueError (-> HTTP 400 in main.py) for anything that would otherwise
     reach siril-cli as a silent, confusing failure: a bad night name, a
@@ -183,7 +177,7 @@ def _resolve_nights(
     hitting exactly the bug that layout duality invites: a request with no
     `nights` silently assumed a raw/lights/ that a multi-night-staged
     project never had). `nights` is required and non-empty (enforced by
-    LightsSelectionRequest's Field(..., min_length=1)); a "single-night"
+    StackLightsRequest's Field(..., min_length=1)); a "single-night"
     project is simply one that only has one entry in `nights`.
 
     Each night's `process_dir` is a disposable conversion workspace
@@ -285,19 +279,4 @@ def render_stack_lights(project: Path, req: StackLightsRequest) -> RenderedScrip
     fresh_dirs = [Path(n["process_dir"]) for n in nights]
     if merge_dir is not None:
         fresh_dirs.append(merge_dir)
-    return RenderedScript(text=text, fresh_dirs=fresh_dirs, light_selections=selections, nights=nights)
-
-
-def render_analyze_lights(project: Path, req: AnalyzeLightsRequest) -> RenderedScript:
-    nights, dark_master, selections, _merge_dir = _resolve_nights(project, req)
-    osc_flags = " -cfa -equalize_cfa -debayer" if req.is_osc else ""
-
-    template = _env.get_template("analyze_lights.ssf.j2")
-    text = template.render(
-        nights=nights,
-        dark_master=dark_master,
-        cc_flag=" -cc=dark",
-        osc_flags=osc_flags,
-    )
-    fresh_dirs = [Path(n["process_dir"]) for n in nights]
     return RenderedScript(text=text, fresh_dirs=fresh_dirs, light_selections=selections, nights=nights)

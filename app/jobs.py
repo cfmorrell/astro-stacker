@@ -1,10 +1,15 @@
 """Minimal in-memory background job manager.
 
 Stacking runs can take an hour+ (see Handoff.md), so /masters/run and
-/stack/run can't block the request thread. This runs siril-cli in a
-background thread and exposes status, parsed progress, and a rolling
-"current_line" plus the full log file for polling from the UI. It's
-intentionally simple (no persistence, no multi-worker coordination) — good
+/stack/run can't block the request thread. `create_job()` runs siril-cli
+in a background thread and exposes status, parsed progress, and a rolling
+"current_line" plus the full log file for polling from the UI.
+`create_python_job()` runs an arbitrary Python callable the same way
+instead — used by /lights/analyze (app/framestats.py), which doesn't
+invoke Siril at all. Both share the same Job/snapshot shape so /jobs/{id}
+doesn't need to know which kind it's looking at.
+
+Intentionally simple (no persistence, no multi-worker coordination) — good
 enough for a single-user, single-process FastAPI app on one NAS box. If
 this ever needs to survive a server restart or run across multiple
 workers, swap this for a real queue (e.g. a SQLite-backed job table)
@@ -121,6 +126,55 @@ def create_job(
                     with job._lock:
                         job.error = f"post-processing failed: {exc}"
         except Exception as exc:  # defensive: e.g. siril binary missing
+            with job._lock:
+                job.status = "failed"
+                job.error = str(exc)
+        finally:
+            with job._lock:
+                job.ended_at = time.time()
+                if job.status == "succeeded":
+                    job.percent_complete = 100.0
+
+    threading.Thread(target=_run, daemon=True, name=f"job-{job_id}").start()
+    return job
+
+
+def create_python_job(
+    work: Callable[[Callable[[float, str], None]], dict],
+    log_dir: Path,
+    workdir: Optional[Path] = None,
+) -> Job:
+    """Run an arbitrary Python callable in a background thread instead of
+    siril-cli. `work(progress)` does the actual computation, calling
+    `progress(percent, message)` as it goes, and returns a dict stored as
+    job.result on success. No subprocess, no return code (always 0 on
+    success) — see app/framestats.py, which uses this for /lights/analyze
+    (stateless numpy/astropy work per frame; no Siril session to degrade).
+    """
+    job_id = uuid.uuid4().hex[:12]
+    log_path = log_dir / f"{job_id}.log"
+    job = Job(id=job_id, workdir=workdir or log_dir, log_path=log_path)
+    with _registry_lock:
+        _jobs[job_id] = job
+
+    def progress(percent: float, message: str) -> None:
+        with job._lock:
+            job.percent_complete = percent
+            job.current_line = message
+        with log_path.open("a") as f:
+            f.write(f"{message}\n")
+
+    def _run() -> None:
+        with job._lock:
+            job.status = "running"
+            job.started_at = time.time()
+        try:
+            result = work(progress)
+            with job._lock:
+                job.result = result
+                job.status = "succeeded"
+                job.return_code = 0
+        except Exception as exc:
             with job._lock:
                 job.status = "failed"
                 job.error = str(exc)

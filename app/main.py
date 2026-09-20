@@ -12,7 +12,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 
-from . import config, jobs, seqstats, ssf, staging
+from . import config, framestats, jobs, ssf, staging
 from .models import (
     AnalyzeLightsRequest,
     BuildMastersRequest,
@@ -100,41 +100,60 @@ def run_stack(name: str, req: StackLightsRequest):
     return {"job_id": job.id}
 
 
-@app.post("/projects/{name}/lights/analyze/render", response_class=PlainTextResponse)
+@app.post("/projects/{name}/lights/analyze/render")
 def render_analyze(name: str, req: AnalyzeLightsRequest):
+    """Dry run: resolve `nights`/`exclude_frames` and report which files
+    would be analyzed, without actually running anything. No Siril, no
+    .ssf script involved anymore — see AnalyzeLightsRequest's docstring
+    for why this no longer shells out to Siril at all.
+    """
     project = _project_or_404(name)
     try:
-        return ssf.render_analyze_lights(project, req).text
+        targets = framestats.resolve_analyze_targets(project, req.nights, req.exclude_frames)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "nights": {
+            t.key: {"lights_dir": str(t.lights_dir), "file_count": len(t.files), "files": [f.name for f in t.files]}
+            for t in targets
+        }
+    }
 
 
 @app.post("/projects/{name}/lights/analyze/run")
 def run_analyze(name: str, req: AnalyzeLightsRequest):
-    """Calibrate+register lights only (no stacking) and, once that
-    succeeds, parse each night's per-frame FWHM/roundness/background/star-
-    count out of Siril's own registration data. Nothing is excluded here —
-    this is the recommend-don't-auto-filter review step; see
-    AnalyzeLightsRequest's docstring and Handoff.md.
+    """Compute per-frame quality-review stats directly from raw light
+    frames via astropy+photutils (app/framestats.py) — no Siril, no
+    masters needed. Nothing is excluded here; this is the
+    recommend-don't-auto-filter review step. See AnalyzeLightsRequest's
+    and app/framestats.py's docstrings, and Handoff.md, for why this
+    stopped shelling out to Siril.
     """
     project = _project_or_404(name)
     try:
-        rendered = ssf.render_analyze_lights(project, req)
+        targets = framestats.resolve_analyze_targets(project, req.nights, req.exclude_frames)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    ssf.prepare_fresh_dirs(rendered.fresh_dirs)
-    ssf.apply_light_selections(rendered.light_selections)
 
-    def on_success() -> dict:
+    total_files = sum(len(t.files) for t in targets)
+
+    def work(progress) -> dict:
         result: dict = {"nights": {}}
-        for night in rendered.nights:
-            process_dir: Path = night["process_dir"]
-            seq_path = process_dir / "r_pp_light_.seq"
-            frames = seqstats.parse_registration_stats(seq_path, source_dir=night["raw_lights"])
-            result["nights"][night["key"]] = seqstats.stats_to_dicts(frames)
+        done = 0
+        for target in targets:
+            night_stats = []
+            for f in target.files:
+                progress(
+                    (done / total_files * 100.0) if total_files else 100.0,
+                    f"analyzing {target.key}: {f.name} ({done + 1}/{total_files})",
+                )
+                stats = framestats.analyze_frame(f, bin_factor=req.bin_factor, threshold_sigma=req.threshold_sigma)
+                night_stats.append(stats.__dict__)
+                done += 1
+            result["nights"][target.key] = night_stats
         return result
 
-    job = jobs.create_job(rendered.text, project, project / "logs", on_success=on_success)
+    job = jobs.create_python_job(work, project / "logs", workdir=project)
     return {"job_id": job.id}
 
 
