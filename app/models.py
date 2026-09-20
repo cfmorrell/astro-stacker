@@ -35,15 +35,16 @@ class StackOptions(BaseModel):
 
 class BuildMastersRequest(BaseModel):
     """Build master bias/dark (always shared across the whole project) and
-    master flat(s) from project_dir/raw/{biases,darks,flats}.
+    one master flat per named night, from project_dir/raw/{biases,darks}
+    and project_dir/raw/nights/<name>/flats.
 
-    `nights`: empty = legacy single flat/flats layout (raw/flats ->
-    process/master_flat, matches the hand-validated pipeline exactly).
-    Non-empty = one master flat per named night, built from
-    raw/nights/<name>/flats -> process/nights/<name>/master_flat, each
-    calibrated against the single shared master_bias. Bias/dark are never
-    per-night — per Chris: "usually a single set of bias and dark images
-    that will apply across all nights."
+    `nights` is required and must name every night whose flats should get
+    a master built (every project always uses the raw/nights/<name>/...
+    layout — see /projects/{name}/stage — even a "single-night" project is
+    just one name here; there is no separate flat/legacy layout to
+    remember to ask about). Bias/dark are never per-night — per Chris:
+    "usually a single set of bias and dark images that will apply across
+    all nights."
 
     Any raw/ subdirectory that doesn't exist (including a given night's
     flats/) is skipped rather than erroring, so re-running this only
@@ -52,13 +53,13 @@ class BuildMastersRequest(BaseModel):
     """
 
     stack: StackOptions = Field(default_factory=StackOptions)
-    nights: list[str] = Field(default_factory=list)
+    nights: list[str] = Field(..., min_length=1)
 
     model_config = {
         "json_schema_extra": {
             "example": {
                 "stack": {"method": "rej", "sigma_low": 3.0, "sigma_high": 3.0},
-                "nights": [],
+                "nights": ["night1"],
             }
         }
     }
@@ -69,17 +70,20 @@ class LightsSelectionRequest(BaseModel):
     frames: calibrate+register+stack (StackLightsRequest) or calibrate+
     register only, for human review (AnalyzeLightsRequest).
 
-    `nights`: empty = legacy single flat layout — lights read from
-    raw/lights, calibrated against process/master_flat. Non-empty = each
-    name's lights are read from raw/nights/<name>/lights and calibrated
-    against ITS OWN process/nights/<name>/master_flat by default (flats
-    vary night to night), while `master_dark` stays a single shared value
-    across every night (see BuildMastersRequest's docstring). Sequences
-    from multiple nights are combined via Siril's `merge` before
-    registration/stacking.
+    `nights` is required — every project always uses the
+    raw/nights/<name>/{lights,flats} layout (see /projects/{name}/stage
+    and BuildMastersRequest), even for a project that only has one
+    session; there is no separate single-night layout to remember or ask
+    about. Each named night's lights are read from raw/nights/<name>/lights
+    and calibrated against ITS OWN process/nights/<name>/master_flat by
+    default (flats vary night to night), while `master_dark` stays a
+    single shared value across every night. With exactly one name, that
+    night's own sequence is registered/stacked directly; with two or more,
+    they're combined first via Siril's `merge` (which — confirmed the hard
+    way — refuses to run with fewer than two inputs, hence the split).
     """
 
-    nights: list[str] = Field(default_factory=list)
+    nights: list[str] = Field(..., min_length=1)
     is_osc: bool = True  # False drops -cfa/-equalize_cfa/-debayer for mono cameras
     master_dark: Optional[str] = None  # absolute path override; default process/master_dark (shared)
     master_flat: Optional[str] = None  # override applied to ALL nights uniformly; default is per-night
@@ -103,7 +107,7 @@ class StackLightsRequest(LightsSelectionRequest):
         # it out" round-trips a request that actually works unedited.
         "json_schema_extra": {
             "example": {
-                "nights": [],
+                "nights": ["night1"],
                 "stack": {"method": "rej", "sigma_low": 3.0, "sigma_high": 3.0},
                 "is_osc": True,
                 "master_dark": None,
@@ -127,7 +131,7 @@ class AnalyzeLightsRequest(LightsSelectionRequest):
     model_config = {
         "json_schema_extra": {
             "example": {
-                "nights": [],
+                "nights": ["night1"],
                 "is_osc": True,
                 "master_dark": None,
                 "master_flat": None,

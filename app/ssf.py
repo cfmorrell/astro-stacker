@@ -1,20 +1,29 @@
 """Renders .ssf scripts from the templates/ dir.
 
-The single-night path is deliberately kept identical in structure to the
-hand-validated script in Handoff.md ("Validated .ssf script" section) —
-convert -> calibrate -> register pp_light -> stack r_pp_light — just with
-the stack method and master paths parameterized. Multi-night stacking uses
-Siril's `merge` across each night's pp_light sequence, following the
-pattern in rolandet's osc-multi-night-stacking script (GPLv3, referenced
-for structure only, per Handoff.md's licensing note).
+Every project uses one universal layout — there is no separate
+single-night mode (dropped 2026-09-20; see gotcha "no separate
+single-night layout" and _resolve_nights()'s docstring for why: a dual
+layout meant an unspecified `nights` could silently assume a raw/lights/
+that a multi-night-staged project never had). A "single-night" project is
+just one whose `nights` list happens to have one entry.
+
+The command sequence itself — convert -> calibrate -> register -> stack —
+is kept identical in structure to the hand-validated script in
+Handoff.md ("Validated .ssf script" section), just with the stack method
+and master paths parameterized. With 2+ nights, their pp_light sequences
+are combined via Siril's `merge` first (Siril requires at least two
+inputs to `merge` — confirmed the hard way — so exactly one night skips
+this and registers/stacks its own sequence directly instead), following
+the pattern in rolandet's osc-multi-night-stacking script (GPLv3,
+referenced for structure only, per Handoff.md's licensing note).
 
 Raw/process layout:
-    raw/biases, raw/darks              — shared across the whole project
-    raw/flats, raw/lights              — legacy single-night layout
-    raw/nights/<name>/{lights,flats}   — multi-night layout
-    process/master_bias, process/master_dark        — always shared
-    process/master_flat                              — legacy single-night
-    process/nights/<name>/master_flat                — per-night (multi)
+    raw/biases, raw/darks                     — shared across the project
+    raw/nights/<name>/{lights,flats}          — every night, always
+    process/master_bias, process/master_dark  — always shared
+    process/nights/<name>/master_flat         — per-night
+    process/nights/<name>/lights              — disposable per-run workspace
+    process/lights/_merged                    — disposable, 2+ nights only
 """
 
 from __future__ import annotations
@@ -126,39 +135,24 @@ def render_build_masters(project: Path, req: BuildMastersRequest) -> RenderedScr
     flat_targets: list[dict] = []
     ensure_dirs = [process]
 
-    if not req.nights:
-        flats_dir = raw / "flats"
+    # Absolute: each night's flats are calibrated from a *different*
+    # process_dir than the shared master_bias lives in.
+    bias_arg_abs = str(process / "master_bias") if build_bias else None
+    for name in req.nights:
+        if not name or "/" in name or name in (".", ".."):
+            raise ValueError(f"invalid night name: {name!r}")
+        flats_dir = raw / "nights" / name / "flats"
         if flats_dir.is_dir():
+            night_process = process / "nights" / name
             flat_targets.append(
                 {
-                    "label": "(single night)",
+                    "label": name,
                     "raw_flats": str(flats_dir),
-                    "process_dir": str(process),
-                    # Relative: read back from the same process_dir the
-                    # flat conversion just cd'd into (matches the
-                    # hand-validated script exactly).
-                    "bias_arg": "master_bias" if build_bias else None,
+                    "process_dir": str(night_process),
+                    "bias_arg": bias_arg_abs,
                 }
             )
-    else:
-        # Absolute: each night's flats are calibrated from a *different*
-        # process_dir than the shared master_bias lives in.
-        bias_arg_abs = str(process / "master_bias") if build_bias else None
-        for name in req.nights:
-            if not name or "/" in name or name in (".", ".."):
-                raise ValueError(f"invalid night name: {name!r}")
-            flats_dir = raw / "nights" / name / "flats"
-            if flats_dir.is_dir():
-                night_process = process / "nights" / name
-                flat_targets.append(
-                    {
-                        "label": name,
-                        "raw_flats": str(flats_dir),
-                        "process_dir": str(night_process),
-                        "bias_arg": bias_arg_abs,
-                    }
-                )
-                ensure_dirs.append(night_process)
+            ensure_dirs.append(night_process)
 
     template = _env.get_template("build_masters.ssf.j2")
     text = template.render(
@@ -175,54 +169,56 @@ def render_build_masters(project: Path, req: BuildMastersRequest) -> RenderedScr
 
 def _resolve_nights(
     project: Path, req: LightsSelectionRequest
-) -> tuple[list[dict], str, bool, list[LightSelection], Path | None]:
+) -> tuple[list[dict], str, list[LightSelection], Path | None]:
     """Shared night/master resolution for stacking and analysis. Returns
-    (nights, dark_master, single, light_selections, merge_dir), raising
+    (nights, dark_master, light_selections, merge_dir), raising
     ValueError (-> HTTP 400 in main.py) for anything that would otherwise
     reach siril-cli as a silent, confusing failure: a bad night name, a
     missing lights directory, or a missing master file (see Handoff.md
     gotcha #4 and the 2026-09-20 "string" placeholder incident this
     validation was added for).
 
+    Every project always uses the raw/nights/<name>/{lights,flats} layout
+    — there is no separate single-night layout (dropped 2026-09-20 after
+    hitting exactly the bug that layout duality invites: a request with no
+    `nights` silently assumed a raw/lights/ that a multi-night-staged
+    project never had). `nights` is required and non-empty (enforced by
+    LightsSelectionRequest's Field(..., min_length=1)); a "single-night"
+    project is simply one that only has one entry in `nights`.
+
     Each night's `process_dir` is a disposable conversion workspace
-    (process/lights or process/nights/<name>/lights) — deliberately
-    *separate* from wherever that night's persistent master_flat.fit
-    lives, and always wiped fresh by prepare_fresh_dirs() before a run
-    (see gotcha #6: reusing a directory that still has a *previous* run's
-    numbered frame files in it gets them silently folded into the new
-    sequence by Siril's own directory rescan). `merge_dir` is an
-    additional disposable workspace for the final merge/register/stack
-    step in multi-night mode (None for single-night, where that step just
-    reuses the one night's own process_dir).
+    (process/nights/<name>/lights) — deliberately *separate* from wherever
+    that night's persistent master_flat.fit lives, and always wiped fresh
+    by prepare_fresh_dirs() before a run (see gotcha #6: reusing a
+    directory that still has a *previous* run's numbered frame files in
+    it gets them silently folded into the new sequence by Siril's own
+    directory rescan).
+
+    `merge_dir` is an additional disposable workspace for the final
+    merge/register/stack step, needed only when there are 2+ nights: with
+    exactly one, that step just reuses the one night's own process_dir
+    directly. This isn't an arbitrary simplification — Siril's `merge`
+    command's own usage string is `merge sequence1 sequence2
+    [sequence3 ...] output_sequence`; it hard-refuses to run with fewer
+    than two inputs (confirmed the hard way, 2026-09-20), so a single
+    night genuinely cannot go through the same merge step as multiple.
     """
     raw = project / "raw"
     process = project / "process"
-    single = not req.nights or (len(req.nights) == 1 and req.nights[0] == "")
 
     nights: list[dict] = []
-    merge_dir: Path | None = None
-    if single:
+    for name in req.nights:
+        if not name or "/" in name or name in (".", ".."):
+            raise ValueError(f"invalid night name: {name!r}")
         nights.append(
             {
-                "key": "single",
-                "raw_lights": raw / "lights",
-                "process_dir": process / "lights",
-                "flat_master": req.master_flat or str(process / "master_flat"),
+                "key": name,
+                "raw_lights": raw / "nights" / name / "lights",
+                "process_dir": process / "nights" / name / "lights",
+                "flat_master": req.master_flat or str(process / "nights" / name / "master_flat"),
             }
         )
-    else:
-        for name in req.nights:
-            if not name or "/" in name or name in (".", ".."):
-                raise ValueError(f"invalid night name: {name!r}")
-            nights.append(
-                {
-                    "key": name,
-                    "raw_lights": raw / "nights" / name / "lights",
-                    "process_dir": process / "nights" / name / "lights",
-                    "flat_master": req.master_flat or str(process / "nights" / name / "master_flat"),
-                }
-            )
-        merge_dir = process / "lights" / "_merged"
+    merge_dir = process / "lights" / "_merged" if len(nights) > 1 else None
 
     dark_master = req.master_dark or str(process / "master_dark")
 
@@ -267,18 +263,19 @@ def _resolve_nights(
                 "master_flat override"
             )
 
-    return nights, dark_master, single, selections, merge_dir
+    return nights, dark_master, selections, merge_dir
 
 
 def render_stack_lights(project: Path, req: StackLightsRequest) -> RenderedScript:
-    nights, dark_master, single, selections, merge_dir = _resolve_nights(project, req)
+    nights, dark_master, selections, merge_dir = _resolve_nights(project, req)
     osc_flags = " -cfa -equalize_cfa -debayer" if req.is_osc else ""
-    base_process_dir = nights[0]["process_dir"] if single else merge_dir
+    needs_merge = merge_dir is not None
+    base_process_dir = merge_dir if needs_merge else nights[0]["process_dir"]
 
     template = _env.get_template("calibrate_stack.ssf.j2")
     text = template.render(
         nights=nights,
-        single=single,
+        merge=needs_merge,
         dark_master=dark_master,
         cc_flag=" -cc=dark",
         osc_flags=osc_flags,
@@ -292,13 +289,12 @@ def render_stack_lights(project: Path, req: StackLightsRequest) -> RenderedScrip
 
 
 def render_analyze_lights(project: Path, req: AnalyzeLightsRequest) -> RenderedScript:
-    nights, dark_master, single, selections, _merge_dir = _resolve_nights(project, req)
+    nights, dark_master, selections, _merge_dir = _resolve_nights(project, req)
     osc_flags = " -cfa -equalize_cfa -debayer" if req.is_osc else ""
 
     template = _env.get_template("analyze_lights.ssf.j2")
     text = template.render(
         nights=nights,
-        single=single,
         dark_master=dark_master,
         cc_flag=" -cc=dark",
         osc_flags=osc_flags,

@@ -68,6 +68,21 @@ post-processing elsewhere.
   excludes nothing; a human picks `exclude_frames` for `/stack/run`
   afterward. Don't add an auto-reject threshold later without Chris
   explicitly asking for one — it would invert this decision.
+- **No separate single-night layout** (settled 2026-09-20, replacing an
+  earlier design that had one): every project always uses
+  `raw/nights/<name>/{lights,flats}`, even for a project with exactly one
+  night. The earlier dual-layout design (an implicit flat `raw/lights` for
+  "single-night", `raw/nights/<name>/...` for "multi-night") caused a real
+  bug in practice — Chris hit it directly: staging `multi1` only ever
+  created the `raw/nights/...` layout, so a request with no `nights`
+  specified silently assumed the *other* layout and failed with a
+  confusing "directory not found" instead of a clear error. `nights` is
+  now a required, non-empty field everywhere (`Field(..., min_length=1)`)
+  — a missing/empty list is a clean 422 from FastAPI itself, not a guess.
+  The only place night-count still matters is whether the final
+  register/stack step needs `merge` first (see gotcha #7 — Siril's
+  `merge` refuses fewer than two inputs, so exactly one night can't use
+  the same code path as two+); the on-disk layout itself never varies.
 
 ## Reference material already pulled (don't re-derive from scratch)
 - `bscholer/astrolab`'s `templates/calibrate_register_stack.yaml` — the
@@ -195,6 +210,18 @@ post-processing elsewhere.
    it a second time against a *different* frame count in `raw/biases`
    `raw/darks`, or a night's `raw/.../flats` is unverified and should be
    assumed unsafe until it gets the same treatment.
+7. **`merge` refuses to run with fewer than two input sequences** — its
+   own usage string is `merge sequence1 sequence2 [sequence3 ...]
+   output_sequence`; `sequence2` is not optional. Confirmed the hard way
+   (2026-09-20) trying to unconditionally merge-then-stack regardless of
+   night count, to see if it would collapse the single/multi-night
+   branching entirely. It can't: a project with exactly one night must
+   skip `merge` and register/stack that night's own `pp_light` sequence
+   directly. `app/ssf.py`'s `_resolve_nights()` handles this by making the
+   merge step conditional purely on `len(nights) > 1` — this is the *only*
+   place single-vs-multi still matters; the on-disk layout itself is
+   identical either way (see the "no separate single-night layout" note
+   below).
 
 ## Current validated status
 - ✅ Docker build/run/exec loop works on the NAS.
@@ -288,6 +315,20 @@ post-processing elsewhere.
   against the same night with two *different* `exclude_frames` sets and
   confirming the second run's result reflected only the second run's
   input, with zero bleed-through from the first.
+- ✅ **Collapsed the single-night/multi-night layout duality (2026-09-20,
+  same day as the above)**: Chris hit the dual-layout bug directly —
+  `multi1` only ever had `raw/nights/...`, and an analyze call with no
+  `nights` specified silently assumed the *other* (flat `raw/lights`)
+  layout and failed confusingly. `nights` is now required and non-empty
+  everywhere (`BuildMastersRequest`, `LightsSelectionRequest`) — a missing
+  one is a clean 422 from FastAPI, not a guess. Every project always uses
+  `raw/nights/<name>/...`; a "single-night" project is just one with a
+  single entry in `nights`. Also surfaced gotcha #7 in the process
+  (`merge` refuses fewer than two inputs) while checking whether the
+  register/stack branching could collapse too — it can't, that's the one
+  place night-count still matters. Re-validated end-to-end after the
+  change: single-night direct path (no merge) and the two-night merge
+  path both re-run successfully against `multi1`'s real data.
 - ❌ `/masters/run` does **not** have the gotcha #6 fix yet — re-running it
   against a changed frame count in `raw/biases`/`raw/darks`/a night's
   `raw/.../flats` is unverified and should be assumed unsafe (see gotcha

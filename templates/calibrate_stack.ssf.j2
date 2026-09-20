@@ -13,14 +13,14 @@ cd "{{ night.process_dir }}"
 calibrate light -dark={{ dark_master }} -flat={{ night.flat_master }}{{ cc_flag }}{{ osc_flags }}
 {% endfor %}
 # ---- Registration & stack ----
-{% if single %}
-cd "{{ base_process_dir }}"
-register pp_light
-stack r_pp_light {{ stack_cmd }} -norm=addscale -output_norm -out=result
-{% else %}
+{% if merge %}
 cd "{{ base_process_dir }}"
 merge {% for night in nights %}"{{ night.process_dir }}/pp_light"{{ " " if not loop.last else "" }}{% endfor %} all_lights
 register all_lights -layer=0
 stack r_all_lights {{ stack_cmd }} -norm=addscale -output_norm -out=result
+{% else %}
+cd "{{ base_process_dir }}"
+register pp_light
+stack r_pp_light {{ stack_cmd }} -norm=addscale -output_norm -out=result
 {% endif %}
 close

@@ -57,19 +57,19 @@ def stage_project(name: str, req: StageProjectRequest | None = None):
 
 
 @app.post("/projects/{name}/masters/render", response_class=PlainTextResponse)
-def render_masters(name: str, req: BuildMastersRequest | None = None):
+def render_masters(name: str, req: BuildMastersRequest):
     project = _project_or_404(name)
     try:
-        return ssf.render_build_masters(project, req or BuildMastersRequest()).text
+        return ssf.render_build_masters(project, req).text
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/projects/{name}/masters/run")
-def run_masters(name: str, req: BuildMastersRequest | None = None):
+def run_masters(name: str, req: BuildMastersRequest):
     project = _project_or_404(name)
     try:
-        rendered = ssf.render_build_masters(project, req or BuildMastersRequest())
+        rendered = ssf.render_build_masters(project, req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     for d in rendered.ensure_dirs:
@@ -79,19 +79,19 @@ def run_masters(name: str, req: BuildMastersRequest | None = None):
 
 
 @app.post("/projects/{name}/stack/render", response_class=PlainTextResponse)
-def render_stack(name: str, req: StackLightsRequest | None = None):
+def render_stack(name: str, req: StackLightsRequest):
     project = _project_or_404(name)
     try:
-        return ssf.render_stack_lights(project, req or StackLightsRequest()).text
+        return ssf.render_stack_lights(project, req).text
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/projects/{name}/stack/run")
-def run_stack(name: str, req: StackLightsRequest | None = None):
+def run_stack(name: str, req: StackLightsRequest):
     project = _project_or_404(name)
     try:
-        rendered = ssf.render_stack_lights(project, req or StackLightsRequest())
+        rendered = ssf.render_stack_lights(project, req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     ssf.prepare_fresh_dirs(rendered.fresh_dirs)
@@ -101,16 +101,16 @@ def run_stack(name: str, req: StackLightsRequest | None = None):
 
 
 @app.post("/projects/{name}/lights/analyze/render", response_class=PlainTextResponse)
-def render_analyze(name: str, req: AnalyzeLightsRequest | None = None):
+def render_analyze(name: str, req: AnalyzeLightsRequest):
     project = _project_or_404(name)
     try:
-        return ssf.render_analyze_lights(project, req or AnalyzeLightsRequest()).text
+        return ssf.render_analyze_lights(project, req).text
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/projects/{name}/lights/analyze/run")
-def run_analyze(name: str, req: AnalyzeLightsRequest | None = None):
+def run_analyze(name: str, req: AnalyzeLightsRequest):
     """Calibrate+register lights only (no stacking) and, once that
     succeeds, parse each night's per-frame FWHM/roundness/background/star-
     count out of Siril's own registration data. Nothing is excluded here —
@@ -119,7 +119,7 @@ def run_analyze(name: str, req: AnalyzeLightsRequest | None = None):
     """
     project = _project_or_404(name)
     try:
-        rendered = ssf.render_analyze_lights(project, req or AnalyzeLightsRequest())
+        rendered = ssf.render_analyze_lights(project, req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     ssf.prepare_fresh_dirs(rendered.fresh_dirs)
