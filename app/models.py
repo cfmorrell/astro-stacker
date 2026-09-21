@@ -197,8 +197,7 @@ class NightSource(BaseModel):
 
 class StageProjectRequest(BaseModel):
     """Symlinks raw frames from CAPTURES_DIR into this project's raw/ tree
-    (creating the project directory if needed), replacing manual
-    `mkdir` + `scripts/stage_captures.sh` invocation. Bias/dark are shared
+    (creating the project directory if needed). Bias/dark are shared
     (staged once, at raw/biases and raw/darks); each entry in `nights`
     stages its own lights+flats at raw/nights/<name>/{lights,flats}.
     """

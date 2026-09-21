@@ -1,16 +1,14 @@
 """Symlinks raw capture frames from CAPTURES_DIR into a project's raw/ tree.
 
-Replaces manual `mkdir` + scripts/stage_captures.sh invocation. Source
-folder names (e.g. "Night 1", with a space) never need to match any
+Source folder names (e.g. "Night 1", with a space) never need to match any
 convention — the caller picks the internal night name that lands on disk
 (raw/nights/<name>/...), decoupling our layout from whatever the telescope
 control software happened to call things (per Chris: "we should remain
 flexible on naming conventions").
 
-Symlinking (not copying) is deliberate and matches scripts/stage_captures.sh:
-CAPTURES_DIR stays read-only always (Handoff.md gotcha #2 — Siril can
-never `cd` into it directly), and cheap symlinks avoid duplicating
-potentially large FITS files on disk.
+Symlinking (not copying) is deliberate: CAPTURES_DIR stays read-only
+always (Handoff.md gotcha #2 — Siril can never `cd` into it directly),
+and cheap symlinks avoid duplicating potentially large FITS files on disk.
 """
 
 from __future__ import annotations

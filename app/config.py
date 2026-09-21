@@ -8,7 +8,7 @@ See Handoff.md "Environment / paths" for the mount layout this assumes:
 - DATA_DIR: bind-mounted, NOT in git. Holds per-project working dirs.
 - CAPTURES_DIR: bind-mounted read-only. Raw camera output. Siril can never
   `cd` into this directly (gotcha #2) — projects stage symlinks from here
-  into DATA_DIR/projects/<name>/raw/ via scripts/stage_captures.sh first.
+  into DATA_DIR/projects/<name>/raw/ first (see app/staging.py).
 """
 
 from __future__ import annotations

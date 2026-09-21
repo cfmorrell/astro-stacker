@@ -103,6 +103,61 @@ def project_status(name: str):
     return status.project_status(project)
 
 
+@app.get("/projects/{name}/broken-links")
+def check_broken_links(name: str):
+    """Check every staged symlink under raw/ for a target that no longer
+    exists — e.g. something outside this app moved or deleted a file in
+    CAPTURES_DIR after it was staged (a real possibility once a separate
+    tool manages that whole archive — see Handoff.md's file-management
+    scope note). A dedicated endpoint, not folded into /status: one
+    stat-like syscall per staged file means a project with hundreds of
+    frames could take noticeably longer than the fast, essential status
+    load the frontend calls constantly — the frontend calls this
+    separately, once, asynchronously after status loads, so a slow check
+    never blocks anything else from rendering.
+    """
+    project = _project_or_404(name)
+    raw = project / "raw"
+    broken = []
+    checked = 0
+    if raw.is_dir():
+        for p in raw.rglob("*"):
+            if p.is_symlink():
+                checked += 1
+                if not p.exists():  # exists() follows the symlink; False means the target is gone
+                    broken.append(str(p.relative_to(project)))
+    return {"checked": checked, "broken": broken}
+
+
+_FRAME_TYPE_KEYWORDS = ("light", "dark", "flat", "bias")
+
+
+def _detect_frame_type(filenames: list[str]) -> str | None:
+    """Guess what kind of frames a directory holds by checking each
+    filename (case-insensitive) for one of the standard type keywords —
+    most capture software (ASIAIR, N.I.N.A., etc.) puts this right in the
+    name, e.g. "Light_Target_300.0s_...fit". Backs a Stage-time warning
+    when a picked folder doesn't look like the field it was picked for
+    (e.g. a "flats" folder full of files that all say "Dark").
+
+    Returns the dominant type if at least 90% of files that mention ANY
+    keyword agree on which one; "mixed" if they don't (inconsistent
+    naming — still worth a warning); None if no file mentions a keyword
+    at all, since that's "we can't tell," not "this looks wrong."
+    """
+    counts = {k: 0 for k in _FRAME_TYPE_KEYWORDS}
+    for name in filenames:
+        lower = name.lower()
+        matched = [k for k in _FRAME_TYPE_KEYWORDS if k in lower]
+        if len(matched) == 1:
+            counts[matched[0]] += 1
+    total = sum(counts.values())
+    if total == 0:
+        return None
+    dominant_type, dominant_count = max(counts.items(), key=lambda kv: kv[1])
+    return dominant_type if dominant_count / total >= 0.9 else "mixed"
+
+
 @app.get("/captures/browse")
 def browse_captures(path: str = ""):
     """List subdirectories under CAPTURES_DIR (read-only) so the frontend
@@ -117,8 +172,8 @@ def browse_captures(path: str = ""):
     if not target.is_dir():
         raise HTTPException(status_code=404, detail=f"not a directory under captures: {path!r}")
     dirs = sorted(p.name for p in target.iterdir() if p.is_dir())
-    fit_count = sum(1 for pat in ("*.fit", "*.fits") for _ in target.glob(pat))
-    return {"path": path, "dirs": dirs, "fit_count": fit_count}
+    fit_names = [p.name for pat in ("*.fit", "*.fits") for p in target.glob(pat)]
+    return {"path": path, "dirs": dirs, "fit_count": len(fit_names), "detected_type": _detect_frame_type(fit_names)}
 
 
 def _project_relative_file(project: Path, path: str) -> Path:
@@ -205,8 +260,7 @@ def project_download(name: str, path: str):
 @app.post("/projects/{name}/stage")
 def stage_project(name: str, req: StageProjectRequest | None = None):
     """Symlink raw frames from CAPTURES_DIR into this project's raw/ tree,
-    creating the project if it doesn't exist yet. Replaces manual `mkdir` +
-    scripts/stage_captures.sh.
+    creating the project if it doesn't exist yet.
     """
     project = _project_path(name)
     try:
@@ -369,7 +423,7 @@ def run_analyze(name: str, req: AnalyzeLightsRequest):
 
 
 @app.get("/projects/{name}/jobs")
-def list_jobs(name: str):
+def list_project_jobs(name: str):
     """All jobs run for this project since the server last started
     (in-memory only, see app/jobs.py), newest first — backs the frontend's
     job history panel and its cross-tab "is anything running right now"
@@ -377,6 +431,15 @@ def list_jobs(name: str):
     """
     _project_or_404(name)
     return {"jobs": [j.snapshot() for j in jobs.list_jobs(name)]}
+
+
+@app.get("/jobs")
+def list_all_jobs_route():
+    """Every job across every project, newest first — backs the
+    frontend's global "active jobs" panel, so a stack running in one
+    project stays visible while looking at a completely different one.
+    """
+    return {"jobs": [j.snapshot() for j in jobs.list_all_jobs()]}
 
 
 @app.get("/jobs/{job_id}")

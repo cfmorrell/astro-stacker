@@ -1,21 +1,21 @@
 """Minimal in-memory background job manager.
 
 Stacking runs can take an hour+ (see Handoff.md), so /masters/run and
-/stack/run can't block the request thread. Three ways to run one:
-- `create_job()` — a single siril-cli invocation in a background thread.
-- `create_multi_script_job()` — SEVERAL independent siril-cli invocations,
-  run one after another as SEPARATE subprocesses within one job. This
-  exists specifically for gotcha #8: running multiple sequences'
-  calibrate+register in *one* Siril session causes a severe, confirmed
-  performance cliff (identical work: 10s alone vs 90s as the 2nd sequence
-  in one process). Giving each night (or each master type) its own fresh
-  siril-cli process sidesteps that entirely — see app/ssf.py's
-  render_stack_lights()/render_build_masters(), which build the step list.
+/stack/run can't block the request thread. Two ways to run one:
+- `create_multi_script_job()` — one or more independent siril-cli
+  invocations, run one after another as SEPARATE subprocesses within one
+  job. This exists specifically for gotcha #8: running multiple
+  sequences' calibrate+register in *one* Siril session causes a severe,
+  confirmed performance cliff (identical work: 10s alone vs 90s as the
+  2nd sequence in one process). Giving each night (or each master type)
+  its own fresh siril-cli process sidesteps that entirely — see
+  app/ssf.py's render_stack_lights()/render_build_masters(), which build
+  the step list.
 - `create_python_job()` — an arbitrary Python callable, no Siril at all;
   used by /lights/analyze (app/framestats.py).
 
-All three share the same Job/snapshot shape so /jobs/{id} doesn't need to
-know which kind it's looking at.
+Both share the same Job/snapshot shape so /jobs/{id} doesn't need to know
+which kind it's looking at.
 
 Intentionally simple (no persistence, no multi-worker coordination) — good
 enough for a single-user, single-process FastAPI app on one NAS box. If
@@ -123,71 +123,16 @@ def list_jobs(project: str) -> list[Job]:
     return sorted(jobs, key=lambda j: j.started_at or 0, reverse=True)
 
 
-def create_job(
-    script_text: str,
-    workdir: Path,
-    log_dir: Path,
-    on_success: Optional[Callable[[], dict]] = None,
-    project: str = "",
-    kind: str = "",
-) -> Job:
-    """Run script_text via siril-cli in a background thread.
-
-    If given, on_success() is called after a zero exit code, and its
-    return value is stored on job.result — e.g. parsing per-frame quality
-    stats out of a .seq file for /lights/analyze. A failure in on_success
-    itself doesn't flip a successful siril run to "failed"; it's recorded
-    in job.error instead, since siril-cli did succeed.
+def list_all_jobs() -> list[Job]:
+    """Every known job across every project, newest-started first - backs
+    the frontend's global "active jobs" panel so running a stack in one
+    project is visible while looking at a completely different one,
+    instead of only ever seeing what's running for whichever project
+    happens to be open right now.
     """
-    job_id = uuid.uuid4().hex[:12]
-    log_path = log_dir / f"{job_id}.log"
-    job = Job(id=job_id, workdir=workdir, log_path=log_path, project=project, kind=kind)
     with _registry_lock:
-        _jobs[job_id] = job
-
-    def on_line(line: str) -> None:
-        with job._lock:
-            job.current_line = line
-            m = _COMMAND_RE.search(line)
-            if m:
-                job.current_command = m.group(1)
-                # A new command starting resets the previous command's
-                # progress rather than leaving e.g. "100.00%" from
-                # `convert` displayed while `register` is just beginning.
-                job.percent_complete = 0.0
-            m = _PROGRESS_RE.search(line)
-            if m:
-                job.percent_complete = float(m.group(1))
-
-    def _run() -> None:
-        with job._lock:
-            job.status = "running"
-            job.started_at = time.time()
-        try:
-            rc = siril_runner.run_script(script_text, workdir, log_path, on_line=on_line)
-            with job._lock:
-                job.return_code = rc
-                job.status = "succeeded" if rc == 0 else "failed"
-            if rc == 0 and on_success is not None:
-                try:
-                    result = on_success()
-                    with job._lock:
-                        job.result = result
-                except Exception as exc:  # defensive: e.g. .seq parsing hiccup
-                    with job._lock:
-                        job.error = f"post-processing failed: {exc}"
-        except Exception as exc:  # defensive: e.g. siril binary missing
-            with job._lock:
-                job.status = "failed"
-                job.error = str(exc)
-        finally:
-            with job._lock:
-                job.ended_at = time.time()
-                if job.status == "succeeded":
-                    job.percent_complete = 100.0
-
-    threading.Thread(target=_run, daemon=True, name=f"job-{job_id}").start()
-    return job
+        jobs = list(_jobs.values())
+    return sorted(jobs, key=lambda j: j.started_at or 0, reverse=True)
 
 
 @dataclass
