@@ -40,11 +40,16 @@
     </div>
   </div>
 
+  <div id="active-jobs-panel" class="active-jobs-panel" style="display:none;">
+    <div class="active-jobs-header">⏳ Active jobs</div>
+    <div id="active-jobs-list"></div>
+  </div>
+
   <div id="no-project-hint" class="empty-hint">Select or create a project to begin.</div>
 
   <div id="project-panels" style="display:none;">
 
-    <div id="external-job-banner" class="external-job-banner" style="display:none;">
+    <div id="broken-links-banner" class="external-job-banner broken-links-banner" style="display:none;">
       <span class="msg"></span>
     </div>
 
@@ -74,6 +79,7 @@
               <input type="text" id="biases-dir" placeholder="click … to browse" style="flex:1;" readonly />
               <button type="button" class="small" id="biases-browse">…</button>
             </div>
+            <div id="biases-type-warning" class="session-mismatch-warning" style="display:none;"></div>
           </div>
           <div class="field">
             <label>Darks dir (relative to captures)</label>
@@ -81,6 +87,7 @@
               <input type="text" id="darks-dir" placeholder="click … to browse" style="flex:1;" readonly />
               <button type="button" class="small" id="darks-browse">…</button>
             </div>
+            <div id="darks-type-warning" class="session-mismatch-warning" style="display:none;"></div>
           </div>
         </div>
 

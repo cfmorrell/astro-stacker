@@ -457,10 +457,11 @@ Siril ones, but the same "don't rediscover this" spirit applies.
    by `_reject_if_job_running()` in `app/main.py`: `/masters/run` and
    `/stack/run` now 409 if `jobs.has_running_job()` finds any job already
    running for that project, from any client. The frontend also polls
-   `GET /projects/{name}/jobs` every 5s while a project is open and
-   disables both buttons the moment it sees anything running elsewhere —
-   best-effort/UX only (up to ~5s to notice), the 409 is the actual
-   guarantee. See "Current validated status."
+   `GET /jobs` (global, every 5s, from page load — not gated on a project
+   being open, see the global active-jobs panel in "Current validated
+   status") and disables both buttons for the currently-open project the
+   moment it sees anything running there from elsewhere — best-effort/UX
+   only (up to ~5s to notice), the 409 is the actual guarantee.
 5. **HEAD requests 404 across this entire FastAPI app, not just one
    route.** Discovered testing the new download button with
    `fetch(url, {method: "HEAD"})` — got a 404 with Starlette's generic
@@ -501,8 +502,71 @@ Siril ones, but the same "don't rediscover this" spirit applies.
    found and fixed in the same pass.
 
 ## Current validated status
+- ✅ **One fix and three additions from live-usage feedback, verified
+  end-to-end (2026-09-2x)**: 1) **fix: review results didn't survive
+  switching projects and back.** Chris: "Light frame images do not stay
+  visible when I move between projects." Root cause: `state.
+  lastAnalyzeResult` (and exclusions/sensitivity) are pure client-side
+  state, unconditionally reset on every project switch — by design,
+  since none of it is saved server-side (see `AnalyzeLightsRequest`'s
+  docstring), but that meant switching away to check something else and
+  back threw the whole review session away even for a project analyzed
+  moments earlier. Fixed with a client-side `reviewCache` (`app.js`),
+  keyed by project name: the outgoing project's analyze result/
+  exclusions/sensitivity are saved just before a switch and restored
+  (after `loadProjectStatus()`, so `is_osc`/debayering is already known)
+  on return — explicitly invalidated by "Start over" and by deleting the
+  project, so neither can resurrect stale data. Verified end-to-end
+  (analyze, switch away, switch back, confirm images load with correct
+  `naturalWidth`) after ruling out a red herring: the first repro
+  attempts failed because the `multi1` test project referenced
+  throughout this file no longer exists — deleted at some point during
+  this session's own testing, not a product bug;
+  2) **global "active jobs" panel** — Chris: "if I'm running a stack in
+  two separate projects, I shouldn't have to go clicking through
+  projects to see what's happening." New `GET /jobs` (`app/main.py`,
+  backed by `jobs.list_all_jobs()`) lists every job across every
+  project; a panel visible regardless of which (if any) project is
+  selected (`pollActiveJobs()`/`renderActiveJobsPanel()` in `app.js`,
+  polling every 5s from page load, not tied to project selection like
+  the per-project version it replaces) shows every currently-running
+  one, each row clickable to jump straight to that project. The
+  per-project Masters/Stack button-disable and 409-avoidance behavior
+  from the prior round is preserved, now driven by this same global
+  poll filtered to `state.project` rather than a separate per-project
+  poll; 3) **broken-symlink detection** — Chris: "we should be aware if
+  the symlinks in the captures folder are invalid... if this check is
+  going to slow response time too much, let's come up with a better
+  solution." New `GET /projects/{name}/broken-links` walks every
+  symlink under `raw/` and checks whether its target still exists (one
+  stat-like syscall per staged file) — deliberately its own endpoint,
+  not folded into `/status`, and called fire-and-forget (not awaited)
+  right after `loadProjectStatus()` so a slow check on a huge project
+  can never block the fast/essential status load or anything else from
+  rendering; shows an amber banner listing what's missing if anything
+  comes back broken. Verified detection against a deliberately broken
+  symlink (real target replaced with `/nonexistent/fake.fit`); 4)
+  **filename-type mismatch warnings at Stage time** — Chris: "if the
+  filenames don't indicate an appropriate image type, we should warn
+  the user. This should look the same as the mismatched lights/flats
+  warning." `_detect_frame_type()` (`app/main.py`) checks `/captures/
+  browse`'s filenames (case-insensitive) for "light"/"dark"/"flat"/
+  "bias" keywords — most capture software puts the type right in the
+  name (confirmed against this project's own real filenames, e.g.
+  `Light_ElephantTrunk_300.0s_..."`) — and returns the dominant type, or
+  "mixed" if inconsistent, or `null` if it can't tell (never warns in
+  that case — nothing to warn about is different from "no files match a
+  keyword"). The frontend compares this against what each field expects
+  and shows the same `.session-mismatch-warning` styling already built
+  for the lights/flats-parent check, combined into one message when both
+  issues apply at once. Verified: pointing "Darks dir" at the biases
+  folder correctly warned "looks like it contains bias frames, not
+  darks."
 - ✅ **Job history + cross-tab/cross-client job awareness implemented and
-  verified against a real ~10+ minute stack run (2026-09-2x)** —
+  verified against a real ~10+ minute stack run (2026-09-2x)** — the
+  cross-tab piece described here is superseded by the global version
+  directly above (same underlying mechanism, now project-agnostic); job
+  history itself is unchanged.
   Immediate next steps items 1 and 2: `app/jobs.py`'s `Job` dataclass
   gained `project`/`kind` fields (threaded through all three
   `create_*_job()` functions and every call site in `app/main.py`);
@@ -1085,6 +1149,64 @@ Siril ones, but the same "don't rediscover this" spirit applies.
   shared flat across nights. A true *per-night* override (vs. today's
   single value applied to every night if given) is still not wired up —
   see Immediate next steps.
+- ✅ **Active-job click-through bug fixed and verified (2026-09-21)** —
+  Chris: "when I click on an active job, it always drops at file staging
+  rather than whatever the actual active stage in that project is." Root
+  cause: the active-job-row's `onclick` dispatched a synthetic `change`
+  event on `#project-select`, and that handler unconditionally reset
+  `state.activeStep` to `"stage"` regardless of why the switch happened.
+  Fixed by extracting the handler into a named `switchToProject(name,
+  initialStep)` (`app.js`) that takes the target step as a parameter —
+  the dropdown's own `change` listener still passes `"stage"`, but
+  `renderActiveJobsPanel()`'s row click now passes `stepForJobKind(job.
+  kind)` (`"masters"→"masters"`, `"stack"→"stack"`, `"analyze"→"review"`,
+  default `"stage"`). Clicking a row for the *current* project now just
+  flips `state.activeStep` and re-renders instead of running the whole
+  project-switch reset for no reason. Verified end-to-end via curl +
+  headless Chrome: started a real stack job on `live-test-3`, loaded the
+  frontend with no project selected, clicked its active-job row, and
+  confirmed both the project selector and the visible step panel landed
+  on `stack` (not `stage`) — for both the cross-project case and the
+  already-on-that-project case.
+- ✅ **Full code review pass (2026-09-21)**, requested after the above
+  fix: removed `jobs.create_job()` (the single-script job runner) —
+  confirmed zero call sites since `create_multi_script_job()` fully
+  replaced it; removed `scripts/stage_captures.sh` — confirmed unused by
+  any runtime code path (`app/staging.py` replaced it earlier this
+  session) and, worse, stale: it assumed a flat `lights/darks/flats/
+  biases` layout under `CAPTURES_DIR` that predates the current
+  `raw/nights/<name>/...` model, so running it today would've built a
+  broken project. Updated the handful of docstring references to both
+  (`app/config.py`, `app/main.py`, `app/models.py`, `app/staging.py`).
+  Removed four dead CSS classes with zero references in `index.html`/
+  `app.js` (`.complete-banner`, `.log-toggle-btn`, `.section-title`,
+  `.two-col`). Removed an unused `field` import in `app/ssf.py`. No
+  other dead code, TODOs, or stray debug output found (checked via AST
+  import/def-usage analysis across `app/*.py` and a grep sweep for
+  unused JS functions and CSS classes) — the codebase came out of this
+  round clean.
+- ✅ **README.md rewritten (2026-09-21)** with a real description of what
+  the tool does, the four-step workflow, and the tech stack — previously
+  a single placeholder sentence.
+- ✅ **Production Dockerfile added (2026-09-21)** as prep for moving off
+  the dev container per Chris's request ("the next step... is to move
+  this out of dev and into a fully deployable container... if you have
+  to do any prep before that, get that done"). New `Dockerfile` (next to
+  the existing `Dockerfile.dev`) copies `app/`/`static/`/`templates/`
+  into the image at build time instead of bind-mounting, and runs
+  `uvicorn` directly with no `--reload` — a rebuild is required to pick
+  up code changes, which is the intended tradeoff for something meant to
+  run unattended rather than be iterated on live. Also added `numpy` to
+  `requirements.txt` as an explicit pin (`app/imaging.py` and `app/
+  framestats.py` both `import numpy` directly; it was only ever present
+  as an unpinned transitive dependency of `astropy`/`photutils`, which
+  works today but isn't something to rely on for a production image).
+  Built and smoke-tested for real: `docker build` against the actual
+  repo succeeded, and a container run from that image (real `/data` and
+  `/captures` mounts, no port published) answered `/health`, `/projects`,
+  and served the frontend correctly — then torn down, nothing left
+  running. Actually packaging/publishing this on UnRAID is explicitly
+  the next round, not done here.
 - ❌ **Crop is permanently out of scope**, not deferred — see Architecture
   decisions. Don't reopen this.
 - ❌ Archive/cleanup (the Endstate's last bullet) is explicitly deferred
@@ -1171,15 +1293,22 @@ Chris, not started. **Format note (Chris, 2026-09-2x): keep this list
 numbered going forward** — makes it easy to say "do 1 and 2" and have
 that mean something unambiguous.
 
-**Nothing open right now.** The last three items here (job history,
-cross-tab job awareness, per-night master overrides) are resolved: the
-first two are built (see "Current validated status"); the third was
-explicitly dropped by Chris rather than built — "if I need to reuse
-flats, I can just do that during staging and point multiple nights at
-the same set of flats," making a dedicated override UI unnecessary. The
-one future idea on the table (deleting an obviously-bad frame instead of
-just excluding it) is real but deliberately **not** listed as a next
+1. **Package and deploy the production container on UnRAID.** The
+   Dockerfile itself is built and smoke-tested (see "Current validated
+   status") — what's left is Chris's own call to make: an UnRAID Community
+   Applications template (or a plain `docker run`/compose setup),
+   deciding the real `-p`/volume mappings for the production container
+   (distinct from `astro-stacker-dev`, which should probably keep running
+   independently rather than being replaced), and actually exposing it.
+   Not started — deliberately deferred to its own round per Chris ("we'll
+   handle this part of it afterwards").
+
+The one future idea on the table (deleting an obviously-bad frame instead
+of just excluding it) is real but deliberately **not** listed as a next
 step — it needs an architecture decision first (`CAPTURES_DIR` is a
 read-only mount) before it's buildable at all. See the "No more
 file-management scope" bullet in Architecture decisions for the full
-reasoning. When something new comes up, number it starting from 1 again.
+reasoning. Per-night master flat overrides were explicitly dropped by
+Chris rather than built ("if I need to reuse flats, I can just do that
+during staging and point multiple nights at the same set of flats").
+When something new comes up, number it starting from 1 again.

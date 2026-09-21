@@ -239,7 +239,7 @@ function attachFolderBrowser(inputEl, browseBtn, onSelect) {
       }
       panel.appendChild(list);
       const actions = el("div", { style: "margin-top:8px; display:flex; gap:8px;" }, [
-        el("button", { class: "primary small", onclick: () => { inputEl.value = path; closeAnyBrowser(); if (onSelect) onSelect(); } }, ["Use this folder"]),
+        el("button", { class: "primary small", onclick: () => { inputEl.value = path; closeAnyBrowser(); if (onSelect) onSelect(data.detected_type); } }, ["Use this folder"]),
         el("button", { class: "small ghost", onclick: () => closeAnyBrowser() }, ["Cancel"]),
       ]);
       panel.appendChild(actions);
@@ -366,22 +366,42 @@ function addNightRow() {
   const flatsInput = el("input", { type: "text", class: "dirpick", placeholder: "e.g. Night 1/flats", readonly: "readonly" }, []);
   const lightsBrowse = el("button", { type: "button", class: "small" }, ["…"]);
   const flatsBrowse = el("button", { type: "button", class: "small" }, ["…"]);
-  const mismatchWarning = el("div", { class: "session-mismatch-warning", style: "display:none;" }, [
-    "⚠ Lights and flats look like they're from different sessions — double check you picked the right folders.",
-  ]);
-  // Not a hard block - Chris explicitly wants this catchable but still
-  // possible (e.g. deliberately reusing one night's flats for another).
-  // Heuristic: same parent folder = same session, matching how a real
-  // capture folder is normally laid out (Night 1/{lights,flats}); this
-  // is exactly what would catch a misclick like night1 lights + night2
-  // flats without needing anything fancier.
-  function checkMismatch() {
+  const mismatchWarning = el("div", { class: "session-mismatch-warning", style: "display:none;" }, []);
+  let lightsDetectedType = null;
+  let flatsDetectedType = null;
+  // Not a hard block - Chris explicitly wants these catchable but still
+  // possible (e.g. deliberately reusing one night's flats for another, or
+  // unusual filenames that don't include a type keyword). Combines two
+  // independent checks into one message so picking either field
+  // re-evaluates both without stacking multiple warning lines:
+  // 1) same parent folder = same session, matching how a real capture
+  //    folder is normally laid out (Night 1/{lights,flats}) - catches a
+  //    misclick like night1 lights + night2 flats;
+  // 2) the folder's filenames actually look like the type being picked
+  //    for (most capture software puts "Light"/"Flat"/etc. right in the
+  //    name - see _detect_frame_type() in app/main.py).
+  function updateSessionWarnings() {
+    const messages = [];
     const lightsParent = lightsInput.value ? lightsInput.value.split("/").slice(0, -1).join("/") : "";
     const flatsParent = flatsInput.value ? flatsInput.value.split("/").slice(0, -1).join("/") : "";
-    mismatchWarning.style.display = lightsParent && flatsParent && lightsParent !== flatsParent ? "block" : "none";
+    if (lightsParent && flatsParent && lightsParent !== flatsParent) {
+      messages.push("Lights and flats look like they're from different sessions.");
+    }
+    if (lightsDetectedType && lightsDetectedType !== "light") {
+      messages.push(`The lights folder looks like it contains ${lightsDetectedType === "mixed" ? "a mix of frame types" : `${lightsDetectedType} frames`}, not lights.`);
+    }
+    if (flatsDetectedType && flatsDetectedType !== "flat") {
+      messages.push(`The flats folder looks like it contains ${flatsDetectedType === "mixed" ? "a mix of frame types" : `${flatsDetectedType} frames`}, not flats.`);
+    }
+    if (messages.length) {
+      mismatchWarning.textContent = "⚠ " + messages.join(" ") + " Double check you picked the right folders.";
+      mismatchWarning.style.display = "block";
+    } else {
+      mismatchWarning.style.display = "none";
+    }
   }
-  attachFolderBrowser(lightsInput, lightsBrowse, checkMismatch);
-  attachFolderBrowser(flatsInput, flatsBrowse, checkMismatch);
+  attachFolderBrowser(lightsInput, lightsBrowse, (detectedType) => { lightsDetectedType = detectedType; updateSessionWarnings(); });
+  attachFolderBrowser(flatsInput, flatsBrowse, (detectedType) => { flatsDetectedType = detectedType; updateSessionWarnings(); });
   const lightsGroup = el("div", { class: "dirpick-group" }, [
     el("span", { class: "dirpick-label" }, ["Lights"]),
     el("div", { class: "dirpick-row" }, [lightsInput, lightsBrowse]),
@@ -404,8 +424,22 @@ function renumberSessions() {
 }
 
 document.getElementById("add-night-btn").addEventListener("click", () => addNightRow());
-attachFolderBrowser(document.getElementById("biases-dir"), document.getElementById("biases-browse"));
-attachFolderBrowser(document.getElementById("darks-dir"), document.getElementById("darks-browse"));
+function warnIfWrongType(expected, detectedType, warningEl) {
+  if (detectedType && detectedType !== expected) {
+    const what = detectedType === "mixed" ? "a mix of frame types, not consistently" : `${detectedType} frames, not`;
+    warningEl.textContent = `⚠ This folder's filenames look like ${what} ${expected}s — double check you picked the right folder.`;
+    warningEl.style.display = "block";
+  } else {
+    warningEl.style.display = "none";
+  }
+}
+
+attachFolderBrowser(document.getElementById("biases-dir"), document.getElementById("biases-browse"), (detectedType) => {
+  warnIfWrongType("bias", detectedType, document.getElementById("biases-type-warning"));
+});
+attachFolderBrowser(document.getElementById("darks-dir"), document.getElementById("darks-browse"), (detectedType) => {
+  warnIfWrongType("dark", detectedType, document.getElementById("darks-type-warning"));
+});
 
 document.getElementById("stage-btn").addEventListener("click", async () => {
   if (!state.project) return;
@@ -1037,6 +1071,11 @@ document.getElementById("analyze-accept-recommended-btn").addEventListener("clic
 
 document.getElementById("analyze-reset-btn").addEventListener("click", () => {
   if (!confirm("Start over? This clears all excluded frames and this session's analysis results.")) return;
+  // Also drop the per-project review cache (see reviewCache below) - it
+  // only gets refreshed when switching away with a *non-null* analyze
+  // result, so without this a switch-away-and-back after starting over
+  // would silently resurrect the pre-reset data instead of respecting it.
+  if (state.project) delete reviewCache[state.project];
   state.excludeFrames.clear();
   state.lastAnalyzeResult = null;
   state.analyzed = false;
@@ -1288,10 +1327,64 @@ async function loadProjectStatus() {
   renderMastersPreviews();
   showStackPreview();
   renderStepper();
+  // Fire-and-forget, not awaited: a large project means one syscall per
+  // staged file server-side, which could be noticeably slower than the
+  // status load above on a big project or a slow NAS - never block the
+  // rest of this function (or anything the user does next) on it.
+  checkBrokenLinks();
 }
 
-document.getElementById("project-select").addEventListener("change", async (e) => {
-  state.project = e.target.value || null;
+async function checkBrokenLinks() {
+  const project = state.project;
+  const banner = document.getElementById("broken-links-banner");
+  let data;
+  try {
+    data = await api("GET", `/projects/${encodeURIComponent(project)}/broken-links`);
+  } catch (e) {
+    return;
+  }
+  // The user may have switched projects while this was in flight (it's
+  // deliberately not awaited by its caller) - don't show a stale result
+  // for a project that isn't even open anymore.
+  if (state.project !== project) return;
+  if (!data.broken.length) {
+    banner.style.display = "none";
+    return;
+  }
+  banner.style.display = "flex";
+  const names = data.broken.map((p) => p.split("/").pop());
+  const shown = names.slice(0, 5).join(", ") + (names.length > 5 ? `, +${names.length - 5} more` : "");
+  banner.querySelector(".msg").textContent =
+    `${data.broken.length} staged file(s) are missing from captures (moved or deleted outside this app): ${shown}.`;
+}
+
+// Review results are pure client-side state (never saved server-side -
+// see AnalyzeLightsRequest's docstring), so switching projects used to
+// throw the whole review session away every time, even switching right
+// back to a project you'd just analyzed a moment ago. Cache the last
+// analyze result (plus exclusions/sensitivity) per project name and
+// restore it on return instead of forcing a re-analyze.
+const reviewCache = {};
+
+// Shared by the project <select>'s own change handler and by clicking a
+// row in the global active-jobs panel - factored out so the latter can
+// land on the step that job actually belongs to (initialStep) instead of
+// always defaulting to Stage, which is the right default for "I manually
+// picked a project" but was wrong for "I clicked a running stack job and
+// want to see the stack step," a real bug Chris hit (every project
+// switch, from anywhere, hardcoded state.activeStep = "stage").
+async function switchToProject(name, initialStep) {
+  // Save the OUTGOING project's review session before resetting
+  // anything below - keyed by whatever state.project still is at this
+  // point (the project being switched away FROM).
+  if (state.project && state.lastAnalyzeResult) {
+    reviewCache[state.project] = {
+      lastAnalyzeResult: state.lastAnalyzeResult,
+      excludeFrames: new Set(state.excludeFrames),
+      lastAnomalySigma: state.lastAnomalySigma,
+    };
+  }
+  state.project = name || null;
   // Reset immediately, not just inside loadProjectStatus(): there's an
   // async gap before that fetch resolves, and showActiveStep() below
   // (which renders the stepper right away) would otherwise briefly - or,
@@ -1303,9 +1396,11 @@ document.getElementById("project-select").addEventListener("change", async (e) =
   document.getElementById("delete-project-btn").style.display = state.project ? "inline-block" : "none";
   document.getElementById("job-history-btn").style.display = state.project ? "inline-block" : "none";
   document.getElementById("job-history-panel").style.display = "none";
-  document.getElementById("external-job-banner").style.display = "none";
-  if (state.project) startCrossTabPoll();
-  else stopCrossTabPoll();
+  document.getElementById("broken-links-banner").style.display = "none";
+  // pollActiveJobs() runs globally regardless of project selection (see
+  // init()) - just reset this so a stale job id from the PREVIOUS
+  // project can't be mistaken for one belonging to the new selection.
+  lastKnownRunningJobIdForCurrentProject = null;
   // Disabled until loadProjectStatus() below confirms the project
   // actually exists on the server: a name can sit in this dropdown
   // (added by Create) before anything is staged, and DELETE on a
@@ -1320,7 +1415,7 @@ document.getElementById("project-select").addEventListener("change", async (e) =
   state.lastAnalyzeResult = null;
   state.showSurvivorsOnly = false;
   state.expandedGroups = {};
-  state.activeStep = "stage";
+  state.activeStep = initialStep || "stage";
   refreshExcludeDisplay();
   document.getElementById("stage-nights").innerHTML = "";
   addNightRow();
@@ -1360,7 +1455,28 @@ document.getElementById("project-select").addEventListener("change", async (e) =
   document.getElementById("stack-preview").dataset.builtFor = "";
   showActiveStep();
   if (state.project) await loadProjectStatus();
-});
+  // Restore a cached review session for the INCOMING project, if this
+  // browser tab analyzed it before switching away at some point - after
+  // loadProjectStatus(), not before, since frame thumbnails need
+  // state.status.is_osc (for debayering) to already be populated.
+  const cached = state.project ? reviewCache[state.project] : null;
+  if (cached) {
+    state.lastAnalyzeResult = cached.lastAnalyzeResult;
+    state.excludeFrames = new Set(cached.excludeFrames);
+    state.lastAnomalySigma = cached.lastAnomalySigma;
+    state.analyzed = true;
+    document.getElementById("analyze-anomaly-sigma").value = cached.lastAnomalySigma;
+    document.getElementById("anomaly-sigma-value").textContent = cached.lastAnomalySigma.toFixed(1);
+    setStepBadge("review-status-badge", "ok", "analyzed");
+    document.getElementById("analyze-reset-btn").style.display = "inline-block";
+    document.getElementById("review-next-btn").style.display = "inline-block";
+    refreshExcludeDisplay();
+    renderAnalyzeOutput();
+    renderStepper();
+  }
+}
+
+document.getElementById("project-select").addEventListener("change", (e) => switchToProject(e.target.value || null, "stage"));
 
 document.getElementById("create-project-btn").addEventListener("click", async () => {
   const name = document.getElementById("new-project-name").value.trim();
@@ -1399,6 +1515,7 @@ document.getElementById("delete-project-btn").addEventListener("click", async ()
     alert(`Delete failed: ${e}`);
     return;
   }
+  delete reviewCache[name];
   await loadProjects();
   const sel = document.getElementById("project-select");
   sel.value = "";
@@ -1477,35 +1594,65 @@ document.getElementById("job-history-close").addEventListener("click", () => {
   document.getElementById("job-history-panel").style.display = "none";
 });
 
-// ---------- cross-tab/cross-client job awareness ----------
+// ---------- global active-jobs panel + cross-tab job awareness ----------
 
-let crossTabPollTimer = null;
-let lastKnownRunningJobId = null;
+// Runs for the lifetime of the page, independent of which (if any)
+// project is selected — Chris: "if I'm running a stack in two separate
+// projects, I shouldn't have to go clicking through projects to see
+// what's happening." Started once at boot (see init()), never stopped.
+let lastKnownRunningJobIdForCurrentProject = null;
 
-function stopCrossTabPoll() {
-  if (crossTabPollTimer) {
-    clearInterval(crossTabPollTimer);
-    crossTabPollTimer = null;
+function stepForJobKind(kind) {
+  if (kind === "masters") return "masters";
+  if (kind === "stack") return "stack";
+  if (kind === "analyze") return "review";
+  return "stage";
+}
+
+function renderActiveJobsPanel(runningJobs) {
+  const panel = document.getElementById("active-jobs-panel");
+  const list = document.getElementById("active-jobs-list");
+  if (!runningJobs.length) {
+    panel.style.display = "none";
+    return;
   }
-  lastKnownRunningJobId = null;
+  panel.style.display = "block";
+  list.innerHTML = "";
+  for (const job of runningJobs) {
+    const row = el("div", {
+      class: `active-job-row${job.project === state.project ? " current-project" : ""}`,
+      onclick: () => {
+        const targetStep = stepForJobKind(job.kind);
+        if (job.project === state.project) {
+          // Already there - just jump to the relevant step rather than
+          // running the whole switch-project reset for no reason.
+          state.activeStep = targetStep;
+          showActiveStep();
+        } else {
+          document.getElementById("project-select").value = job.project;
+          switchToProject(job.project, targetStep);
+        }
+      },
+    }, [
+      el("span", { class: "project-name" }, [job.project]),
+      el("span", { class: "kind" }, [job.kind || "job"]),
+      el("span", { class: "pct" }, [`${(job.percent_complete || 0).toFixed(0)}%`]),
+      el("span", { class: "hint" }, [job.current_line || ""]),
+    ]);
+    list.appendChild(row);
+  }
 }
 
-function startCrossTabPoll() {
-  stopCrossTabPoll();
-  checkForExternalJob();
-  crossTabPollTimer = setInterval(checkForExternalJob, 5000);
-}
-
-async function checkForExternalJob() {
-  if (!state.project) return;
+async function pollActiveJobs() {
   let jobsList;
   try {
-    jobsList = (await api("GET", `/projects/${encodeURIComponent(state.project)}/jobs`)).jobs;
+    jobsList = (await api("GET", "/jobs")).jobs;
   } catch (e) {
-    return; // e.g. a project that's only in the dropdown, not staged yet
+    return;
   }
-  const running = jobsList.find((j) => j.status === "running");
-  const banner = document.getElementById("external-job-banner");
+  const running = jobsList.filter((j) => j.status === "running");
+  renderActiveJobsPanel(running);
+
   // Masters/stack genuinely race on shared scratch directories if two run
   // at once against the same project (Frontend/web gotcha #4) - disable
   // both regardless of which kind is running, matching the server's own
@@ -1514,22 +1661,22 @@ async function checkForExternalJob() {
   // stays enabled. This is best-effort (up to ~5s to notice a job
   // started elsewhere) - the server's 409 is the actual guarantee, this
   // is just to avoid hitting it in the first place.
-  if (running) {
-    lastKnownRunningJobId = running.id;
-    banner.style.display = "flex";
-    banner.querySelector(".msg").textContent =
-      `A ${running.kind} job is running for this project (${(running.percent_complete || 0).toFixed(0)}%)`
-      + (running.current_line ? ` — ${running.current_line}` : "") + ".";
-    document.getElementById("masters-run-btn").disabled = true;
-    document.getElementById("stack-run-btn").disabled = true;
+  if (!state.project) return;
+  const runningHere = running.find((j) => j.project === state.project);
+  const mastersBtn = document.getElementById("masters-run-btn");
+  const stackBtn = document.getElementById("stack-run-btn");
+  if (!mastersBtn || !stackBtn) return; // project-panels not in the DOM yet on first load
+  if (runningHere) {
+    lastKnownRunningJobIdForCurrentProject = runningHere.id;
+    mastersBtn.disabled = true;
+    stackBtn.disabled = true;
   } else {
-    banner.style.display = "none";
-    document.getElementById("masters-run-btn").disabled = false;
-    document.getElementById("stack-run-btn").disabled = false;
-    if (lastKnownRunningJobId) {
-      // Something that was running (possibly from another tab) just
-      // finished - pick up whatever it changed.
-      lastKnownRunningJobId = null;
+    mastersBtn.disabled = false;
+    stackBtn.disabled = false;
+    if (lastKnownRunningJobIdForCurrentProject) {
+      // Something that was running for THIS project (possibly from
+      // another tab) just finished - pick up whatever it changed.
+      lastKnownRunningJobIdForCurrentProject = null;
       await loadProjectStatus();
     }
   }
@@ -1570,4 +1717,9 @@ document.addEventListener("click", (e) => {
       sel.dispatchEvent(new Event("change"));
     }
   }
+
+  // Runs for the page's whole lifetime, regardless of project selection -
+  // see pollActiveJobs()'s own docstring.
+  pollActiveJobs();
+  setInterval(pollActiveJobs, 5000);
 })();

@@ -191,15 +191,6 @@ button.small {
   display: block;
 }
 
-.section-title {
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--text-muted);
-  font-size: 12px;
-  font-weight: 600;
-  margin: 0 0 12px;
-}
-
 .card {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -239,20 +230,6 @@ button.small {
 .badge.warn { background: rgba(245, 158, 11, 0.15); color: var(--warn); }
 .badge.danger { background: rgba(239, 68, 68, 0.15); color: var(--danger); }
 .badge.accent { background: rgba(99, 102, 241, 0.18); color: #a5b4fc; }
-
-.complete-banner {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  background: rgba(34, 197, 94, 0.1);
-  border: 1px solid rgba(34, 197, 94, 0.3);
-  color: var(--success);
-  border-radius: 8px;
-  padding: 10px 14px;
-  margin-top: 10px;
-  font-weight: 600;
-  font-size: 13px;
-}
 
 .error-banner {
   display: flex;
@@ -436,10 +413,6 @@ button.small {
 
 .status-line.ok { color: var(--success); }
 .status-line.err { color: var(--danger); }
-
-.log-toggle-btn {
-  font-size: 12px;
-}
 
 .script-toggle-btn .arrow {
   display: inline-block;
@@ -649,6 +622,65 @@ button.danger-outline:hover {
 
 .external-job-banner::before {
   content: "⏳";
+}
+
+.broken-links-banner {
+  background: rgba(245, 158, 11, 0.12);
+  border-color: var(--warn);
+}
+
+.broken-links-banner::before {
+  content: "🔗";
+}
+
+.active-jobs-panel {
+  background: rgba(99, 102, 241, 0.08);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin: 0 0 16px;
+  font-size: 13px;
+}
+
+.active-jobs-header {
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+
+.active-job-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.active-job-row:hover {
+  background: rgba(99, 102, 241, 0.15);
+}
+
+.active-job-row .project-name {
+  font-weight: 600;
+  min-width: 120px;
+}
+
+.active-job-row .kind {
+  text-transform: capitalize;
+  color: var(--text-muted);
+  min-width: 60px;
+}
+
+.active-job-row .pct {
+  color: var(--accent-2);
+  font-family: ui-monospace, monospace;
+}
+
+.active-job-row.current-project {
+  background: rgba(99, 102, 241, 0.15);
+  border: 1px solid var(--accent);
 }
 
 .job-history-row {
@@ -1047,14 +1079,7 @@ button.danger-outline:hover {
   color: #fff;
 }
 
-.two-col {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
-}
-
 @media (max-width: 700px) {
-  .two-col { grid-template-columns: 1fr; }
   .stepper { flex-wrap: wrap; }
 }
 
