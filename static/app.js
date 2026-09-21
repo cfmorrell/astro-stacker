@@ -208,7 +208,7 @@ function renderBreadcrumb(rootLabel, path, onNavigate) {
   return wrap;
 }
 
-function attachFolderBrowser(inputEl, browseBtn) {
+function attachFolderBrowser(inputEl, browseBtn, onSelect) {
   async function open() {
     closeAnyBrowser();
     let path = inputEl.value || "";
@@ -239,7 +239,7 @@ function attachFolderBrowser(inputEl, browseBtn) {
       }
       panel.appendChild(list);
       const actions = el("div", { style: "margin-top:8px; display:flex; gap:8px;" }, [
-        el("button", { class: "primary small", onclick: () => { inputEl.value = path; closeAnyBrowser(); } }, ["Use this folder"]),
+        el("button", { class: "primary small", onclick: () => { inputEl.value = path; closeAnyBrowser(); if (onSelect) onSelect(); } }, ["Use this folder"]),
         el("button", { class: "small ghost", onclick: () => closeAnyBrowser() }, ["Cancel"]),
       ]);
       panel.appendChild(actions);
@@ -366,8 +366,22 @@ function addNightRow() {
   const flatsInput = el("input", { type: "text", class: "dirpick", placeholder: "e.g. Night 1/flats", readonly: "readonly" }, []);
   const lightsBrowse = el("button", { type: "button", class: "small" }, ["…"]);
   const flatsBrowse = el("button", { type: "button", class: "small" }, ["…"]);
-  attachFolderBrowser(lightsInput, lightsBrowse);
-  attachFolderBrowser(flatsInput, flatsBrowse);
+  const mismatchWarning = el("div", { class: "session-mismatch-warning", style: "display:none;" }, [
+    "⚠ Lights and flats look like they're from different sessions — double check you picked the right folders.",
+  ]);
+  // Not a hard block - Chris explicitly wants this catchable but still
+  // possible (e.g. deliberately reusing one night's flats for another).
+  // Heuristic: same parent folder = same session, matching how a real
+  // capture folder is normally laid out (Night 1/{lights,flats}); this
+  // is exactly what would catch a misclick like night1 lights + night2
+  // flats without needing anything fancier.
+  function checkMismatch() {
+    const lightsParent = lightsInput.value ? lightsInput.value.split("/").slice(0, -1).join("/") : "";
+    const flatsParent = flatsInput.value ? flatsInput.value.split("/").slice(0, -1).join("/") : "";
+    mismatchWarning.style.display = lightsParent && flatsParent && lightsParent !== flatsParent ? "block" : "none";
+  }
+  attachFolderBrowser(lightsInput, lightsBrowse, checkMismatch);
+  attachFolderBrowser(flatsInput, flatsBrowse, checkMismatch);
   const lightsGroup = el("div", { class: "dirpick-group" }, [
     el("span", { class: "dirpick-label" }, ["Lights"]),
     el("div", { class: "dirpick-row" }, [lightsInput, lightsBrowse]),
@@ -377,7 +391,7 @@ function addNightRow() {
     el("div", { class: "dirpick-row" }, [flatsInput, flatsBrowse]),
   ]);
   const removeBtn = el("button", { type: "button", class: "small ghost", onclick: () => { row.remove(); renumberSessions(); } }, ["✕"]);
-  row.append(label, lightsGroup, flatsGroup, removeBtn);
+  row.append(label, lightsGroup, flatsGroup, removeBtn, mismatchWarning);
   container.appendChild(row);
 }
 
@@ -1287,6 +1301,11 @@ document.getElementById("project-select").addEventListener("change", async (e) =
   document.getElementById("project-panels").style.display = state.project ? "block" : "none";
   document.getElementById("no-project-hint").style.display = state.project ? "none" : "block";
   document.getElementById("delete-project-btn").style.display = state.project ? "inline-block" : "none";
+  document.getElementById("job-history-btn").style.display = state.project ? "inline-block" : "none";
+  document.getElementById("job-history-panel").style.display = "none";
+  document.getElementById("external-job-banner").style.display = "none";
+  if (state.project) startCrossTabPoll();
+  else stopCrossTabPoll();
   // Disabled until loadProjectStatus() below confirms the project
   // actually exists on the server: a name can sit in this dropdown
   // (added by Create) before anything is staged, and DELETE on a
@@ -1385,6 +1404,136 @@ document.getElementById("delete-project-btn").addEventListener("click", async ()
   sel.value = "";
   sel.dispatchEvent(new Event("change"));
 });
+
+// ---------- job history ----------
+
+function formatJobWhen(job) {
+  if (!job.started_at) return "—";
+  const started = new Date(job.started_at * 1000);
+  let text = started.toLocaleString(undefined, { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  if (job.ended_at) {
+    const secs = Math.round(job.ended_at - job.started_at);
+    text += ` (${secs}s)`;
+  } else if (job.status === "running") {
+    text += ` — ${(job.percent_complete || 0).toFixed(0)}%`;
+  }
+  return text;
+}
+
+async function renderJobHistory() {
+  const list = document.getElementById("job-history-list");
+  list.innerHTML = "loading…";
+  let jobsList;
+  try {
+    jobsList = (await api("GET", `/projects/${encodeURIComponent(state.project)}/jobs`)).jobs;
+  } catch (e) {
+    list.textContent = String(e);
+    return;
+  }
+  list.innerHTML = "";
+  if (!jobsList.length) {
+    list.appendChild(el("span", { class: "empty-hint" }, ["No jobs run yet this server session."]));
+    return;
+  }
+  for (const job of jobsList) {
+    const statusClass = job.status === "succeeded" ? "ok" : job.status === "failed" ? "danger" : job.status === "running" ? "accent" : "";
+    const row = el("div", { class: "job-history-row" }, [
+      el("span", { class: "kind" }, [job.kind || "job"]),
+      el("span", { class: `badge ${statusClass}` }, [job.status]),
+      el("span", { class: "when" }, [formatJobWhen(job)]),
+      el("span", { class: "hint" }, ["click for log"]),
+    ]);
+    const logView = el("pre", { class: "log-view", style: "display:none; white-space:pre-wrap;" }, []);
+    let loaded = false;
+    row.addEventListener("click", async () => {
+      const open = logView.classList.contains("open");
+      if (open) {
+        logView.classList.remove("open");
+        logView.style.display = "none";
+        return;
+      }
+      if (!loaded) {
+        logView.textContent = "loading…";
+        try {
+          logView.textContent = await api("GET", `/jobs/${job.id}/log`);
+          loaded = true;
+        } catch (e) {
+          logView.textContent = String(e);
+        }
+      }
+      logView.classList.add("open");
+      logView.style.display = "block";
+    });
+    list.appendChild(row);
+    list.appendChild(logView);
+  }
+}
+
+document.getElementById("job-history-btn").addEventListener("click", () => {
+  document.getElementById("job-history-panel").style.display = "block";
+  renderJobHistory();
+});
+document.getElementById("job-history-close").addEventListener("click", () => {
+  document.getElementById("job-history-panel").style.display = "none";
+});
+
+// ---------- cross-tab/cross-client job awareness ----------
+
+let crossTabPollTimer = null;
+let lastKnownRunningJobId = null;
+
+function stopCrossTabPoll() {
+  if (crossTabPollTimer) {
+    clearInterval(crossTabPollTimer);
+    crossTabPollTimer = null;
+  }
+  lastKnownRunningJobId = null;
+}
+
+function startCrossTabPoll() {
+  stopCrossTabPoll();
+  checkForExternalJob();
+  crossTabPollTimer = setInterval(checkForExternalJob, 5000);
+}
+
+async function checkForExternalJob() {
+  if (!state.project) return;
+  let jobsList;
+  try {
+    jobsList = (await api("GET", `/projects/${encodeURIComponent(state.project)}/jobs`)).jobs;
+  } catch (e) {
+    return; // e.g. a project that's only in the dropdown, not staged yet
+  }
+  const running = jobsList.find((j) => j.status === "running");
+  const banner = document.getElementById("external-job-banner");
+  // Masters/stack genuinely race on shared scratch directories if two run
+  // at once against the same project (Frontend/web gotcha #4) - disable
+  // both regardless of which kind is running, matching the server's own
+  // has_running_job() check (any job blocks a new masters/stack run, not
+  // just a same-kind one). Analyze has no such conflict, so its button
+  // stays enabled. This is best-effort (up to ~5s to notice a job
+  // started elsewhere) - the server's 409 is the actual guarantee, this
+  // is just to avoid hitting it in the first place.
+  if (running) {
+    lastKnownRunningJobId = running.id;
+    banner.style.display = "flex";
+    banner.querySelector(".msg").textContent =
+      `A ${running.kind} job is running for this project (${(running.percent_complete || 0).toFixed(0)}%)`
+      + (running.current_line ? ` — ${running.current_line}` : "") + ".";
+    document.getElementById("masters-run-btn").disabled = true;
+    document.getElementById("stack-run-btn").disabled = true;
+  } else {
+    banner.style.display = "none";
+    document.getElementById("masters-run-btn").disabled = false;
+    document.getElementById("stack-run-btn").disabled = false;
+    if (lastKnownRunningJobId) {
+      // Something that was running (possibly from another tab) just
+      // finished - pick up whatever it changed.
+      lastKnownRunningJobId = null;
+      await loadProjectStatus();
+    }
+  }
+}
 
 // ---------- advanced toggles (event delegation) ----------
 

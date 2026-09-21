@@ -141,6 +141,24 @@ post-processing elsewhere.
   register/stack step needs `merge` first (see gotcha #7 — Siril's
   `merge` refuses fewer than two inputs, so exactly one night can't use
   the same code path as two+); the on-disk layout itself never varies.
+- **No more file-management scope than what already exists** (settled
+  2026-09-2x). Chris is building a *separate* tool that pulls data off
+  his telescope controllers, sorts it, and archives it under its own
+  naming convention — this app comes in *after* that, purely to
+  calibrate/stack. Don't add features that overlap with that job (import
+  automation, sorting/renaming captures, archival) — remove-a-night and
+  whole-project-delete (see below) are the ceiling for file management
+  here, not a first step toward more. One specific idea explicitly
+  flagged as **future work, not started, needs real design thought**:
+  actually *deleting* an obviously-bad frame from Review rather than
+  just excluding it. Not built because `CAPTURES_DIR` is a read-only NAS
+  mount (gotcha #2) — a raw light lives there, not in the project's own
+  `raw/` (which only holds symlinks into it), so "delete" can't just be
+  `rm` on the symlink; it would need to either delete through to the
+  read-only mount (requires it to stop being read-only, a bigger
+  decision) or repoint the symlink at some kind of quarantine location
+  that isn't `CAPTURES_DIR` itself. Don't build this without deciding
+  that architecture question first.
 
 ## Reference material already pulled (don't re-derive from scratch)
 - `bscholer/astrolab`'s `templates/calibrate_register_stack.yaml` — the
@@ -365,6 +383,24 @@ post-processing elsewhere.
     port (`8000` = `1F40`) to get its socket inode, then scan every
     process's `/proc/{pid}/fd/*` for a symlink to `socket:[<inode>]` — that
     PID is unambiguous regardless of what its cmdline looks like.
+12. **Siril 1.4 always tries to prepare its own internal Python virtual
+    environment during `calibrate`, and always fails, harmlessly, in this
+    container.** Chris spotted `log: Preparing python virtual
+    environment: /root/.local/share/siril/venv` and `Warning: unable to
+    install or update the Siril python module` scrolling by during a
+    masters build and flagged it as suspicious. This is Siril 1.4's own
+    bundled Python scripting feature (`sirilpy`/`pyscript`) trying to
+    set itself up automatically on every `calibrate` call — completely
+    unrelated to this app's own Python/FastAPI backend, and never
+    actually invoked by anything in our `.ssf` scripts (no `pyscript`
+    command is ever used). It fails because the AppImage doesn't ship a
+    `pyproject.toml` in this headless Docker environment
+    (`Failed to install Python module: Failed to open file
+    "pyproject.toml": No such file or directory`), logs a warning, and
+    then immediately continues into the actual calibration work
+    normally — confirmed by reading the surrounding log lines, which show
+    "Preprocessing: processing..." and real per-frame corrections right
+    after the warning. Pure noise; don't waste time chasing it again.
 
 ## Frontend/web gotchas (do not rediscover these either)
 Found building `app/static/` (2026-09-2x) — Python/browser issues, not
@@ -417,8 +453,14 @@ Siril ones, but the same "don't rediscover this" spirit applies.
    (`lockButtons` option), so a normal double-click or a second click
    after navigating away and back can't trigger this through the UI.
    Two different browser tabs, or a Swagger UI call made while the
-   frontend also has a job running, still can — a real gap, just a
-   narrower one than "any double-click breaks it."
+   frontend also has a job running, still could — **closed 2026-09-2x**
+   by `_reject_if_job_running()` in `app/main.py`: `/masters/run` and
+   `/stack/run` now 409 if `jobs.has_running_job()` finds any job already
+   running for that project, from any client. The frontend also polls
+   `GET /projects/{name}/jobs` every 5s while a project is open and
+   disables both buttons the moment it sees anything running elsewhere —
+   best-effort/UX only (up to ~5s to notice), the 409 is the actual
+   guarantee. See "Current validated status."
 5. **HEAD requests 404 across this entire FastAPI app, not just one
    route.** Discovered testing the new download button with
    `fetch(url, {method: "HEAD"})` — got a 404 with Starlette's generic
@@ -432,8 +474,80 @@ Siril ones, but the same "don't rediscover this" spirit applies.
    `-I`/`-X HEAD`) always issues GET, so this doesn't affect actual
    users — just don't waste time debugging a "download is broken" report
    that turns out to be a HEAD-based health check or test script.
+6. **A real, structural color bug lived in `_BAYER_OFFSETS`
+   (`app/imaging.py`) since debayering was first added: B and the second
+   green sample (G2) were transposed in every one of the four pattern
+   entries.** For RGGB specifically, the code listed `(1,0)` as B and
+   `(1,1)` as G2 — backwards; the actual RGGB tile (reading the name
+   literally, row-major) is R(0,0) G(0,1) G(1,0) B(1,1). Every debayered
+   preview (both the original block-mean version and the later bilinear
+   one) was therefore averaging real G with real B into its "G" output
+   and emitting pure G as its "B" output — a wrong-channel bug, not a
+   stretch or rendering issue. Caught while chasing an unrelated
+   checkerboard artifact Chris spotted on master flat thumbnails: the
+   demosaiced G channel showed values alternating ~0.29 vs ~0.87, while
+   the raw mosaic's actual two green sub-samples measured almost
+   identical means (0.586 vs 0.587) — a 3x internal discrepancy only
+   possible if one of the code's "G" positions was actually reading B.
+   Fixing the four tuples resolved *two* separately-reported symptoms at
+   once: the checkerboard on flats, and a persistent turquoise/cyan color
+   cast on review light thumbnails Chris had separately flagged as
+   "we may have lost our unlinked stretch" — the stretch parameter was
+   fine the whole time; the underlying color channels were wrong.
+   Verified via raw pixel inspection before/after and a full visual
+   re-check of both a flat and a light preview. See "Current validated
+   status" for the fix and `_block_average()`, a smaller, genuinely
+   secondary issue (naive strided downsampling has no anti-aliasing)
+   found and fixed in the same pass.
 
 ## Current validated status
+- ✅ **Job history + cross-tab/cross-client job awareness implemented and
+  verified against a real ~10+ minute stack run (2026-09-2x)** —
+  Immediate next steps items 1 and 2: `app/jobs.py`'s `Job` dataclass
+  gained `project`/`kind` fields (threaded through all three
+  `create_*_job()` functions and every call site in `app/main.py`);
+  `has_running_job(project)` checks for any job (any kind, any client)
+  currently `"running"` for a project; `list_jobs(project)` returns all
+  known jobs newest-first. New endpoint `GET /projects/{name}/jobs`
+  backs both features. **Job history**: a "🕐 Job history" button opens a
+  panel listing every job run for the current project since the server
+  last started (not persisted to disk — same in-memory lifetime as
+  `_jobs` always had), each row expandable to its full log
+  (`renderJobHistory()` in `app.js`). **Cross-tab awareness**: `/masters/
+  run` and `/stack/run` now return 409 if `has_running_job()` finds
+  anything already running for that project (`_reject_if_job_running()`)
+  — a real server-side close of Frontend/web gotcha #4's race, not just
+  the existing same-tab button-disabling. The frontend polls `GET
+  /projects/{name}/jobs` every 5s while a project is open
+  (`startCrossTabPoll()`); if it finds a running job (started from this
+  tab, another tab, or a raw API call), it shows a banner with live
+  progress and disables both Masters/Stack run buttons project-wide, and
+  auto-refreshes project status the moment nothing is running anymore.
+  Verified for real: opened the frontend fresh while a stack job I'd
+  started via curl was already ~mid-run — banner and disabled buttons
+  appeared on first load (not just after starting a job from that tab),
+  and a second `/stack/run` call while it was running got a real 409.
+- ✅ **Confirmation warning for mismatched lights/flats folders**
+  (2026-09-2x, new task, not from the prior gap list — Chris: "if the
+  user misclicks and selects night 1 lights and night 2 flats, we should
+  warn them... they should still be able to do it"). Each session row in
+  Stage now shows an inline amber warning the moment its lights and flats
+  folders have different PARENT directories (`checkMismatch()` in
+  `app.js`, wired via a new optional `onSelect` callback on
+  `attachFolderBrowser()`) — not a hard block, matching the "still
+  possible, just flagged" requirement (e.g. deliberately reusing one
+  night's flats for another remains fully supported, just without the
+  warning if you happen to pick folders with the same parent name for
+  an unrelated reason — a heuristic, not a strict identity check).
+  Verified: picking `Night 1/lights` + `Night 2/flats` shows the warning;
+  correcting to `Night 1/lights` + `Night 1/flats` clears it.
+- ✅ **Fixed the real Bayer B/G2 channel-position bug and a secondary
+  aliasing issue** — see Frontend/web gotcha #6 for the full story
+  (`_BAYER_OFFSETS` had B and G2 transposed in every pattern since
+  debayering was first added; `_block_average()` replaced naive strided
+  downsampling, which has no anti-aliasing). Resolved two separately-
+  reported symptoms at once: a checkerboard pattern on master flat
+  thumbnails and a turquoise/cyan color cast on review light thumbnails.
 - ✅ **Four "Immediate next steps" items completed in one round, plus a
   real bug found and fixed along the way (2026-09-2x)**: 1) **UI hint for
   cross-night frame exclusion** — a one-line note added to the Stack
@@ -1055,24 +1169,17 @@ for the full history. Crop is permanently out of scope (Architecture
 decisions), not deferred. Archive/cleanup is explicitly deferred per
 Chris, not started. **Format note (Chris, 2026-09-2x): keep this list
 numbered going forward** — makes it easy to say "do 1 and 2" and have
-that mean something unambiguous. Open work items:
+that mean something unambiguous.
 
-1. **Job history.** Only the most recently started job's progress is
-   shown per section; nothing persists across a page reload or lets you
-   browse past jobs.
-2. **Cross-tab/cross-client job awareness.** No polling or auto-refresh
-   of project status while a job started from *another* browser tab or
-   the Swagger UI is running. Combined with Frontend/web gotcha #4, two
-   clients running jobs against the same project at once can still 500.
-3. **Per-night master flat/dark overrides.** `master_dark`/`master_flat`
-   on `StackLightsRequest` are single values applied uniformly to every
-   selected night. Correct for `master_dark` (genuinely shared — see the
-   master reuse policy in Architecture decisions), but `master_flat`
-   really wants a per-night override (e.g. "night3 is missing its own
-   flats, reuse night2's," or a library entry) instead of one value
-   forced onto every night in the request. The Stack section's file
-   picker (see "Current validated status") makes *setting* the existing
-   global override easier but doesn't add per-night granularity. Needs
-   design thought before building — how should the UI represent "this
-   override applies to this specific night" without over-complicating
-   the common case where no override is needed at all?
+**Nothing open right now.** The last three items here (job history,
+cross-tab job awareness, per-night master overrides) are resolved: the
+first two are built (see "Current validated status"); the third was
+explicitly dropped by Chris rather than built — "if I need to reuse
+flats, I can just do that during staging and point multiple nights at
+the same set of flats," making a dedicated override UI unnecessary. The
+one future idea on the table (deleting an obviously-bad frame instead of
+just excluding it) is real but deliberately **not** listed as a next
+step — it needs an architecture decision first (`CAPTURES_DIR` is a
+read-only mount) before it's buildable at all. See the "No more
+file-management scope" bullet in Architecture decisions for the full
+reasoning. When something new comes up, number it starting from 1 again.

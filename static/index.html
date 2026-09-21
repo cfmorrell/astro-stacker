@@ -32,6 +32,10 @@
     </div>
     <div class="field" style="margin-bottom:0;">
       <label>&nbsp;</label>
+      <button id="job-history-btn" class="ghost" style="display:none;">🕐 Job history</button>
+    </div>
+    <div class="field" style="margin-bottom:0;">
+      <label>&nbsp;</label>
       <button id="delete-project-btn" class="danger-outline" style="display:none;" disabled>🗑 Delete project</button>
     </div>
   </div>
@@ -39,6 +43,19 @@
   <div id="no-project-hint" class="empty-hint">Select or create a project to begin.</div>
 
   <div id="project-panels" style="display:none;">
+
+    <div id="external-job-banner" class="external-job-banner" style="display:none;">
+      <span class="msg"></span>
+    </div>
+
+    <div id="job-history-panel" class="card" style="display:none;">
+      <div class="card-header">
+        <div class="card-title">Job history</div>
+        <button type="button" class="small ghost" id="job-history-close">✕ Close</button>
+      </div>
+      <p class="hint">Only jobs run since the server last restarted — this isn't persisted to disk.</p>
+      <div id="job-history-list"></div>
+    </div>
 
     <div class="stepper" id="stepper"></div>
 

@@ -352,6 +352,12 @@ button.small {
   gap: 6px;
 }
 
+.session-mismatch-warning {
+  flex-basis: 100%;
+  font-size: 11px;
+  color: var(--warn);
+}
+
 .checklist {
   display: flex;
   flex-wrap: wrap;
@@ -626,6 +632,51 @@ button.danger-outline:hover {
 .frame-ellipsis:hover {
   border-color: var(--accent);
   color: var(--text);
+}
+
+.external-job-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(99, 102, 241, 0.12);
+  border: 1px solid var(--accent);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 16px;
+  font-size: 13px;
+}
+
+.external-job-banner::before {
+  content: "⏳";
+}
+
+.job-history-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.job-history-row:hover {
+  border-color: var(--accent);
+}
+
+.job-history-row .kind {
+  font-weight: 600;
+  min-width: 70px;
+  text-transform: capitalize;
+}
+
+.job-history-row .when {
+  color: var(--text-dim);
+  flex: 1;
 }
 
 .master-preview-strip {
