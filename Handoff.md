@@ -434,6 +434,83 @@ Siril ones, but the same "don't rediscover this" spirit applies.
    that turns out to be a HEAD-based health check or test script.
 
 ## Current validated status
+- ✅ **Two items off the "Immediate next steps" gap list, re-validated
+  end-to-end (2026-09-2x)** — Chris picked these two out of item 1's
+  bundle of six distinct gaps via an explicit choice, deferring the rest
+  (cross-tab polling, job history, large-night testing, a better debayer
+  algorithm) rather than have them all guessed at in one unscoped pass:
+  1) **remove a single staged night**: new `DELETE
+  /projects/{name}/nights/{night}` (`app/main.py`) removes that night's
+  `raw/nights/<night>` symlinks and any `process/nights/<night>`
+  artifacts (master flat, per-night stack scratch) without touching the
+  rest of the project — shared master bias/dark and any already-completed
+  merged stack are left alone (a merged result that included the removed
+  night becomes stale, same as the existing "exclude frames after
+  stacking" situation; nothing tries to detect or clean that up). The
+  Stage panel now shows a "Currently staged sessions" list above the
+  add-session rows, each with a confirm-gated "✕ Remove" button
+  (`renderExistingStagedNights()`). Re-staging afterward no longer risks
+  colliding with a night that's still there: `nextNightNumber()` names a
+  newly-added session starting after the highest *existing* night number
+  rather than always starting from 1 based on the current form's row
+  count — verified by removing night2 from a real 2-night project and
+  confirming the next session would become night3, not a second night2;
+  2) **breadcrumb trail for both folder/file pickers**
+  (`/captures/browse`'s and `/projects/{name}/browse`'s UI): replaced the
+  bare "← up" button with a clickable path (`renderBreadcrumb()` in
+  `app.js`, shared by `attachFolderBrowser`/`attachFileBrowser`) — the
+  root segment and every intermediate segment jump straight there, only
+  the current (last) segment is non-interactive. Verified navigating
+  captures/Night 1/lights three levels deep and jumping back to the
+  middle segment in one click.
+- ✅ **Three more small frontend fixes, re-validated end-to-end
+  (2026-09-2x)**: 1) **the "add a session" row's number was wrong when
+  opening a project that already had sessions staged** — Chris hit this
+  directly: a project with one staged night showed "Session 1" for the
+  next one instead of "Session 2". Two compounding bugs:
+  `addNightRow()`'s label only ever counted draft rows already in the
+  form (`container.children.length + 1`), never what the project already
+  had staged; and on a project switch, `addNightRow()` runs *before*
+  `loadProjectStatus()`'s fetch resolves, so even a fix based on
+  `state.status` would've read it while still `null` (just reset). Fixed
+  by having `addNightRow()`/`renumberSessions()` both use
+  `nextNightNumber()` (added for the remove-a-night work above — continue
+  after the highest existing night number) instead of a local row count,
+  and calling `renumberSessions()` again once `loadProjectStatus()`
+  actually knows the real count, on both its success and 404 paths.
+  Verified across a 0/1/2-staged-night project each showing the correct
+  next number, plus adding/removing draft rows still renumbering
+  correctly relative to that base; 2) **the lights vs. flats fields in
+  each session row weren't distinguishable once a folder was picked** —
+  the only cue was placeholder text ("lights dir (e.g. ...)"), which
+  disappears the moment a `readonly` field gets a real value, leaving
+  nothing on screen to say which side was which. Fixed by adding a
+  persistent "LIGHTS"/"FLATS" label above each field (`.dirpick-group`/
+  `.dirpick-label` in `styles.css`) instead of relying on placeholder
+  text alone; 3) **master bias/dark/flat preview thumbnails
+  (`renderMastersPreviews()`) switched from a "none" to an "unlinked"
+  stretch** — Chris asked directly ("I think an unlinked stretch across
+  all of them would be helpful to see what the calibration frames look
+  like"). Real difference confirmed visually: the master dark now clearly
+  shows a per-channel color cast (a pink tint) invisible under the flat
+  linear stretch, and the flats show visible dust donuts on top of the
+  vignetting gradient that "none" alone hadn't revealed.
+- ✅ **Master bias/dark/per-night-flat preview thumbnails** (Immediate
+  next steps item 2 — the "no image thumbnails for the stack preview's
+  intermediate steps" gap), click-to-zoom into the same lightbox as
+  everything else: `renderMastersPreviews()` in `app.js` shows a small
+  thumbnail strip in the Masters panel for whichever of master_bias/
+  master_dark/each night's master_flat are actually built, debayered the
+  same way raw lights are when the project `is_osc` (stretch mode has
+  since changed — see the bullet directly above; this entry is kept for
+  the rest of what it introduced). No backend changes needed; `GET
+  /projects/{name}/preview` already handled any path in the project.
+  Extracted `openPlainLightbox()` (reset nav arrows/exclude row, since
+  master previews have neither) out of what was inline-only logic on the
+  stack preview's click handler, so both share it. Verified against
+  `multi1`'s real built masters — flat thumbnails visibly show the
+  vignetting gradient, bias/dark show as near-black noise frames, exactly
+  the "spot a bad flat before it ruins a night" use case this was for.
 - ✅ **Four more small frontend fixes, re-validated end-to-end
   (2026-09-2x)**: 1) "Delete project" is now disabled (with an
   explanatory tooltip) until `loadProjectStatus()` confirms the project
@@ -920,50 +997,42 @@ lights phases, FastAPI render/run + background jobs, progress parsing,
 real multi-night validation, a staging endpoint, frame review/filtering
 (recommend-only, on astropy+photutils, with anomaly-based flagging
 validated against real known-bad frames), both Siril gotcha #6/#8 fixes
-in `/masters/run` and `/stack/run`, a first-version frontend, and five
-further rounds of live-usage feedback/fixes on top of that (19 items,
-then 18, then 8, then a stale-project-status bug plus whole-project
-delete, then four more small fixes — see "Current validated status" for
-the full list of what each round covered). Crop is permanently out of
-scope (Architecture decisions), not deferred. Archive/cleanup is
-explicitly deferred per Chris, not started. What's actually left:
+in `/masters/run` and `/stack/run`, a first-version frontend, six further
+rounds of live-usage feedback/fixes on top of that (19 items, then 18,
+then 8, then a stale-project-status bug plus whole-project delete, then
+four more small fixes, then removing a single night + breadcrumbs), and
+master-preview thumbnails (see "Current validated status" for the full
+list of what each round covered). Crop is permanently out of scope
+(Architecture decisions), not deferred. Archive/cleanup is explicitly
+deferred per Chris, not started. What's actually left:
 
-1. **The frontend covers the full flow end-to-end now, but real gaps
-   remain**: no way to *remove a single staged night* or re-stage over
-   one that already exists from the UI (the API supports re-running
-   `/stage`, the form just doesn't pre-fill from what's already there) —
-   distinct from whole-*project* deletion, which now exists (`DELETE
-   /projects/{name}` + the "Delete project" button); the folder browsers
-   (`/captures/browse` and `/projects/{name}/browse`) have no breadcrumb
-   trail, just an "← up" button; no polling/auto-refresh of project
-   status while a job from *another* browser tab or the Swagger UI is
-   running — combined with Frontend/web gotcha #4, two tabs running jobs
-   against the same project at once can still 500; the exclude-frames
-   list is global across nights in one request (matches the API's own
-   semantics, see gotcha-adjacent note in `StackLightsRequest`, but worth
-   a UI hint if it ever causes confusion); no way to browse job history
-   (only the most recently started job's progress is shown per section,
-   nothing persists across a page reload); the large-night collapsing
-   behavior (flagged frames ± 2 neighbors, rest collapsed to an
-   expandable "N more") is implemented but has never been exercised
-   against a real >20-frame night, since no current test project has one
-   — worth a specific look once real data that size exists; the debayer
-   (`_debayer_block_mean`) is a quick-look 2x2-block demosaic, not a real
-   (e.g. bilinear/AHD) one — fine for review, not for anything claiming
-   photometric accuracy; the review lightbox's prev/next navigation
-   (`app.js`'s `lightboxNav`) captures its frame list by reference at
-   open time — if you toggle survivors-only or exclude the very frame
-   you're looking at while the lightbox is open, the arrows keep
-   navigating the list as it was when you opened it rather than the
-   freshly-filtered one, a minor staleness edge case, not a crash. None
-   of these are hard, just not done.
-2. **No image thumbnails for the *stack* preview's intermediate steps** —
-   only the raw lights (Review) and the final `result.fit` (Stack) get
-   previews. A real "blink through everything" experience closer to the
-   astropup-blink screenshot would also want previews of e.g. per-night
-   master flats, for spotting a bad flat before it ruins a whole night's
-   calibration.
-3. **Per-night master overrides aren't wired up.** `master_dark`/
+1. **Remaining frontend gaps** (this was a single bundled item; Chris
+   picked "remove a single staged night" and "breadcrumb trail" out of it
+   to build — see "Current validated status" — deferring the rest below
+   rather than have them all guessed at in one unscoped pass):
+   no polling/auto-refresh of project status while a job from *another*
+   browser tab or the Swagger UI is running — combined with Frontend/web
+   gotcha #4, two tabs running jobs against the same project at once can
+   still 500; the exclude-frames list is global across nights in one
+   request (matches the API's own semantics, see gotcha-adjacent note in
+   `StackLightsRequest`, but worth a UI hint if it ever causes
+   confusion); no way to browse job history (only the most recently
+   started job's progress is shown per section, nothing persists across
+   a page reload); the large-night collapsing behavior (flagged frames
+   ± 2 neighbors, rest collapsed to an expandable "N more") is
+   implemented but has never been exercised against a real >20-frame
+   night, since no current test project has one — worth a specific look
+   once real data that size exists; the debayer (`_debayer_block_mean`,
+   also now used for master preview thumbnails) is a quick-look
+   2x2-block demosaic, not a real (e.g. bilinear/AHD) one — fine for
+   review, not for anything claiming photometric accuracy; the review
+   lightbox's prev/next navigation (`app.js`'s `lightboxNav`) captures
+   its frame list by reference at open time — if you toggle
+   survivors-only or exclude the very frame you're looking at while the
+   lightbox is open, the arrows keep navigating the list as it was when
+   you opened it rather than the freshly-filtered one, a minor staleness
+   edge case, not a crash. None of these are hard, just not done.
+2. **Per-night master overrides aren't wired up.** `master_dark`/
    `master_flat` on `StackLightsRequest` are single values applied
    uniformly to every requested night if given. That's correct for
    `master_dark` (genuinely shared — see the master reuse policy in

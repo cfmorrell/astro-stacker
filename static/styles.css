@@ -331,6 +331,27 @@ button.small {
   min-width: 160px;
 }
 
+.dirpick-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 180px;
+}
+
+.dirpick-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+}
+
+.dirpick-row {
+  display: flex;
+  gap: 6px;
+}
+
 .checklist {
   display: flex;
   flex-wrap: wrap;
@@ -605,6 +626,64 @@ button.danger-outline:hover {
 .frame-ellipsis:hover {
   border-color: var(--accent);
   color: var(--text);
+}
+
+.master-preview-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.master-preview-card {
+  flex: 0 0 160px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.master-preview-card img {
+  width: 100%;
+  height: 110px;
+  object-fit: cover;
+  display: block;
+  background: #000;
+  cursor: zoom-in;
+}
+
+.master-preview-label {
+  padding: 6px 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.browser-breadcrumb {
+  font-size: 11px;
+  font-family: ui-monospace, monospace;
+  color: var(--text-dim);
+  word-break: break-word;
+}
+
+.browser-breadcrumb .crumb {
+  color: var(--accent-2);
+  cursor: pointer;
+}
+
+.browser-breadcrumb .crumb:hover {
+  text-decoration: underline;
+}
+
+.browser-breadcrumb .crumb.current {
+  color: var(--text-muted);
+  cursor: default;
+  text-decoration: none;
+}
+
+.browser-breadcrumb .crumb-sep {
+  margin: 0 3px;
+  color: var(--text-dim);
 }
 
 .metric-grid {

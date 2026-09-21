@@ -187,6 +187,27 @@ function wireToggleButton(btnId, logKey, fetchFn) {
 
 // ---------- folder browser (for Stage section) ----------
 
+function renderBreadcrumb(rootLabel, path, onNavigate) {
+  const wrap = el("div", { class: "browser-breadcrumb" }, []);
+  const parts = path ? path.split("/") : [];
+  wrap.appendChild(el("span", {
+    class: `crumb${parts.length ? "" : " current"}`,
+    onclick: parts.length ? () => onNavigate("") : null,
+  }, [rootLabel]));
+  let acc = "";
+  parts.forEach((part, i) => {
+    acc = acc ? `${acc}/${part}` : part;
+    const isLast = i === parts.length - 1;
+    const target = acc;
+    wrap.appendChild(el("span", { class: "crumb-sep" }, ["/"]));
+    wrap.appendChild(el("span", {
+      class: `crumb${isLast ? " current" : ""}`,
+      onclick: isLast ? null : () => onNavigate(target),
+    }, [part]));
+  });
+  return wrap;
+}
+
 function attachFolderBrowser(inputEl, browseBtn) {
   async function open() {
     closeAnyBrowser();
@@ -207,10 +228,8 @@ function attachFolderBrowser(inputEl, browseBtn) {
         panel.appendChild(el("div", { class: "status-line err" }, [String(e)]));
         return;
       }
-      panel.appendChild(el("div", { class: "hint mono" }, [`/${data.path || ""}  (${data.fit_count} .fit files here)`]));
-      if (path) {
-        panel.appendChild(el("button", { class: "small", onclick: () => { path = path.split("/").slice(0, -1).join("/"); render(); } }, ["← up"]));
-      }
+      panel.appendChild(renderBreadcrumb("captures", data.path, (target) => { path = target; render(); }));
+      panel.appendChild(el("div", { class: "hint mono" }, [`${data.fit_count} .fit files here`]));
       const list = el("div", { style: "margin-top:6px; max-height:220px; overflow-y:auto;" }, []);
       for (const d of data.dirs) {
         list.appendChild(el("div", {
@@ -263,10 +282,7 @@ function attachFileBrowser(inputEl, browseBtn, startPath) {
         panel.appendChild(el("div", { class: "status-line err" }, [String(e)]));
         return;
       }
-      panel.appendChild(el("div", { class: "hint mono" }, [`/${data.path || ""}`]));
-      if (path) {
-        panel.appendChild(el("button", { class: "small", onclick: () => { path = path.split("/").slice(0, -1).join("/"); render(); } }, ["← up"]));
-      }
+      panel.appendChild(renderBreadcrumb(state.project, data.path, (target) => { path = target; render(); }));
       const list = el("div", { style: "margin-top:6px; max-height:220px; overflow-y:auto;" }, []);
       for (const d of data.dirs) {
         list.appendChild(el("div", {
@@ -295,26 +311,81 @@ function attachFileBrowser(inputEl, browseBtn, startPath) {
 
 // ---------- Stage section ----------
 
+function nextNightNumber() {
+  // Continue after whatever's already staged rather than always starting
+  // from 1, so adding a session after removing one can't collide with a
+  // night that's still there (e.g. night1 stays, night2 gets removed,
+  // a new session becomes night3, not a second "night2").
+  const existing = (state.status ? state.status.nights : [])
+    .map((n) => parseInt(n.name.replace(/^night/, ""), 10))
+    .filter((x) => !isNaN(x));
+  return (existing.length ? Math.max(...existing) : 0) + 1;
+}
+
+function renderExistingStagedNights() {
+  const container = document.getElementById("stage-existing-nights");
+  container.innerHTML = "";
+  const nights = state.status ? state.status.nights : [];
+  if (!nights.length) {
+    container.appendChild(el("span", { class: "empty-hint" }, ["None staged yet."]));
+    return;
+  }
+  for (const n of nights) {
+    container.appendChild(el("div", { class: "night-row", style: "justify-content:space-between;" }, [
+      el("span", {}, [`${nightDisplayLabel(n)} — ${n.light_count} lights, ${n.flat_count} flats`]),
+      el("button", {
+        type: "button", class: "small danger-outline",
+        onclick: async () => {
+          if (!confirm(`Remove ${nightDisplayLabel(n)}? This deletes its staged files and any built master flat for it. Cannot be undone.`)) return;
+          try {
+            await api("DELETE", `/projects/${encodeURIComponent(state.project)}/nights/${encodeURIComponent(n.name)}`);
+            await loadProjectStatus();
+          } catch (e) {
+            alert(`Remove failed: ${e}`);
+          }
+        },
+      }, ["✕ Remove"]),
+    ]));
+  }
+}
+
 function addNightRow() {
   const container = document.getElementById("stage-nights");
-  const sessionNum = container.children.length + 1;
+  // Continue after whatever's already staged, not just count draft rows
+  // in this form: opening a project that already has night1/night2
+  // staged should offer "Session 3" for a new one, not restart at 1.
+  const sessionNum = nextNightNumber() + container.children.length;
   const row = el("div", { class: "night-row" }, []);
   const label = el("span", { class: "session-label" }, [`Session ${sessionNum}`]);
-  const lightsInput = el("input", { type: "text", class: "dirpick", placeholder: "lights dir (e.g. Night 1/lights)", readonly: "readonly" }, []);
-  const flatsInput = el("input", { type: "text", class: "dirpick", placeholder: "flats dir (e.g. Night 1/flats)", readonly: "readonly" }, []);
+  // A persistent "Lights"/"Flats" label above each field, not just
+  // placeholder text: placeholder text disappears the moment a folder is
+  // picked (readonly inputs show the selected path, not a hint anymore),
+  // which was the whole problem - nothing left on screen said which side
+  // was which once both were filled in.
+  const lightsInput = el("input", { type: "text", class: "dirpick", placeholder: "e.g. Night 1/lights", readonly: "readonly" }, []);
+  const flatsInput = el("input", { type: "text", class: "dirpick", placeholder: "e.g. Night 1/flats", readonly: "readonly" }, []);
   const lightsBrowse = el("button", { type: "button", class: "small" }, ["…"]);
   const flatsBrowse = el("button", { type: "button", class: "small" }, ["…"]);
   attachFolderBrowser(lightsInput, lightsBrowse);
   attachFolderBrowser(flatsInput, flatsBrowse);
+  const lightsGroup = el("div", { class: "dirpick-group" }, [
+    el("span", { class: "dirpick-label" }, ["Lights"]),
+    el("div", { class: "dirpick-row" }, [lightsInput, lightsBrowse]),
+  ]);
+  const flatsGroup = el("div", { class: "dirpick-group" }, [
+    el("span", { class: "dirpick-label" }, ["Flats"]),
+    el("div", { class: "dirpick-row" }, [flatsInput, flatsBrowse]),
+  ]);
   const removeBtn = el("button", { type: "button", class: "small ghost", onclick: () => { row.remove(); renumberSessions(); } }, ["✕"]);
-  row.append(label, lightsInput, lightsBrowse, flatsInput, flatsBrowse, removeBtn);
+  row.append(label, lightsGroup, flatsGroup, removeBtn);
   container.appendChild(row);
 }
 
 function renumberSessions() {
+  const base = nextNightNumber();
   const rows = document.getElementById("stage-nights").children;
   Array.from(rows).forEach((row, i) => {
-    row.querySelector(".session-label").textContent = `Session ${i + 1}`;
+    row.querySelector(".session-label").textContent = `Session ${base + i}`;
   });
 }
 
@@ -324,11 +395,15 @@ attachFolderBrowser(document.getElementById("darks-dir"), document.getElementByI
 
 document.getElementById("stage-btn").addEventListener("click", async () => {
   if (!state.project) return;
+  let nextNum = nextNightNumber();
   const rows = Array.from(document.getElementById("stage-nights").children);
-  const nights = rows.map((row, i) => {
-    const inputs = row.querySelectorAll("input");
-    return { name: `night${i + 1}`, lights_dir: inputs[0].value.trim(), flats_dir: inputs[1].value.trim() };
-  }).filter((n) => n.lights_dir && n.flats_dir);
+  const nights = rows
+    .map((row) => {
+      const inputs = row.querySelectorAll("input");
+      return { lights_dir: inputs[0].value.trim(), flats_dir: inputs[1].value.trim() };
+    })
+    .filter((n) => n.lights_dir && n.flats_dir)
+    .map((n) => ({ ...n, name: `night${nextNum++}` }));
 
   const body = {
     biases_dir: document.getElementById("biases-dir").value.trim() || null,
@@ -409,6 +484,39 @@ const analyzeSelected = new Set();
 const stackSelected = new Set();
 
 // ---------- Masters section ----------
+
+function renderMastersPreviews() {
+  const container = document.getElementById("masters-previews");
+  container.innerHTML = "";
+  if (!state.status) return;
+  const items = [];
+  if (state.status.master_bias_built) items.push({ label: "Master Bias", path: "process/master_bias.fit" });
+  if (state.status.master_dark_built) items.push({ label: "Master Dark", path: "process/master_dark.fit" });
+  for (const n of state.status.nights) {
+    if (n.master_flat_built) {
+      items.push({ label: `Master Flat — ${nightDisplayLabel(n)}`, path: `process/nights/${n.name}/master_flat.fit` });
+    }
+  }
+  if (!items.length) return;
+  // Master bias/dark/flat are never debayered by Siril (only light
+  // calibration gets -cfa/-debayer - see Handoff.md), so they're still a
+  // raw Bayer mosaic same as an unstaged raw light; debayer them here the
+  // same way for a real look rather than grainy grayscale. "unlinked"
+  // (independent per-channel percentile+asinh) rather than "none": Chris
+  // asked for it specifically to actually see what these calibration
+  // frames look like - same reasoning as review's raw-light thumbnails,
+  // which are unbalanced straight off the sensor and need a per-channel
+  // stretch to look like more than a flat color wash.
+  const debayer = state.status.is_osc ? "&debayer=1" : "";
+  for (const item of items) {
+    const thumbUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(item.path)}&max_size=220&stretch=unlinked${debayer}`;
+    const largeUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(item.path)}&max_size=1600&stretch=unlinked${debayer}`;
+    container.appendChild(el("div", { class: "master-preview-card" }, [
+      el("img", { src: thumbUrl, onclick: () => openPlainLightbox(largeUrl, item.label) }, []),
+      el("div", { class: "master-preview-label" }, [item.label]),
+    ]));
+  }
+}
 
 function mastersBody() {
   return {
@@ -532,6 +640,19 @@ function openLightbox(url, title, { stats, indicator } = {}) {
   captionEl.appendChild(el("div", { class: "lightbox-caption-title" }, [title]));
   if (stats) captionEl.appendChild(el("div", { class: "lightbox-caption-stats" }, [stats]));
   document.getElementById("lightbox").classList.add("open");
+}
+
+function openPlainLightbox(url, title) {
+  // For anything with no frame list to navigate and no exclusion to
+  // toggle (the final stack preview, a master bias/dark/flat preview) -
+  // resets the nav arrows/exclude row explicitly, since a plain
+  // openLightbox() call doesn't touch them and they'd otherwise be left
+  // over from whatever was last shown (e.g. a review frame).
+  lightboxNav = null;
+  document.getElementById("lightbox-exclude-row").style.display = "none";
+  document.getElementById("lightbox-prev").classList.add("hidden");
+  document.getElementById("lightbox-next").classList.add("hidden");
+  openLightbox(url, title);
 }
 
 function renderLightboxFrame() {
@@ -1001,18 +1122,7 @@ function showStackPreview() {
     previewEl.appendChild(controls);
     previewEl.appendChild(el("div", { class: "preview-frame" }, [el("img", {
       src: stackPreviewUrl(path),
-      onclick: () => {
-        // Arrows/exclude checkbox only make sense while browsing review
-        // frames (openLightboxForFrame) - reset them explicitly here since
-        // a plain openLightbox() call doesn't touch them, and they'd
-        // otherwise be left over from whatever was last shown in the
-        // lightbox if that was a review frame.
-        lightboxNav = null;
-        document.getElementById("lightbox-exclude-row").style.display = "none";
-        document.getElementById("lightbox-prev").classList.add("hidden");
-        document.getElementById("lightbox-next").classList.add("hidden");
-        openLightbox(stackPreviewUrl(path, 2400), path.split("/").pop());
-      },
+      onclick: () => openPlainLightbox(stackPreviewUrl(path, 2400), path.split("/").pop()),
     }, [])]));
     previewEl.dataset.builtFor = path;
   }
@@ -1090,6 +1200,7 @@ async function loadProjectStatus() {
     state.status = null;
     document.getElementById("delete-project-btn").disabled = true;
     document.getElementById("delete-project-btn").title = "This project hasn't been staged yet — nothing to delete";
+    renumberSessions();
     renderStepper();
     return;
   }
@@ -1110,9 +1221,18 @@ async function loadProjectStatus() {
   renderChecklist("masters-nights", nights, mastersSelected);
   renderChecklist("analyze-nights", nights, analyzeSelected);
   refreshStackNightsChecklist();
+  renderExistingStagedNights();
+  // The draft "Session N" row(s) in the Stage form are created by
+  // addNightRow() at project-switch time, BEFORE this function's fetch
+  // resolves - at that point state.status is still null (just reset),
+  // so the label always came out "Session 1" regardless of how many
+  // nights this project actually already has staged. Relabel now that
+  // the real count is known.
+  renumberSessions();
 
   document.getElementById("stage-is-osc").checked = state.status.is_osc !== false;
 
+  renderMastersPreviews();
   showStackPreview();
   renderStepper();
 }
@@ -1150,6 +1270,7 @@ document.getElementById("project-select").addEventListener("change", async (e) =
   document.getElementById("analyze-output").innerHTML = "";
   document.getElementById("analyze-result").innerHTML = "";
   document.getElementById("masters-result").innerHTML = "";
+  document.getElementById("masters-previews").innerHTML = "";
   document.getElementById("stack-result").innerHTML = "";
   document.getElementById("analyze-actions").style.display = "none";
   document.getElementById("analyze-reset-btn").style.display = "none";
@@ -1170,6 +1291,7 @@ document.getElementById("project-select").addEventListener("change", async (e) =
   renderChecklist("masters-nights", [], mastersSelected);
   renderChecklist("analyze-nights", [], analyzeSelected);
   renderChecklist("stack-nights", [], stackSelected);
+  document.getElementById("stage-existing-nights").innerHTML = "";
   // The stack preview's "only rebuild when the path changes" optimization
   // (showStackPreview) keys off the result's path alone, which is
   // relative and could coincidentally match between two different

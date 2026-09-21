@@ -71,10 +71,13 @@
           <label><input type="checkbox" id="stage-is-osc" checked /> OSC / Bayer color camera (e.g. ASI2600MC) — used to debayer review thumbnails/previews</label>
         </div>
 
-        <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Sessions (each night's lights + matching flats)</label>
+        <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Currently staged sessions</label>
+        <div id="stage-existing-nights"></div>
+
+        <label style="display:block; font-size:12px; color:var(--text-muted); margin: 14px 0 6px;">Add a session (lights + matching flats)</label>
         <div id="stage-nights"></div>
         <button id="add-night-btn" class="small">+ Add session</button>
-        <p class="hint">Sessions are numbered automatically (Session 1, Session 2, …) — you never need to name them; internally they're stored as night1, night2, etc. Checkboxes elsewhere show whatever your source folder was actually called.</p>
+        <p class="hint">Sessions are numbered automatically — you never need to name them; internally they're stored as night1, night2, etc. Checkboxes elsewhere show whatever your source folder was actually called.</p>
 
         <div class="progress-wrap">
           <button id="stage-btn" class="primary">Stage files</button>
@@ -126,6 +129,7 @@
         </div>
         <div id="masters-result"></div>
         <div class="log-view" data-log-view="masters"></div>
+        <div id="masters-previews" class="master-preview-strip"></div>
       </div>
     </section>
 
