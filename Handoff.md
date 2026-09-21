@@ -992,54 +992,46 @@ the `raw/` staging layer exists at all — don't collapse it away):
   rejection method, that's the whole parameterization surface.
 
 ## Immediate next steps
-Everything from the prior handoffs' lists is **done**: split masters/
-lights phases, FastAPI render/run + background jobs, progress parsing,
-real multi-night validation, a staging endpoint, frame review/filtering
-(recommend-only, on astropy+photutils, with anomaly-based flagging
-validated against real known-bad frames), both Siril gotcha #6/#8 fixes
-in `/masters/run` and `/stack/run`, a first-version frontend, six further
-rounds of live-usage feedback/fixes on top of that (19 items, then 18,
-then 8, then a stale-project-status bug plus whole-project delete, then
-four more small fixes, then removing a single night + breadcrumbs), and
-master-preview thumbnails (see "Current validated status" for the full
-list of what each round covered). Crop is permanently out of scope
-(Architecture decisions), not deferred. Archive/cleanup is explicitly
-deferred per Chris, not started. What's actually left:
+Everything from prior rounds is **done** — see "Current validated status"
+for the full history. Crop is permanently out of scope (Architecture
+decisions), not deferred. Archive/cleanup is explicitly deferred per
+Chris, not started. Open work items, smallest/most self-contained first:
 
-1. **Remaining frontend gaps** (this was a single bundled item; Chris
-   picked "remove a single staged night" and "breadcrumb trail" out of it
-   to build — see "Current validated status" — deferring the rest below
-   rather than have them all guessed at in one unscoped pass):
-   no polling/auto-refresh of project status while a job from *another*
-   browser tab or the Swagger UI is running — combined with Frontend/web
-   gotcha #4, two tabs running jobs against the same project at once can
-   still 500; the exclude-frames list is global across nights in one
-   request (matches the API's own semantics, see gotcha-adjacent note in
-   `StackLightsRequest`, but worth a UI hint if it ever causes
-   confusion); no way to browse job history (only the most recently
-   started job's progress is shown per section, nothing persists across
-   a page reload); the large-night collapsing behavior (flagged frames
-   ± 2 neighbors, rest collapsed to an expandable "N more") is
-   implemented but has never been exercised against a real >20-frame
-   night, since no current test project has one — worth a specific look
-   once real data that size exists; the debayer (`_debayer_block_mean`,
-   also now used for master preview thumbnails) is a quick-look
-   2x2-block demosaic, not a real (e.g. bilinear/AHD) one — fine for
-   review, not for anything claiming photometric accuracy; the review
-   lightbox's prev/next navigation (`app.js`'s `lightboxNav`) captures
-   its frame list by reference at open time — if you toggle
-   survivors-only or exclude the very frame you're looking at while the
-   lightbox is open, the arrows keep navigating the list as it was when
-   you opened it rather than the freshly-filtered one, a minor staleness
-   edge case, not a crash. None of these are hard, just not done.
-2. **Per-night master overrides aren't wired up.** `master_dark`/
-   `master_flat` on `StackLightsRequest` are single values applied
-   uniformly to every requested night if given. That's correct for
-   `master_dark` (genuinely shared — see the master reuse policy in
-   Architecture decisions), but `master_flat` really wants a *per-night*
-   override (e.g. "night3 is missing its own flats, reuse night2's" or a
-   library entry) rather than one value forced onto every night in the
-   request. Not built — flagged, not attempted; the frontend's Stack
-   section now has a file picker for setting the override (see "Current
-   validated status"), but it's still the same one global value applied
-   to every selected night, not a per-night one.
+- **UI hint for cross-night frame exclusion.** `exclude_frames` on
+  `StackLightsRequest` applies globally across every selected night in
+  one request (matches the API's own semantics — not a bug), but nothing
+  in the UI says so. Add a one-line note wherever exclusions are shown on
+  the Stack step.
+- **Real debayer algorithm.** `_debayer_block_mean` (`app/imaging.py`) is
+  a quick 2x2-block-average demosaic — fine for a review thumbnail, not
+  for anything claiming photometric accuracy. Swap in a real
+  bilinear/AHD demosaic for review and master-preview thumbnails.
+- **Lightbox nav staleness.** `lightboxNav` (`app.js`) captures its frame
+  list by reference at open time. Toggling survivors-only or excluding
+  the frame you're currently viewing doesn't refresh what the prev/next
+  arrows navigate — a minor edge case, not a crash. Recompute the list
+  live from `state.lastAnalyzeResult` instead of snapshotting it.
+- **Validate large-night collapsing against real data.** The >20-frame
+  collapse-to-flagged-±2-neighbors behavior (`computeVisibleItems()`) has
+  never been exercised against an actual night that size — no current
+  test project has one. Needs a look once real data that large exists,
+  not a code change on its own.
+- **Job history.** Only the most recently started job's progress is
+  shown per section; nothing persists across a page reload or lets you
+  browse past jobs.
+- **Cross-tab/cross-client job awareness.** No polling or auto-refresh of
+  project status while a job started from *another* browser tab or the
+  Swagger UI is running. Combined with Frontend/web gotcha #4, two
+  clients running jobs against the same project at once can still 500.
+- **Per-night master flat/dark overrides.** `master_dark`/`master_flat`
+  on `StackLightsRequest` are single values applied uniformly to every
+  selected night. Correct for `master_dark` (genuinely shared — see the
+  master reuse policy in Architecture decisions), but `master_flat`
+  really wants a per-night override (e.g. "night3 is missing its own
+  flats, reuse night2's," or a library entry) instead of one value forced
+  onto every night in the request. The Stack section's file picker (see
+  "Current validated status") makes *setting* the existing global
+  override easier but doesn't add per-night granularity. Needs design
+  thought before building — how should the UI represent "this override
+  applies to this specific night" without over-complicating the common
+  case where no override is needed at all?
