@@ -227,12 +227,11 @@ function attachFolderBrowser(inputEl, browseBtn) {
     }
     render();
   }
+  // The ellipsis button is the one, unambiguous way to open this picker
+  // (matches the "Browse..." convention Siril's own reference tool uses,
+  // per Chris) - the field itself is just a read-only display of the
+  // current selection, not a second click target for the same action.
   browseBtn.addEventListener("click", open);
-  // Inputs are read-only now (Chris: "I'd rather someone have to click
-  // the ellipsis and choose a folder than mistype something") - clicking
-  // the input itself opens the same picker rather than doing nothing,
-  // since a read-only field with a text cursor otherwise looks broken.
-  inputEl.addEventListener("click", open);
 }
 
 function closeAnyBrowser() {
@@ -290,8 +289,8 @@ function attachFileBrowser(inputEl, browseBtn, startPath) {
     }
     render();
   }
+  // Same "one obvious way in" reasoning as attachFolderBrowser above.
   browseBtn.addEventListener("click", open);
-  inputEl.addEventListener("click", open);
 }
 
 // ---------- Stage section ----------
@@ -504,8 +503,22 @@ function metricStrip(label, frames, key, subKey, anomalySigma) {
 }
 
 let lightboxZoomed = false;
+// Set only while browsing review frames (via openLightboxForFrame) so the
+// prev/next arrows and exclude checkbox know what they're navigating;
+// null for a plain open (e.g. the final stack preview), which has neither.
+let lightboxNav = null;
 
-function openLightbox(url, caption) {
+function frameStatsLine(f) {
+  return `Stars: ${f.star_count}, FWHM: ${f.fwhm !== null ? f.fwhm.toFixed(2) : "—"}, `
+    + `Eccentricity: ${f.roundness !== null ? f.roundness.toFixed(3) : "—"}, SNR: ${f.snr !== null ? f.snr.toFixed(0) : "—"}`;
+}
+
+function frameLightboxUrl(night, f) {
+  const debayer = state.status && state.status.is_osc ? "&debayer=1" : "";
+  return `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(`raw/nights/${night}/lights/${f.filename}`)}&max_size=1600&stretch=unlinked${debayer}`;
+}
+
+function openLightbox(url, title, { stats, indicator } = {}) {
   const img = document.getElementById("lightbox-img");
   const scroll = document.getElementById("lightbox-scroll");
   img.src = url;
@@ -513,11 +526,66 @@ function openLightbox(url, caption) {
   scroll.classList.remove("zoomed");
   scroll.scrollTop = 0;
   scroll.scrollLeft = 0;
-  document.getElementById("lightbox-caption").textContent = caption;
+  const captionEl = document.getElementById("lightbox-caption");
+  captionEl.className = `lightbox-caption${indicator ? ` ${indicator}` : ""}`;
+  captionEl.innerHTML = "";
+  captionEl.appendChild(el("div", { class: "lightbox-caption-title" }, [title]));
+  if (stats) captionEl.appendChild(el("div", { class: "lightbox-caption-stats" }, [stats]));
   document.getElementById("lightbox").classList.add("open");
 }
+
+function renderLightboxFrame() {
+  const { night, frames, index } = lightboxNav;
+  const f = frames[index];
+  const { date, time } = formatCaptured(f.captured_at);
+  openLightbox(frameLightboxUrl(night, f), `${f.filename} — ${date} ${time}`, {
+    stats: frameStatsLine(f),
+    indicator: isFrameFlagged(f) ? "flagged" : "ok",
+  });
+  document.getElementById("lightbox-exclude-row").style.display = "flex";
+  document.getElementById("lightbox-exclude").checked = state.excludeFrames.has(f.filename);
+  document.getElementById("lightbox-prev").classList.toggle("hidden", index <= 0);
+  document.getElementById("lightbox-next").classList.toggle("hidden", index >= frames.length - 1);
+}
+
+function openLightboxForFrame(night, frames, index) {
+  lightboxNav = { night, frames, index };
+  renderLightboxFrame();
+}
+
 document.getElementById("lightbox").addEventListener("click", () => {
   document.getElementById("lightbox").classList.remove("open");
+});
+document.getElementById("lightbox-prev").addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (!lightboxNav || lightboxNav.index <= 0) return;
+  lightboxNav.index -= 1;
+  renderLightboxFrame();
+});
+document.getElementById("lightbox-next").addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (!lightboxNav || lightboxNav.index >= lightboxNav.frames.length - 1) return;
+  lightboxNav.index += 1;
+  renderLightboxFrame();
+});
+document.addEventListener("keydown", (e) => {
+  if (!document.getElementById("lightbox").classList.contains("open")) return;
+  if (e.key === "ArrowLeft") document.getElementById("lightbox-prev").click();
+  else if (e.key === "ArrowRight") document.getElementById("lightbox-next").click();
+  else if (e.key === "Escape") document.getElementById("lightbox").classList.remove("open");
+});
+document.getElementById("lightbox-exclude-row").addEventListener("click", (e) => e.stopPropagation());
+document.getElementById("lightbox-exclude").addEventListener("change", (e) => {
+  if (!lightboxNav) return;
+  const f = lightboxNav.frames[lightboxNav.index];
+  if (e.target.checked) state.excludeFrames.add(f.filename);
+  else state.excludeFrames.delete(f.filename);
+  refreshExcludeDisplay();
+  // Rebuilds the review grid behind the (still-open) lightbox, including
+  // the matching frame-card's own checkbox/border - scroll position
+  // (both the page and the per-night horizontal strip) is already
+  // preserved by renderAnalyzeOutput/frameCard's own handling of this.
+  renderAnalyzeOutput();
 });
 document.getElementById("lightbox-scroll").addEventListener("click", (e) => {
   // Toggle zoom instead of letting the click bubble to the overlay's
@@ -543,18 +611,17 @@ document.getElementById("lightbox-scroll").addEventListener("click", (e) => {
   }
 });
 
-function frameCard(night, f) {
+function frameCard(night, f, frames, index) {
   const debayer = state.status && state.status.is_osc ? "&debayer=1" : "";
   // Unlinked stretch (each channel gets its own black/white point) rather
   // than the "linked"/default: raw subs are wildly unbalanced straight
   // off the sensor (no white balance applied yet), so a linked stretch
   // left review thumbnails looking like a flat cyan wash - unlinked
   // actually shows the frame's real content.
-  const previewParams = `&stretch=unlinked${debayer}`;
-  const smallUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(`raw/nights/${night}/lights/${f.filename}`)}&max_size=320${previewParams}`;
-  const largeUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(`raw/nights/${night}/lights/${f.filename}`)}&max_size=1600${previewParams}`;
+  const smallUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(`raw/nights/${night}/lights/${f.filename}`)}&max_size=320&stretch=unlinked${debayer}`;
   const checked = state.excludeFrames.has(f.filename);
-  const card = el("div", { class: `frame-card${isFrameFlagged(f) ? " flagged" : ""}` }, []);
+  const flagged = isFrameFlagged(f);
+  const card = el("div", { class: `frame-card${flagged ? " flagged" : ""}` }, []);
   const { date, time } = formatCaptured(f.captured_at);
   // Not loading="lazy": the frame strip scrolls horizontally, and lazy
   // loading only fires once an image nears the *viewport*, not the
@@ -563,7 +630,7 @@ function frameCard(night, f) {
   // way: 7/11 stuck "loading" indefinitely until manually scrolled).
   card.appendChild(el("img", {
     src: smallUrl,
-    onclick: () => openLightbox(largeUrl, `${f.filename} — ${date} ${time}`),
+    onclick: () => openLightboxForFrame(night, frames, index),
   }, []));
   const meta = el("div", { class: "frame-meta" }, []);
   meta.appendChild(el("div", { class: "frame-name" }, [f.filename]));
@@ -679,7 +746,7 @@ function renderAnalyzeOutput() {
     if (frames.length > LARGE_NIGHT_THRESHOLD && !state.showSurvivorsOnly) {
       for (const item of computeVisibleItems(night, frames)) {
         if (item.type === "frame") {
-          strip.appendChild(frameCard(night, item.frame));
+          strip.appendChild(frameCard(night, item.frame, frames, item.index));
         } else {
           strip.appendChild(el("div", {
             class: "frame-ellipsis",
@@ -692,7 +759,7 @@ function renderAnalyzeOutput() {
         }
       }
     } else {
-      for (const f of frames) strip.appendChild(frameCard(night, f));
+      frames.forEach((f, i) => strip.appendChild(frameCard(night, f, frames, i)));
     }
     block.appendChild(strip);
     outputEl.appendChild(block);
@@ -934,7 +1001,18 @@ function showStackPreview() {
     previewEl.appendChild(controls);
     previewEl.appendChild(el("div", { class: "preview-frame" }, [el("img", {
       src: stackPreviewUrl(path),
-      onclick: () => openLightbox(stackPreviewUrl(path, 2400), path.split("/").pop()),
+      onclick: () => {
+        // Arrows/exclude checkbox only make sense while browsing review
+        // frames (openLightboxForFrame) - reset them explicitly here since
+        // a plain openLightbox() call doesn't touch them, and they'd
+        // otherwise be left over from whatever was last shown in the
+        // lightbox if that was a review frame.
+        lightboxNav = null;
+        document.getElementById("lightbox-exclude-row").style.display = "none";
+        document.getElementById("lightbox-prev").classList.add("hidden");
+        document.getElementById("lightbox-next").classList.add("hidden");
+        openLightbox(stackPreviewUrl(path, 2400), path.split("/").pop());
+      },
     }, [])]));
     previewEl.dataset.builtFor = path;
   }
@@ -998,7 +1076,25 @@ async function loadProjects() {
 
 async function loadProjectStatus() {
   if (!state.project) return;
-  state.status = await api("GET", `/projects/${encodeURIComponent(state.project)}/status`);
+  try {
+    state.status = await api("GET", `/projects/${encodeURIComponent(state.project)}/status`);
+  } catch (e) {
+    // A project name can exist in the dropdown (added by Create) before
+    // it exists on the server (nothing is created there until Stage
+    // actually runs) - that 404 is expected, not an error. Previously
+    // this threw here and left state.status holding whatever the
+    // PREVIOUSLY selected project's status was, since the assignment
+    // above never happened - the stepper then kept showing that other
+    // project's completed steps (staged/built/stacked) against the new,
+    // actually-empty project. Reset explicitly instead of leaving it stale.
+    state.status = null;
+    document.getElementById("delete-project-btn").disabled = true;
+    document.getElementById("delete-project-btn").title = "This project hasn't been staged yet — nothing to delete";
+    renderStepper();
+    return;
+  }
+  document.getElementById("delete-project-btn").disabled = false;
+  document.getElementById("delete-project-btn").title = "";
   const nights = state.status.nights;
 
   setStepBadge("stage-status-badge", nights.length ? "ok" : null, nights.length ? `${nights.length} night(s) staged` : "not staged");
@@ -1023,9 +1119,21 @@ async function loadProjectStatus() {
 
 document.getElementById("project-select").addEventListener("change", async (e) => {
   state.project = e.target.value || null;
+  // Reset immediately, not just inside loadProjectStatus(): there's an
+  // async gap before that fetch resolves, and showActiveStep() below
+  // (which renders the stepper right away) would otherwise briefly - or,
+  // if the fetch then fails, indefinitely - show the PREVIOUS project's
+  // staged/built/stacked state against whatever's newly selected.
+  state.status = null;
   document.getElementById("project-panels").style.display = state.project ? "block" : "none";
   document.getElementById("no-project-hint").style.display = state.project ? "none" : "block";
   document.getElementById("delete-project-btn").style.display = state.project ? "inline-block" : "none";
+  // Disabled until loadProjectStatus() below confirms the project
+  // actually exists on the server: a name can sit in this dropdown
+  // (added by Create) before anything is staged, and DELETE on a
+  // project that was never staged 404s.
+  document.getElementById("delete-project-btn").disabled = true;
+  document.getElementById("delete-project-btn").title = "This project hasn't been staged yet — nothing to delete";
   mastersSelected.clear();
   analyzeSelected.clear();
   stackSelected.clear();
@@ -1052,6 +1160,16 @@ document.getElementById("project-select").addEventListener("change", async (e) =
   document.getElementById("stack-master-dark").value = "";
   document.getElementById("stack-master-flat").value = "";
   setStepBadge("review-status-badge", null, "not analyzed");
+  // Same staleness risk as state.status above: these otherwise only get
+  // updated inside loadProjectStatus()'s success path, so a project that
+  // 404s (not staged on the server yet) would leave the PREVIOUS
+  // project's badges and night checklists on screen indefinitely.
+  setStepBadge("stage-status-badge", null, "not staged");
+  setStepBadge("masters-status-badge", null, "not built");
+  setStepBadge("stack-status-badge", null, "not stacked");
+  renderChecklist("masters-nights", [], mastersSelected);
+  renderChecklist("analyze-nights", [], analyzeSelected);
+  renderChecklist("stack-nights", [], stackSelected);
   // The stack preview's "only rebuild when the path changes" optimization
   // (showStackPreview) keys off the result's path alone, which is
   // relative and could coincidentally match between two different

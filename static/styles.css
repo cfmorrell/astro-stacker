@@ -423,12 +423,11 @@ button.small {
 }
 
 input[readonly] {
-  cursor: pointer;
+  /* Purely a read-only display of the current selection now - the
+     ellipsis button next to it is the only way to change it, so this
+     shouldn't look or act clickable (no pointer cursor, no hover state). */
+  cursor: default;
   color: var(--text-muted);
-}
-
-input[readonly]:hover {
-  border-color: var(--accent);
 }
 
 button.danger-outline {
@@ -748,8 +747,16 @@ button.danger-outline:hover {
 }
 
 .lightbox-scroll.zoomed img {
+  /* max-height: 92vh (from .lightbox-overlay img above) was still
+     capping the rendered height here while width got forced to 220% -
+     two independent constraints on one image, which distorts it
+     (stretches horizontally) instead of scaling both dimensions
+     together. Clearing max-height too lets height:auto compute purely
+     from the image's own aspect ratio at the new width. */
   max-width: none;
+  max-height: none;
   width: 220%;
+  height: auto;
 }
 
 .lightbox-hint {
@@ -762,15 +769,99 @@ button.danger-outline:hover {
   font-size: 11px;
 }
 
-.lightbox-caption {
+.lightbox-footer {
   position: absolute;
-  bottom: 24px;
+  bottom: 20px;
   left: 0;
   right: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.lightbox-caption {
   text-align: center;
   color: var(--text-muted);
   font-size: 12px;
   font-family: ui-monospace, monospace;
+}
+
+.lightbox-exclude-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 12px;
+  cursor: pointer;
+}
+
+.lightbox-exclude-row input {
+  accent-color: var(--danger);
+}
+
+.lightbox-caption-title::before {
+  content: "●";
+  margin-right: 6px;
+  font-size: 9px;
+  vertical-align: middle;
+  color: transparent;
+}
+
+.lightbox-caption.ok .lightbox-caption-title::before {
+  color: var(--success);
+}
+
+.lightbox-caption.flagged .lightbox-caption-title::before {
+  color: var(--danger);
+}
+
+.lightbox-caption-stats {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.lightbox-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 44px;
+  height: 60px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: var(--text);
+  font-size: 24px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0.5;
+  transition: opacity 0.15s ease, background 0.15s ease;
+  z-index: 5;
+}
+
+.lightbox-nav:hover {
+  opacity: 1;
+  background: rgba(0, 0, 0, 0.6);
+}
+
+.lightbox-nav.hidden {
+  display: none;
+}
+
+.lightbox-nav-prev {
+  left: 16px;
+}
+
+.lightbox-nav-next {
+  right: 16px;
 }
 
 /* ---------- preview / stretch / download ---------- */

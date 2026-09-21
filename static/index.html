@@ -32,7 +32,7 @@
     </div>
     <div class="field" style="margin-bottom:0;">
       <label>&nbsp;</label>
-      <button id="delete-project-btn" class="danger-outline" style="display:none;">🗑 Delete project</button>
+      <button id="delete-project-btn" class="danger-outline" style="display:none;" disabled>🗑 Delete project</button>
     </div>
   </div>
 
@@ -259,10 +259,17 @@
 
 <div class="lightbox-overlay" id="lightbox">
   <div class="lightbox-hint">click image to zoom · scroll to pan</div>
+  <button type="button" id="lightbox-prev" class="lightbox-nav lightbox-nav-prev" aria-label="Previous frame">‹</button>
+  <button type="button" id="lightbox-next" class="lightbox-nav lightbox-nav-next" aria-label="Next frame">›</button>
   <div class="lightbox-scroll" id="lightbox-scroll">
     <img id="lightbox-img" src="" alt="" />
   </div>
-  <div class="lightbox-caption" id="lightbox-caption"></div>
+  <div class="lightbox-footer">
+    <div class="lightbox-caption" id="lightbox-caption"></div>
+    <label class="lightbox-exclude-row" id="lightbox-exclude-row" style="display:none;">
+      <input type="checkbox" id="lightbox-exclude" /> Exclude from stack
+    </label>
+  </div>
 </div>
 
 <script src="/app.js"></script>

@@ -418,6 +418,54 @@ Siril ones, but the same "don't rediscover this" spirit applies.
    that turns out to be a HEAD-based health check or test script.
 
 ## Current validated status
+- ✅ **Four more small frontend fixes, re-validated end-to-end
+  (2026-09-2x)**: 1) "Delete project" is now disabled (with an
+  explanatory tooltip) until `loadProjectStatus()` confirms the project
+  actually exists on the server — deleting one that's only ever existed
+  in the dropdown (added by Create, before Stage ever ran) 404'd;
+  2) fixed the lightbox's zoomed image stretching horizontally: the
+  base `.lightbox-overlay img` rule's `max-height: 92vh` was still
+  capping the rendered height while the zoomed rule forced `width:
+  220%`, so two independent constraints fought over one image instead of
+  scaling both dimensions together — cleared `max-height`
+  (`height: auto` instead) in the zoomed state, verified the rendered
+  aspect ratio now matches the natural one to 5 decimal places before
+  and after zoom; 3) removed the redundant click-to-browse handler on
+  the directory/file `readonly` inputs themselves (Stage's biases/darks/
+  lights/flats, Stack's master overrides) — the ellipsis "Browse…"
+  button is now the one, unambiguous way in, matching the convention
+  Siril's own reference tool uses, rather than two click targets doing
+  the same thing; 4) the review lightbox gained prev/next navigation
+  (click or arrow keys, hidden appropriately at the first/last frame of
+  whatever list it was opened from — respects the current survivors-only
+  filter and reaches into collapsed/ellipsis-hidden frames on a large
+  night without needing them expanded first) and an "Exclude from stack"
+  checkbox synced live with the underlying frame-card's own checkbox and
+  the exclude count (toggling it re-renders the review grid behind the
+  still-open lightbox via the existing scroll-preserving
+  `renderAnalyzeOutput()`). Neither the nav arrows nor the exclude
+  checkbox appear when the lightbox is opened from the final stack
+  preview, which has no frame list or exclusion to navigate/toggle.
+- ✅ **Fixed: switching to a not-yet-staged project showed the
+  PREVIOUS project's completed steps (2026-09-2x)**. Chris hit this
+  directly: created `live-test-3`, and Calibration Frames/Stack showed
+  green-complete with "2 nights staged" even though nothing had been
+  staged yet. Root cause: `loadProjectStatus()` only ever reassigned
+  `state.status` on a *successful* `/status` fetch — a brand-new project
+  name (added to the dropdown by "+ Create," which doesn't touch the
+  server until Stage actually runs) 404s there, so the assignment never
+  happened and `state.status` silently kept whatever the *previously
+  selected* project's status was. The stepper, badges, and night
+  checklists all read `state.status`, so they kept showing that other
+  project's real completed steps. Fixed two ways: `loadProjectStatus()`
+  now catches the fetch failure and explicitly resets `state.status =
+  null`, and the project `<select>`'s change handler resets it (plus the
+  three badges and three night checklists) immediately and
+  unconditionally, before the async fetch even starts, so there's no
+  window - however brief, or permanent on a 404 - where stale data from
+  another project can render. Verified by reproducing the exact
+  sequence (select a fully-complete project, switch to one that's never
+  been staged) and confirming everything resets to "not staged."
 - ✅ **Third round of frontend fixes, 8 items, re-validated end-to-end
   (2026-09-2x)**: 1) each per-night metric graph now shows an x-axis
   (first/last frame's local time) alongside the existing y-axis min/max;
