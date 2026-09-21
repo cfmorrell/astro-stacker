@@ -40,20 +40,60 @@ _BAYER_OFFSETS = {
 }
 
 
-def _debayer_block_mean(mono: np.ndarray, pattern: str) -> np.ndarray:
-    """Quick-look-only demosaic: averages each 2x2 Bayer tile into one RGB
-    pixel (half resolution in each dimension) instead of leaving a raw OSC
-    sub looking like grainy grayscale noise. Same "block-mean over a
-    multiple-of-2 tile acts as a free rough debayer" trick already used in
-    app/framestats.py for analysis speed — not photometric quality, but
-    plenty for a review thumbnail or a click-to-inspect preview.
+def _convolve3x3(img: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    """3x3 convolution via shifted-slice addition — avoids adding scipy as
+    a dependency just for this. Edge-padded so the border pixels get a
+    (slightly duplicated-edge) answer instead of shrinking the output.
+    """
+    h, w = img.shape
+    padded = np.pad(img, 1, mode="edge")
+    out = np.zeros_like(img)
+    for ky in range(3):
+        for kx in range(3):
+            weight = kernel[ky, kx]
+            if weight:
+                out += weight * padded[ky : ky + h, kx : kx + w]
+    return out
+
+
+def _debayer_bilinear(mono: np.ndarray, pattern: str) -> np.ndarray:
+    """Full-resolution bilinear Bayer demosaic — each missing sample in a
+    channel is the (weighted) average of its nearest real neighbors of
+    that same channel, the standard approach for a Bayer CFA. Replaces an
+    earlier 2x2-block-average version that also halved resolution as a
+    side effect; this is real, if not the most sophisticated (AHD etc.
+    would do better at color-edge artifacts), demosaicing rather than a
+    quick-look approximation. R and B sit on a lattice sampled every
+    other row AND column, so each real sample's nearest same-channel
+    neighbors are its 4 diagonal corners (weight 1 each) plus the 2
+    orthogonal ones that fall on the same row/col of a DIFFERENT tile —
+    net kernel [[1,2,1],[2,4,2],[1,2,1]]/4, verified against real Bayer
+    tile positions. G sits on the other, denser checkerboard (every other
+    pixel counting both row and column together): a missing G's 4
+    orthogonal neighbors are always real G samples, kernel
+    [[0,1,0],[1,4,1],[0,1,0]]/4. Both kernels reduce to the identity at an
+    actual sample of that channel (verified: center weight 4, all other
+    in-window taps land on non-that-channel positions in the sparse
+    per-channel array, i.e. zero).
     """
     (ry, rx), (g1y, g1x), (by, bx), (g2y, g2x) = _BAYER_OFFSETS.get(pattern.upper(), _BAYER_OFFSETS["RGGB"])
     h, w = mono.shape
-    mono = mono[: h - h % 2, : w - w % 2]
-    r = mono[ry::2, rx::2]
-    g = (mono[g1y::2, g1x::2].astype(np.float32) + mono[g2y::2, g2x::2].astype(np.float32)) / 2.0
-    b = mono[by::2, bx::2]
+    mono = mono[: h - h % 2, : w - w % 2].astype(np.float32)
+    h, w = mono.shape
+
+    def sparse_channel(y0: int, x0: int) -> np.ndarray:
+        out = np.zeros((h, w), dtype=np.float32)
+        out[y0::2, x0::2] = mono[y0::2, x0::2]
+        return out
+
+    rb_kernel = np.array([[1, 2, 1], [2, 4, 2], [1, 2, 1]], dtype=np.float32) / 4.0
+    g_kernel = np.array([[0, 1, 0], [1, 4, 1], [0, 1, 0]], dtype=np.float32) / 4.0
+
+    r = _convolve3x3(sparse_channel(ry, rx), rb_kernel)
+    b = _convolve3x3(sparse_channel(by, bx), rb_kernel)
+    g_sparse = sparse_channel(g1y, g1x)
+    g_sparse[g2y::2, g2x::2] = mono[g2y::2, g2x::2]
+    g = _convolve3x3(g_sparse, g_kernel)
     return np.stack([r, g, b], axis=-1)
 
 
@@ -90,7 +130,7 @@ def render_preview_png(
         # grayscale noise. BAYERPAT is written by ASIAIR/typical capture
         # software; RGGB is the overwhelmingly common default if absent.
         pattern = str(header.get("BAYERPAT", "RGGB")).strip()
-        rgb = _debayer_block_mean(data, pattern)
+        rgb = _debayer_bilinear(data, pattern)
         h, w = rgb.shape[:2]
     else:
         # Raw OSC subs are single-plane Bayer mosaics — no color info to

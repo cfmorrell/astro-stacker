@@ -268,6 +268,14 @@ def create_python_job(
     """
     job_id = uuid.uuid4().hex[:12]
     log_path = log_dir / f"{job_id}.log"
+    # siril_runner.run_script() does this itself for the Siril-based job
+    # types (create_job/create_multi_script_job) - this path has no
+    # subprocess to do it for us, so a project that goes straight from
+    # Stage to Review without ever building masters first (logs/ only
+    # ever gets created as a side effect of a Siril run) crashed here
+    # with a bare "No such file or directory" the first time /lights/
+    # analyze/run tried to open its log file.
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     job = Job(id=job_id, workdir=workdir or log_dir, log_path=log_path)
     with _registry_lock:
         _jobs[job_id] = job

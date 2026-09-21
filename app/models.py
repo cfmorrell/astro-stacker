@@ -203,8 +203,12 @@ class StageProjectRequest(BaseModel):
     stages its own lights+flats at raw/nights/<name>/{lights,flats}.
     """
 
-    biases_dir: Optional[str] = "biases"  # relative to CAPTURES_DIR; None = skip staging biases
-    darks_dir: Optional[str] = "darks"  # relative to CAPTURES_DIR; None = skip staging darks
+    # Deliberately no default folder name (e.g. "biases") to assume — once
+    # CAPTURES_DIR points at a whole, less tidily organized astrophotos
+    # library rather than a dedicated per-project folder, "biases"/"darks"
+    # subfolders won't reliably exist at all. None = skip staging that one.
+    biases_dir: Optional[str] = None  # relative to CAPTURES_DIR
+    darks_dir: Optional[str] = None  # relative to CAPTURES_DIR
     nights: list[NightSource] = Field(default_factory=list)
     is_osc: Optional[bool] = None  # None = leave any previously-recorded setting alone; see app/config.py's project meta
 
