@@ -9,6 +9,7 @@ spirit to Siril's own OSC Multi-Night Stacking tool. See Handoff.md.
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -52,6 +53,21 @@ def list_projects():
     if not config.PROJECTS_DIR.is_dir():
         return {"projects": []}
     return {"projects": sorted(p.name for p in config.PROJECTS_DIR.iterdir() if p.is_dir())}
+
+
+@app.delete("/projects/{name}")
+def delete_project(name: str):
+    """Permanently remove a project's entire directory — staged raw/
+    symlinks, built masters, review data, and any stacked result. Safe to
+    call even though raw/ is full of symlinks into CAPTURES_DIR:
+    shutil.rmtree() never follows a symlink into its target, it just
+    unlinks the symlink itself, so CAPTURES_DIR (read-only, shared across
+    projects) is never touched. Irreversible; the frontend gates this
+    behind a confirmation that requires typing the project name.
+    """
+    project = _project_or_404(name)
+    shutil.rmtree(project)
+    return {"deleted": name}
 
 
 @app.get("/projects/{name}/status")
