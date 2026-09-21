@@ -33,10 +33,24 @@ _STRETCH_MODES = ("none", "linked", "unlinked")
 # (R, G1, B, G2) sample offsets within a 2x2 Bayer tile, keyed by the FITS
 # BAYERPAT convention (top-left pixel first, reading left-to-right).
 _BAYER_OFFSETS = {
-    "RGGB": ((0, 0), (0, 1), (1, 0), (1, 1)),
-    "BGGR": ((1, 1), (0, 1), (1, 0), (0, 0)),
-    "GRBG": ((0, 1), (0, 0), (1, 1), (1, 0)),
-    "GBRG": ((1, 0), (0, 0), (1, 1), (0, 1)),
+    # A real, previously-undiscovered bug lived here: B and G2 were
+    # transposed in every pattern (e.g. RGGB listed (1,0) as B and (1,1)
+    # as G2, but the actual RGGB tile - reading the name literally,
+    # row-major - is R(0,0) G(0,1) G(1,0) B(1,1), so (1,0) is a second G
+    # and (1,1) is B). _debayer_block_mean's "B" output was actually
+    # averaging real G with real B for its "G" channel and outputting
+    # pure G for "B" - a real, structural color error, not a stretch or
+    # rendering issue, present since debayering was first added. Caught
+    # while chasing an unrelated checkerboard artifact: comparing the
+    # demosaiced G channel against the raw mosaic's actual G1/G2 means
+    # (0.586 vs 0.587 - correctly close) showed the code's own internal
+    # G1/G2 split had a ~3x difference, which only makes sense if one of
+    # "G1"/"G2" was actually reading true B data. Confirmed against the
+    # positions by hand for all four patterns below.
+    "RGGB": ((0, 0), (0, 1), (1, 1), (1, 0)),
+    "BGGR": ((1, 1), (0, 1), (0, 0), (1, 0)),
+    "GRBG": ((0, 1), (0, 0), (1, 0), (1, 1)),
+    "GBRG": ((1, 0), (0, 0), (0, 1), (1, 1)),
 }
 
 
@@ -97,6 +111,21 @@ def _debayer_bilinear(mono: np.ndarray, pattern: str) -> np.ndarray:
     return np.stack([r, g, b], axis=-1)
 
 
+def _block_average(arr: np.ndarray, stride: int) -> np.ndarray:
+    """Downsample by averaging each stride x stride block, not by picking
+    one pixel per block (rgb[::stride, ::stride]) - the latter has no
+    anti-aliasing and visibly artifacts on any image with fine per-pixel
+    structure. Works on both a 2D mono array and an (H, W, 3) RGB one.
+    """
+    if arr.ndim == 2:
+        h, w = arr.shape
+        h2, w2 = h - h % stride, w - w % stride
+        return arr[:h2, :w2].reshape(h2 // stride, stride, w2 // stride, stride).mean(axis=(1, 3))
+    h, w, c = arr.shape
+    h2, w2 = h - h % stride, w - w % stride
+    return arr[:h2, :w2, :].reshape(h2 // stride, stride, w2 // stride, stride, c).mean(axis=(1, 3))
+
+
 def _apply_stretch(arr: np.ndarray, mode: str) -> np.ndarray:
     interval = PercentileInterval(99.5)
     if mode == "none":
@@ -138,18 +167,31 @@ def render_preview_png(
         rgb = data
         h, w = rgb.shape
 
-    # Downsample via simple striding BEFORE the percentile/stretch
-    # computation, not just via PIL's thumbnail() at the end — for a
-    # small review-grid thumbnail (a dozen of these load at once, see
-    # app/static/), that's the difference between running numpy stats
-    # over the full ~26M pixels vs roughly the ~1M we actually asked to
-    # see. Confirmed this mattered in practice: with 11 frame cards
-    # requesting full-resolution decodes, only ~7 finished loading within
-    # 8s in the browser; this is a real latency fix, not premature
-    # optimization. Fine for a quick-look preview (not photometry).
+    # Downsample BEFORE the percentile/stretch computation, not just via
+    # PIL's thumbnail() at the end — for a small review-grid thumbnail (a
+    # dozen of these load at once, see app/static/), that's the
+    # difference between running numpy stats over the full ~26M pixels vs
+    # roughly the ~1M we actually asked to see. Confirmed this mattered in
+    # practice: with 11 frame cards requesting full-resolution decodes,
+    # only ~7 finished loading within 8s in the browser; this is a real
+    # latency fix, not premature optimization. Fine for a quick-look
+    # preview (not photometry).
+    #
+    # Block-AVERAGE the stride factor, not naive strided picking
+    # (rgb[::stride, ::stride]): decimating without an anti-aliasing
+    # filter aliases any per-pixel-scale structure into visible artifacts
+    # at thumbnail size — confirmed the hard way once _debayer_bilinear
+    # replaced the old block-mean debayer (which had accidentally been
+    # doing this same averaging as a side effect of halving resolution).
+    # Symptoms were a checkerboard/moire pattern on master flat thumbnails
+    # (flats have strong fine-scale dust/vignetting texture) and a
+    # turquoise color cast on review light thumbnails (color-channel
+    # aliasing skewing the apparent average color). Reshaping into
+    # stride x stride blocks and averaging is the standard fix and isn't
+    # meaningfully slower than the naive version.
     stride = max(1, -(-max(h, w) // max_size)) if max_size else 1
     if stride > 1:
-        rgb = rgb[::stride, ::stride] if rgb.ndim == 2 else rgb[::stride, ::stride, :]
+        rgb = _block_average(rgb, stride)
 
     if rgb.ndim == 3 and stretch == "unlinked":
         # Per-channel: each gets its own percentile+asinh curve, i.e. its

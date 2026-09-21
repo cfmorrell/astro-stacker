@@ -227,7 +227,19 @@ def _render_steps_text(steps: list[ssf.SirilStep]) -> str:
     return "\n".join(parts)
 
 
-def _run_steps(steps: list[ssf.SirilStep], project: Path) -> dict:
+def _reject_if_job_running(name: str) -> None:
+    """A second /masters/run or /stack/run against a project that already
+    has one in flight (from this client, another browser tab, or a raw
+    Swagger/curl call) races on the same scratch directories and can 500
+    (Handoff.md's Frontend/web gotcha #4). The frontend disabling its own
+    Run button only prevents that from *this* tab; this closes the gap
+    server-side, for any client.
+    """
+    if jobs.has_running_job(name):
+        raise HTTPException(status_code=409, detail=f"a job is already running for project {name!r}")
+
+
+def _run_steps(steps: list[ssf.SirilStep], project: Path, name: str, kind: str) -> dict:
     """Wipe each step's fresh_dir, wire up its move (if any), and hand the
     whole list to jobs.create_multi_script_job() — one subprocess per
     step, in order (Handoff.md gotcha #8).
@@ -242,7 +254,7 @@ def _run_steps(steps: list[ssf.SirilStep], project: Path) -> dict:
         )
         for s in steps
     ]
-    job = jobs.create_multi_script_job(job_steps, project / "logs")
+    job = jobs.create_multi_script_job(job_steps, project / "logs", project=name, kind=kind)
     return {"job_id": job.id}
 
 
@@ -259,11 +271,12 @@ def render_masters(name: str, req: BuildMastersRequest):
 @app.post("/projects/{name}/masters/run")
 def run_masters(name: str, req: BuildMastersRequest):
     project = _project_or_404(name)
+    _reject_if_job_running(name)
     try:
         steps = ssf.render_build_masters(project, req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _run_steps(steps, project)
+    return _run_steps(steps, project, name, "masters")
 
 
 @app.post("/projects/{name}/stack/render", response_class=PlainTextResponse)
@@ -279,12 +292,13 @@ def render_stack(name: str, req: StackLightsRequest):
 @app.post("/projects/{name}/stack/run")
 def run_stack(name: str, req: StackLightsRequest):
     project = _project_or_404(name)
+    _reject_if_job_running(name)
     try:
         steps, _nights, selections = ssf.render_stack_lights(project, req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     ssf.apply_light_selections(selections)
-    return _run_steps(steps, project)
+    return _run_steps(steps, project, name, "stack")
 
 
 @app.post("/projects/{name}/lights/analyze/render")
@@ -350,8 +364,19 @@ def run_analyze(name: str, req: AnalyzeLightsRequest):
             result["nights"][target.key] = [s.__dict__ for s in night_stats]
         return result
 
-    job = jobs.create_python_job(work, project / "logs", workdir=project)
+    job = jobs.create_python_job(work, project / "logs", workdir=project, project=name, kind="analyze")
     return {"job_id": job.id}
+
+
+@app.get("/projects/{name}/jobs")
+def list_jobs(name: str):
+    """All jobs run for this project since the server last started
+    (in-memory only, see app/jobs.py), newest first — backs the frontend's
+    job history panel and its cross-tab "is anything running right now"
+    polling.
+    """
+    _project_or_404(name)
+    return {"jobs": [j.snapshot() for j in jobs.list_jobs(name)]}
 
 
 @app.get("/jobs/{job_id}")

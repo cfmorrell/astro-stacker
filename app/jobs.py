@@ -67,12 +67,21 @@ class Job:
     # single-script jobs (create_job()/create_python_job()).
     steps: list = field(default_factory=list)
     current_step_index: Optional[int] = None
+    # Which project this job belongs to and what kind of run it is
+    # ("masters"/"stack"/"analyze") - added for job history and cross-tab
+    # awareness (see has_running_job()/list_jobs() below). Not used by
+    # anything that predates that (this dataclass field has a default so
+    # existing call sites that don't pass it keep working).
+    project: str = ""
+    kind: str = ""
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def snapshot(self) -> dict:
         with self._lock:
             return {
                 "id": self.id,
+                "project": self.project,
+                "kind": self.kind,
                 "status": self.status,
                 "return_code": self.return_code,
                 "started_at": self.started_at,
@@ -91,11 +100,36 @@ _jobs: Dict[str, Job] = {}
 _registry_lock = threading.Lock()
 
 
+def has_running_job(project: str) -> bool:
+    """True if some job for this project (started from any client - this
+    tab, another tab, or a raw API call) is currently running. Used to
+    reject a second /masters/run or /stack/run against the same project
+    before it can race with the first on shared scratch directories (see
+    Handoff.md's Frontend/web gotcha #4) — a server-side close of that
+    gap, not just the frontend's own same-tab button-disabling.
+    """
+    with _registry_lock:
+        return any(j.project == project and j.status == "running" for j in _jobs.values())
+
+
+def list_jobs(project: str) -> list[Job]:
+    """All known jobs for a project, newest-started first. Only reflects
+    jobs this server process has run since it last started (in-memory,
+    not persisted) - a restart clears history same as it already clears
+    everything else in _jobs.
+    """
+    with _registry_lock:
+        jobs = [j for j in _jobs.values() if j.project == project]
+    return sorted(jobs, key=lambda j: j.started_at or 0, reverse=True)
+
+
 def create_job(
     script_text: str,
     workdir: Path,
     log_dir: Path,
     on_success: Optional[Callable[[], dict]] = None,
+    project: str = "",
+    kind: str = "",
 ) -> Job:
     """Run script_text via siril-cli in a background thread.
 
@@ -107,7 +141,7 @@ def create_job(
     """
     job_id = uuid.uuid4().hex[:12]
     log_path = log_dir / f"{job_id}.log"
-    job = Job(id=job_id, workdir=workdir, log_path=log_path)
+    job = Job(id=job_id, workdir=workdir, log_path=log_path, project=project, kind=kind)
     with _registry_lock:
         _jobs[job_id] = job
 
@@ -176,6 +210,8 @@ def create_multi_script_job(
     steps: list[ScriptStep],
     log_dir: Path,
     on_all_success: Optional[Callable[[], dict]] = None,
+    project: str = "",
+    kind: str = "",
 ) -> Job:
     """Run several independent siril-cli invocations in order, each its own
     subprocess (see module docstring — this is the gotcha #8 fix). All
@@ -190,6 +226,8 @@ def create_multi_script_job(
         workdir=steps[0].workdir if steps else log_dir,
         log_path=log_path,
         steps=[s.label for s in steps],
+        project=project,
+        kind=kind,
     )
     with _registry_lock:
         _jobs[job_id] = job
@@ -258,6 +296,8 @@ def create_python_job(
     work: Callable[[Callable[[float, str], None]], dict],
     log_dir: Path,
     workdir: Optional[Path] = None,
+    project: str = "",
+    kind: str = "",
 ) -> Job:
     """Run an arbitrary Python callable in a background thread instead of
     siril-cli. `work(progress)` does the actual computation, calling
@@ -276,7 +316,7 @@ def create_python_job(
     # with a bare "No such file or directory" the first time /lights/
     # analyze/run tried to open its log file.
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    job = Job(id=job_id, workdir=workdir or log_dir, log_path=log_path)
+    job = Job(id=job_id, workdir=workdir or log_dir, log_path=log_path, project=project, kind=kind)
     with _registry_lock:
         _jobs[job_id] = job
 
