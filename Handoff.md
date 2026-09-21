@@ -43,10 +43,14 @@ post-processing elsewhere.
   validated and does real geometric-transform/stacking work not worth
   reimplementing.
 - No file-browser UI for v1 — typed directory paths. **Superseded
-  2026-09-2x**: `/captures/browse` + the frontend's Stage section now
-  give a basic folder picker (no breadcrumbs yet — see Immediate next
-  steps). Still wanted eventually: pulling lights/flats from a telescope
-  controller, darks/biases from a server, and archiving files once done.
+  2026-09-2x**: `/captures/browse` (Stage's folder pickers) and
+  `/projects/{name}/browse` (Stack's master-override file pickers) give
+  basic pickers now, and every directory/file field in the frontend is
+  `readonly` — a picker button is the only way to set them, no typed
+  paths anywhere anymore (no breadcrumbs in either picker yet — see
+  Immediate next steps). Still wanted eventually: pulling lights/flats
+  from a telescope controller, darks/biases from a server, and archiving
+  files once done.
 - **Frontend: plain HTML/CSS/JS in `app/static/`, no build step, no
   framework** (settled 2026-09-2x). Chris asked for astrolab's dark
   card-based *styling* but this project's own *functionality* — closer to
@@ -101,7 +105,14 @@ post-processing elsewhere.
   ramp and a subtler elevated-background frame) before this was built —
   see "Current validated status." Don't replace this with fixed
   thresholds later without a specific reason; it would contradict this
-  direction and the "recommend, don't auto-filter" one above.
+  direction and the "recommend, don't auto-filter" one above. **The
+  z-score threshold itself is tunable** (`anomaly_sigma`, default 3.0 —
+  Chris asked "is 4.69 really that much worse than 4.62 for FWHM?"), and
+  the frontend recomputes which frames count as flagged client-side from
+  the z-scores it already has (`isFrameFlagged()` in `app.js`) so a
+  slider drag re-colors instantly with no re-analyze round trip — this is
+  still the same relative-to-the-night's-own-data z-score, just a
+  user-adjustable cutoff on it, not a step back toward a fixed number.
 - **`/lights/analyze` uses astropy+photutils directly, not Siril**
   (settled 2026-09-2x). Cause: a real, confirmed performance cliff running
   multiple sequences in one Siril session (gotcha #8) — identical
@@ -168,11 +179,16 @@ post-processing elsewhere.
   plane trail. This directly informed `flag_anomalies()`'s design
   (per-metric, relative-to-the-sequence flagging — see Architecture
   decisions) and confirmed the "7 flagged" in the screenshot lines up with
-  a real 7-frame dawn-twilight ramp in the actual capture data. Still not
-  replicated: the visual blink-comparator itself (no image preview
-  generation exists yet — see Immediate next steps) or SNR-panel-style
-  spatial background maps (`app/framestats.py` uses a single global
-  background/std per frame, not `Background2D`'s 2D map).
+  a real 7-frame dawn-twilight ramp in the actual capture data. Image
+  preview generation now exists and then some (thumbnails, a zoom/pan
+  lightbox, prev/next frame navigation — see "Current validated status"),
+  but it's still one-at-a-time, not astropup's actual two-up side-by-side
+  "blink" comparator (flip rapidly between two specific frames to spot a
+  difference like a satellite trail) — nobody's asked for that specific
+  interaction since, so it's not planned, just noted as the one thing
+  from this reference that isn't replicated. Also still not replicated:
+  SNR-panel-style spatial background maps (`app/framestats.py` uses a
+  single global background/std per frame, not `Background2D`'s 2D map).
 - **Siril's `.seq` registration-data format** (undocumented anywhere
   found — reverse-engineered from real output): after `register`, a `R<layer>`
   line per frame holds `fwhm wfwhm roundness quality background nb_stars`,
@@ -511,61 +527,6 @@ Siril ones, but the same "don't rediscover this" spirit applies.
   verified via the same headless-Chrome CDP approach; the delete flow was
   checked against disk (`ls` before/after), the stack-method bug against
   three real successive stacks, not just one.
-- ✅ **Frontend redesigned per Chris's 19-item live-usage feedback and
-  re-validated end-to-end (2026-09-2x)**, superseding the first-version
-  frontend described below. Chris used the first version, listed 19
-  specific issues in one message, and all 19 were addressed in this pass:
-  1) new indigo/blue/amber/green/red palette (no longer visually an
-  astrolab reskin — kept its dark theme); 2) a clickable step-wizard
-  (`#stepper` in `index.html`, driven by `renderStepper()`/`stepStatus()`
-  in `app.js`) showing Stage/Masters/Review/Stack, with only the active
-  step's panel visible, checkmarks on completed steps, and disabled
-  (unclickable) steps whose prerequisites aren't met yet; 3) an ellipsis
-  (`…`) folder-browse button on the biases/darks dir fields, reusing the
-  same picker built for staging's night rows; 4) sessions are auto-
-  numbered ("Session 1", "Session 2", ...) with no name field exposed —
-  internally still staged as `night1`/`night2`; 5) the stage result
-  renders as a clean checkmarked list (`.stage-summary`), not raw JSON;
-  6) masters' status/log display kept as-is (Chris confirmed it was
-  already right); 7) "Preview script" is now a single arrow-toggle button
-  (▾/▴) that shows/hides the script inline, replacing the old separate
-  show/hide links; 8) a green `.complete-banner`/red `.error-banner`
-  makes step completion or failure unambiguous everywhere a job finishes;
-  9) clicking a review thumbnail opens a full-size lightbox
-  (`#lightbox` overlay); 10) frame cards show `DATE-OBS` (via
-  `framestats.py`'s new `captured_at` field) and the backend now sorts
-  each night's frames chronologically before returning them, since bad
-  frames cluster in time (clouds, dusk/dawn); 11) flagged vs. clean is
-  now unambiguous green/red (frame-card left border, metric bars, badge)
-  instead of the old teal/orange; 12) a "↻ Re-analyze survivors" button
-  re-runs `/lights/analyze/run` with the current exclusions already
-  applied; 13) FWHM and eccentricity (`roundness`) are now shown per
-  frame alongside star count and SNR; 14) a `.help-box` explains bin
-  factor (with an explicit warning about the precision/speed tradeoff)
-  and threshold sigma; 15) an "Accept exclusions — show survivors only"
-  toggle filters the review grid down to what will actually reach Stack;
-  16) nights over 20 frames collapse to flagged frames ± 2 chronological
-  neighbors, with the hidden runs shown as a clickable "⋯ N more" tile
-  that expands in place (`computeVisibleItems()` in `app.js`) — logic
-  reviewed carefully but **not exercised against real data**, since no
-  test project currently has a night that large; 17) the Stack section
-  shows a live pipeline diagram (`#stack-pipeline`, driven by the job's
-  new `steps`/`current_step_index` fields — see `app/jobs.py`) alongside
-  the percent bar; 18) a none/linked/unlinked stretch-mode toggle on the
-  final stack preview (`app/imaging.py`'s `render_preview_png(...,
-  stretch=...)`, backed by `AsinhStretch`+`PercentileInterval`); 19) a
-  working download button (`GET /projects/{name}/download`) for the
-  full-resolution `.fit`, verified to return the correct
-  `content-disposition`/`content-length` and actual file bytes. All of
-  this (except item 16, per above) was driven through a real, scripted
-  headless-Chrome session against `multi1`'s real two-night data and a
-  disposable clone project (`uitest`, since deleted) — including running
-  a real ~185s two-night stack to completion and confirming the download
-  actually serves the resulting 313MB `result.fit`. This session's
-  testing also found and fixed a real bug — see Frontend/web gotcha #4
-  (concurrent-run race) — and ruled out a false alarm — gotcha #5
-  (HEAD requests 404 globally in this environment; irrelevant to real
-  browser downloads, which use GET).
 - ✅ **Second round of frontend polish per 18 more items of live-usage
   feedback, re-validated end-to-end (2026-09-2x)**: 1) Stage's biases/
   darks/lights/flats inputs are now `readonly` — folders can only be
@@ -637,6 +598,63 @@ Siril ones, but the same "don't rediscover this" spirit applies.
   coincidentally collide between two different projects — a project
   switch now explicitly resets it. Verified end-to-end via the same
   headless-Chrome CDP approach against `multi1`'s real two-night data.
+- ✅ **Frontend redesigned per Chris's 19-item live-usage feedback and
+  re-validated end-to-end (2026-09-2x)**, superseding the first-version
+  frontend described below — chronologically the FIRST of these
+  redesign/polish rounds (the "second round," directly above, followed
+  it). Chris used the first version, listed 19 specific issues in one
+  message, and all 19 were addressed in this pass:
+  1) new indigo/blue/amber/green/red palette (no longer visually an
+  astrolab reskin — kept its dark theme); 2) a clickable step-wizard
+  (`#stepper` in `index.html`, driven by `renderStepper()`/`stepStatus()`
+  in `app.js`) showing Stage/Masters/Review/Stack, with only the active
+  step's panel visible, checkmarks on completed steps, and disabled
+  (unclickable) steps whose prerequisites aren't met yet; 3) an ellipsis
+  (`…`) folder-browse button on the biases/darks dir fields, reusing the
+  same picker built for staging's night rows; 4) sessions are auto-
+  numbered ("Session 1", "Session 2", ...) with no name field exposed —
+  internally still staged as `night1`/`night2`; 5) the stage result
+  renders as a clean checkmarked list (`.stage-summary`), not raw JSON;
+  6) masters' status/log display kept as-is (Chris confirmed it was
+  already right); 7) "Preview script" is now a single arrow-toggle button
+  (▾/▴) that shows/hides the script inline, replacing the old separate
+  show/hide links; 8) a green `.complete-banner`/red `.error-banner`
+  makes step completion or failure unambiguous everywhere a job finishes;
+  9) clicking a review thumbnail opens a full-size lightbox
+  (`#lightbox` overlay); 10) frame cards show `DATE-OBS` (via
+  `framestats.py`'s new `captured_at` field) and the backend now sorts
+  each night's frames chronologically before returning them, since bad
+  frames cluster in time (clouds, dusk/dawn); 11) flagged vs. clean is
+  now unambiguous green/red (frame-card left border, metric bars, badge)
+  instead of the old teal/orange; 12) a "↻ Re-analyze survivors" button
+  re-runs `/lights/analyze/run` with the current exclusions already
+  applied; 13) FWHM and eccentricity (`roundness`) are now shown per
+  frame alongside star count and SNR; 14) a `.help-box` explains bin
+  factor (with an explicit warning about the precision/speed tradeoff)
+  and threshold sigma; 15) an "Accept exclusions — show survivors only"
+  toggle filters the review grid down to what will actually reach Stack;
+  16) nights over 20 frames collapse to flagged frames ± 2 chronological
+  neighbors, with the hidden runs shown as a clickable "⋯ N more" tile
+  that expands in place (`computeVisibleItems()` in `app.js`) — logic
+  reviewed carefully but **not exercised against real data**, since no
+  test project currently has a night that large; 17) the Stack section
+  shows a live pipeline diagram (`#stack-pipeline`, driven by the job's
+  new `steps`/`current_step_index` fields — see `app/jobs.py`) alongside
+  the percent bar; 18) a none/linked/unlinked stretch-mode toggle on the
+  final stack preview (`app/imaging.py`'s `render_preview_png(...,
+  stretch=...)`, backed by `AsinhStretch`+`PercentileInterval`); 19) a
+  working download button (`GET /projects/{name}/download`) for the
+  full-resolution `.fit`, verified to return the correct
+  `content-disposition`/`content-length` and actual file bytes. All of
+  this (except item 16, per above) was driven through a real, scripted
+  headless-Chrome session against `multi1`'s real two-night data and a
+  disposable clone project (`uitest`, since deleted) — including running
+  a real ~185s two-night stack to completion and confirming the download
+  actually serves the resulting 313MB `result.fit`. This session's
+  testing also found and fixed a real bug — see Frontend/web gotcha #4
+  (concurrent-run race) — and ruled out a false alarm — gotcha #5
+  (HEAD requests 404 globally in this environment; irrelevant to real
+  browser downloads, which use GET).
 - ✅ **First-version frontend built and validated end-to-end against real
   data (2026-09-2x)**: `app/static/` (`index.html`/`app.js`/`styles.css`),
   served by FastAPI. Covers the full flow — stage (with a `/captures`
@@ -902,40 +920,43 @@ lights phases, FastAPI render/run + background jobs, progress parsing,
 real multi-night validation, a staging endpoint, frame review/filtering
 (recommend-only, on astropy+photutils, with anomaly-based flagging
 validated against real known-bad frames), both Siril gotcha #6/#8 fixes
-in `/masters/run` and `/stack/run`, a first-version frontend, a full
-redesign addressing 19 items of live-usage feedback, and now an 18-item
-second round of polish on top of that (see "Current validated status"
-for all of it — readonly folder pickers, Next buttons, consistent
-completion badges, renamed steps, OSC debayering, lightbox zoom, local
-time display, a 2x2 metric grid, tunable outlier sensitivity, scroll
-preservation, accept-recommended/start-over, survivor counts, real night
-labels, file-picker master overrides, and a stable non-collapsing stack
-preview). Crop is permanently out of scope (Architecture decisions), not
-deferred. Archive/cleanup is explicitly deferred per Chris, not started.
-What's actually left:
+in `/masters/run` and `/stack/run`, a first-version frontend, and five
+further rounds of live-usage feedback/fixes on top of that (19 items,
+then 18, then 8, then a stale-project-status bug plus whole-project
+delete, then four more small fixes — see "Current validated status" for
+the full list of what each round covered). Crop is permanently out of
+scope (Architecture decisions), not deferred. Archive/cleanup is
+explicitly deferred per Chris, not started. What's actually left:
 
-1. **The redesigned frontend is closer to done but still has real gaps**:
-   no way to *remove* a staged night or re-stage over one that already
-   exists from the UI (the API supports re-running `/stage`, the form
-   just doesn't pre-fill from what's already there); the folder browsers
-   (`/captures/browse` and the new `/projects/{name}/browse`) have no
-   breadcrumb trail, just an "← up" button; no polling/auto-refresh of
-   project status while a job from *another* browser tab or the Swagger
-   UI is running — combined with Frontend/web gotcha #4, two tabs
-   running jobs against the same project at once can still 500; the
-   exclude-frames list is global across nights in one request (matches
-   the API's own semantics, see gotcha-adjacent note in
-   `StackLightsRequest`, but worth a UI hint if it ever causes
-   confusion); no way to browse job history (only the most recently
-   started job's progress is shown per section, nothing persists across
-   a page reload); the large-night collapsing behavior (flagged frames
-   ± 2 neighbors, rest collapsed to an expandable "N more") is
-   implemented but has never been exercised against a real >20-frame
-   night, since no current test project has one — worth a specific look
-   once real data that size exists; the debayer added this round
+1. **The frontend covers the full flow end-to-end now, but real gaps
+   remain**: no way to *remove a single staged night* or re-stage over
+   one that already exists from the UI (the API supports re-running
+   `/stage`, the form just doesn't pre-fill from what's already there) —
+   distinct from whole-*project* deletion, which now exists (`DELETE
+   /projects/{name}` + the "Delete project" button); the folder browsers
+   (`/captures/browse` and `/projects/{name}/browse`) have no breadcrumb
+   trail, just an "← up" button; no polling/auto-refresh of project
+   status while a job from *another* browser tab or the Swagger UI is
+   running — combined with Frontend/web gotcha #4, two tabs running jobs
+   against the same project at once can still 500; the exclude-frames
+   list is global across nights in one request (matches the API's own
+   semantics, see gotcha-adjacent note in `StackLightsRequest`, but worth
+   a UI hint if it ever causes confusion); no way to browse job history
+   (only the most recently started job's progress is shown per section,
+   nothing persists across a page reload); the large-night collapsing
+   behavior (flagged frames ± 2 neighbors, rest collapsed to an
+   expandable "N more") is implemented but has never been exercised
+   against a real >20-frame night, since no current test project has one
+   — worth a specific look once real data that size exists; the debayer
    (`_debayer_block_mean`) is a quick-look 2x2-block demosaic, not a real
    (e.g. bilinear/AHD) one — fine for review, not for anything claiming
-   photometric accuracy. None of these are hard, just not done.
+   photometric accuracy; the review lightbox's prev/next navigation
+   (`app.js`'s `lightboxNav`) captures its frame list by reference at
+   open time — if you toggle survivors-only or exclude the very frame
+   you're looking at while the lightbox is open, the arrows keep
+   navigating the list as it was when you opened it rather than the
+   freshly-filtered one, a minor staleness edge case, not a crash. None
+   of these are hard, just not done.
 2. **No image thumbnails for the *stack* preview's intermediate steps** —
    only the raw lights (Review) and the final `result.fit` (Stack) get
    previews. A real "blink through everything" experience closer to the
@@ -950,4 +971,6 @@ What's actually left:
    override (e.g. "night3 is missing its own flats, reuse night2's" or a
    library entry) rather than one value forced onto every night in the
    request. Not built — flagged, not attempted; the frontend's Stack
-   section only exposes the existing global override for the same reason.
+   section now has a file picker for setting the override (see "Current
+   validated status"), but it's still the same one global value applied
+   to every selected night, not a per-night one.
