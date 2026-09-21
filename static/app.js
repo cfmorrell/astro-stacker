@@ -72,6 +72,17 @@ function nightDisplayLabel(n) {
   return (n && (n.label || n.name)) || "";
 }
 
+function isFrameFlagged(f) {
+  // Computed client-side from the raw per-metric z-scores the server
+  // already returned, rather than trusting the server's own `flagged`
+  // boolean (computed at whatever anomaly_sigma the analyze request
+  // used). z-scores themselves don't change with the threshold, so the
+  // outlier-sensitivity slider can move live with no re-analyze round
+  // trip - matches the server's own "flag if ANY metric crosses it" rule.
+  if (!f.anomaly_z) return false;
+  return Object.values(f.anomaly_z).some((z) => z >= state.lastAnomalySigma);
+}
+
 function setOutcome(el_, ok, msg) {
   // Errors still get a full banner (there's real detail worth reading);
   // success does not — see setStepBadge, which is the "one consistent
@@ -479,9 +490,16 @@ function metricStrip(label, frames, key, subKey, anomalySigma) {
     el("span", {}, [hi.toFixed(2)]),
     el("span", {}, [lo.toFixed(2)]),
   ]);
+  const firstTime = formatCaptured(frames[0].captured_at).time;
+  const lastTime = formatCaptured(frames[frames.length - 1].captured_at).time;
+  const xAxis = el("div", { class: "metric-xaxis" }, [
+    el("span", {}, [firstTime]),
+    el("span", {}, [lastTime]),
+  ]);
+  const barsWrap = el("div", { class: "metric-bars-wrap" }, [bars, xAxis]);
   return el("div", { class: "metric-strip" }, [
     el("div", { class: "metric-label" }, [label]),
-    el("div", { class: "metric-strip-body" }, [axis, bars]),
+    el("div", { class: "metric-strip-body" }, [axis, barsWrap]),
   ]);
 }
 
@@ -527,10 +545,16 @@ document.getElementById("lightbox-scroll").addEventListener("click", (e) => {
 
 function frameCard(night, f) {
   const debayer = state.status && state.status.is_osc ? "&debayer=1" : "";
-  const smallUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(`raw/nights/${night}/lights/${f.filename}`)}&max_size=320${debayer}`;
-  const largeUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(`raw/nights/${night}/lights/${f.filename}`)}&max_size=1600${debayer}`;
+  // Unlinked stretch (each channel gets its own black/white point) rather
+  // than the "linked"/default: raw subs are wildly unbalanced straight
+  // off the sensor (no white balance applied yet), so a linked stretch
+  // left review thumbnails looking like a flat cyan wash - unlinked
+  // actually shows the frame's real content.
+  const previewParams = `&stretch=unlinked${debayer}`;
+  const smallUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(`raw/nights/${night}/lights/${f.filename}`)}&max_size=320${previewParams}`;
+  const largeUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(`raw/nights/${night}/lights/${f.filename}`)}&max_size=1600${previewParams}`;
   const checked = state.excludeFrames.has(f.filename);
-  const card = el("div", { class: `frame-card${f.flagged ? " flagged" : ""}` }, []);
+  const card = el("div", { class: `frame-card${isFrameFlagged(f) ? " flagged" : ""}` }, []);
   const { date, time } = formatCaptured(f.captured_at);
   // Not loading="lazy": the frame strip scrolls horizontally, and lazy
   // loading only fires once an image nears the *viewport*, not the
@@ -557,7 +581,7 @@ function frameCard(night, f) {
     stats.appendChild(el("b", { class: isAnom ? "anom" : "" }, [String(v)]));
   }
   meta.appendChild(stats);
-  if (f.flagged) meta.appendChild(el("div", { class: "badge danger", style: "margin-top:6px;" }, ["flagged"]));
+  if (isFrameFlagged(f)) meta.appendChild(el("div", { class: "badge danger", style: "margin-top:6px;" }, ["flagged"]));
   const excludeRow = el("label", { class: "frame-exclude" }, [
     el("input", {
       type: "checkbox", checked: checked ? "checked" : null,
@@ -589,7 +613,7 @@ function computeVisibleItems(night, frames) {
   const expanded = state.expandedGroups[night] || new Set();
   const showIndex = new Set();
   frames.forEach((f, i) => {
-    if (f.flagged) {
+    if (isFrameFlagged(f)) {
       for (let d = -2; d <= 2; d++) {
         const j = i + d;
         if (j >= 0 && j < frames.length) showIndex.add(j);
@@ -619,15 +643,27 @@ function computeVisibleItems(night, frames) {
 
 function renderAnalyzeOutput() {
   const outputEl = document.getElementById("analyze-output");
+  // Every re-render (e.g. toggling one exclude checkbox) throws away and
+  // rebuilds each night's .frame-strip from scratch, and a freshly
+  // created element always starts at scrollLeft 0 - which was silently
+  // snapping the horizontally-scrolling strip back to its start on every
+  // single click. Capture each night's current scroll position before
+  // tearing it down, keyed by night so it survives even though the DOM
+  // node itself doesn't.
+  const prevScrollLeft = {};
+  outputEl.querySelectorAll(".night-block").forEach((block) => {
+    const strip = block.querySelector(".frame-strip");
+    if (block.dataset.night && strip) prevScrollLeft[block.dataset.night] = strip.scrollLeft;
+  });
   outputEl.innerHTML = "";
   if (!state.lastAnalyzeResult) return;
 
   for (const [night, allFrames] of Object.entries(state.lastAnalyzeResult.nights)) {
     const frames = state.showSurvivorsOnly ? allFrames.filter((f) => !state.excludeFrames.has(f.filename)) : allFrames;
-    const flaggedCount = allFrames.filter((f) => f.flagged).length;
+    const flaggedCount = allFrames.filter((f) => isFrameFlagged(f)).length;
     const excludedCount = allFrames.filter((f) => state.excludeFrames.has(f.filename)).length;
 
-    const block = el("div", { class: "night-block" }, []);
+    const block = el("div", { class: "night-block", "data-night": night }, []);
     block.appendChild(el("h4", {}, [
       `${night} — ${allFrames.length} frames, ${flaggedCount} flagged` + (excludedCount ? `, ${excludedCount} excluded` : ""),
     ]));
@@ -660,6 +696,7 @@ function renderAnalyzeOutput() {
     }
     block.appendChild(strip);
     outputEl.appendChild(block);
+    if (prevScrollLeft[night] !== undefined) strip.scrollLeft = prevScrollLeft[night];
   }
 
   if (state.excludeFrames.size > 0) {
@@ -683,7 +720,7 @@ function renderAnalyzeOutput() {
 
   const anyUnacceptedFlags = Object.values(state.lastAnalyzeResult.nights)
     .flat()
-    .some((f) => f.flagged && !state.excludeFrames.has(f.filename));
+    .some((f) => isFrameFlagged(f) && !state.excludeFrames.has(f.filename));
   document.getElementById("analyze-actions").style.display = anyUnacceptedFlags ? "block" : "none";
 
   refreshStackNightsChecklist();
@@ -735,11 +772,22 @@ async function runAnalyze() {
 document.getElementById("analyze-run-btn").addEventListener("click", runAnalyze);
 document.getElementById("analyze-rerun-btn").addEventListener("click", runAnalyze);
 
+document.getElementById("analyze-anomaly-sigma").addEventListener("input", (e) => {
+  const v = parseFloat(e.target.value) || 3.0;
+  document.getElementById("anomaly-sigma-value").textContent = v.toFixed(1);
+  state.lastAnomalySigma = v;
+  // Flagging is derived client-side from the per-frame z-scores already
+  // in hand (isFrameFlagged()), so dragging this slider re-colors
+  // everything immediately with no server round trip - it only matters
+  // once there's a result to re-color.
+  if (state.lastAnalyzeResult) renderAnalyzeOutput();
+});
+
 document.getElementById("analyze-accept-recommended-btn").addEventListener("click", () => {
   if (!state.lastAnalyzeResult) return;
   for (const frames of Object.values(state.lastAnalyzeResult.nights)) {
     for (const f of frames) {
-      if (f.flagged) state.excludeFrames.add(f.filename);
+      if (isFrameFlagged(f)) state.excludeFrames.add(f.filename);
     }
   }
   refreshExcludeDisplay();
@@ -781,7 +829,7 @@ function stackBody() {
       sigma_low: parseFloat(document.getElementById("stack-sigma-low").value) || 3.0,
       sigma_high: parseFloat(document.getElementById("stack-sigma-high").value) || 3.0,
     },
-    is_osc: document.getElementById("stack-is-osc").checked,
+    is_osc: state.status ? state.status.is_osc !== false : true,
     exclude_frames: Array.from(state.excludeFrames),
   };
   const dark = document.getElementById("stack-master-dark").value.trim();
@@ -804,7 +852,16 @@ document.getElementById("stack-run-btn").addEventListener("click", async () => {
   const previewEl = document.getElementById("stack-preview");
   resultEl.innerHTML = "";
   resultEl.appendChild(el("div", { class: "status-line" }, ["starting…"]));
+  // Also clear builtFor, not just the DOM: showStackPreview() skips
+  // rebuilding whenever the result path matches what it already built -
+  // a correct optimization for the stretch-mode buttons, but back-to-back
+  // stack runs (e.g. rejection, then max, then median) all write to the
+  // SAME path, so without this reset showStackPreview() would see "same
+  // path, nothing to do" after the job finishes and leave this now-empty
+  // element blank forever - confirmed this is exactly what happened
+  // testing successive runs with different stack methods.
   previewEl.innerHTML = "";
+  previewEl.dataset.builtFor = "";
   runBtn.disabled = true;
   try {
     const { job_id } = await api("POST", `/projects/${encodeURIComponent(state.project)}/stack/run`, stackBody());
@@ -832,8 +889,9 @@ function currentResultPath() {
   return state.status.merged_result_path || (state.status.nights.find((n) => n.result_path) || {}).result_path || null;
 }
 
-function stackPreviewUrl(path) {
-  return `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(path)}&stretch=${state.stretchMode}&t=${Date.now()}`;
+function stackPreviewUrl(path, maxSize) {
+  const size = maxSize ? `&max_size=${maxSize}` : "";
+  return `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(path)}&stretch=${state.stretchMode}${size}&t=${Date.now()}`;
 }
 
 function showStackPreview() {
@@ -874,7 +932,10 @@ function showStackPreview() {
       class: "mono",
     }, [el("button", { type: "button" }, ["⬇ Download full-resolution .fit"])]));
     previewEl.appendChild(controls);
-    previewEl.appendChild(el("div", { class: "preview-frame" }, [el("img", { src: stackPreviewUrl(path) }, [])]));
+    previewEl.appendChild(el("div", { class: "preview-frame" }, [el("img", {
+      src: stackPreviewUrl(path),
+      onclick: () => openLightbox(stackPreviewUrl(path, 2400), path.split("/").pop()),
+    }, [])]));
     previewEl.dataset.builtFor = path;
   }
 }
@@ -955,7 +1016,6 @@ async function loadProjectStatus() {
   refreshStackNightsChecklist();
 
   document.getElementById("stage-is-osc").checked = state.status.is_osc !== false;
-  document.getElementById("stack-is-osc").checked = state.status.is_osc !== false;
 
   showStackPreview();
   renderStepper();
@@ -965,6 +1025,7 @@ document.getElementById("project-select").addEventListener("change", async (e) =
   state.project = e.target.value || null;
   document.getElementById("project-panels").style.display = state.project ? "block" : "none";
   document.getElementById("no-project-hint").style.display = state.project ? "none" : "block";
+  document.getElementById("delete-project-btn").style.display = state.project ? "inline-block" : "none";
   mastersSelected.clear();
   analyzeSelected.clear();
   stackSelected.clear();
@@ -1020,6 +1081,31 @@ document.getElementById("create-project-btn").addEventListener("click", async ()
 });
 
 document.getElementById("refresh-status-btn").addEventListener("click", loadProjectStatus);
+
+document.getElementById("delete-project-btn").addEventListener("click", async () => {
+  if (!state.project) return;
+  const name = state.project;
+  // Deletes staged frames, built masters, and any stacked result -
+  // permanent and not something a plain confirm() dialog conveys well
+  // enough. Typing the name back is the same "you have to mean it"
+  // pattern as most destructive-delete UIs.
+  const typed = prompt(`Type the project name "${name}" to permanently delete it and everything in it (staged frames, masters, review data, stacked result). This cannot be undone.`);
+  if (typed === null) return;
+  if (typed !== name) {
+    alert("Name didn't match — nothing was deleted.");
+    return;
+  }
+  try {
+    await api("DELETE", `/projects/${encodeURIComponent(name)}`);
+  } catch (e) {
+    alert(`Delete failed: ${e}`);
+    return;
+  }
+  await loadProjects();
+  const sel = document.getElementById("project-select");
+  sel.value = "";
+  sel.dispatchEvent(new Event("change"));
+});
 
 // ---------- advanced toggles (event delegation) ----------
 

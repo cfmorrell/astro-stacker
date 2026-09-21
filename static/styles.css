@@ -651,13 +651,27 @@ button.danger-outline:hover {
   padding-bottom: 1px;
 }
 
+.metric-bars-wrap {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
 .metric-bars {
   display: flex;
   align-items: flex-end;
   gap: 2px;
   height: 72px;
-  flex: 1;
-  min-width: 0;
+}
+
+.metric-xaxis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 9px;
+  color: var(--text-dim);
+  font-family: ui-monospace, monospace;
+  margin-top: 3px;
 }
 
 .metric-bars .bar {
@@ -780,6 +794,7 @@ button.danger-outline:hover {
   height: 100%;
   object-fit: contain;
   display: block;
+  cursor: zoom-in;
 }
 
 .preview-controls {

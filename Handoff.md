@@ -418,6 +418,51 @@ Siril ones, but the same "don't rediscover this" spirit applies.
    that turns out to be a HEAD-based health check or test script.
 
 ## Current validated status
+- ✅ **Third round of frontend fixes, 8 items, re-validated end-to-end
+  (2026-09-2x)**: 1) each per-night metric graph now shows an x-axis
+  (first/last frame's local time) alongside the existing y-axis min/max;
+  2) review thumbnails/lightbox previews use `stretch=unlinked` instead of
+  the default `linked` — raw, not-yet-white-balanced subs looked like a
+  flat cyan wash under a linked stretch; unlinked (independent per-channel
+  black/white points) actually shows the frame; 3) outlier sensitivity is
+  now a live-updating range slider pulled out of "advanced options" —
+  made possible by computing which frames are "flagged" **client-side**
+  from the per-metric z-scores the server already returned
+  (`isFrameFlagged()` in `app.js`, replacing every read of the server's
+  own `flagged` boolean), since the z-scores themselves don't change with
+  the threshold, only which ones count as outliers — dragging the slider
+  re-colors everything instantly with no re-analyze round trip; 4) a real
+  bug: excluding/re-including a frame lost the frame strip's *horizontal*
+  scroll position (distinct from the page's vertical scroll, fixed last
+  round) — every re-render throws away and rebuilds each night's
+  `.frame-strip` from scratch, and a fresh element always starts at
+  `scrollLeft` 0; fixed by capturing each night's scroll position (keyed
+  by night, via a new `data-night` attribute) before the rebuild and
+  restoring it after; 5) Stack's "OSC / Bayer camera" checkbox removed —
+  it re-asked something Chris already answered once at Stage, and now
+  `stackBody()` just reads `state.status.is_osc` directly; 6) the final
+  stack preview image is now clickable into the same zoom/pan lightbox
+  the review thumbnails use, requesting a larger (2400px) render for
+  close inspection; 7) a real bug, found from Chris's own report of
+  running Rejection then Max then Median back-to-back and getting no
+  preview for the 2nd/3rd runs: `stack-run-btn`'s click handler cleared
+  `#stack-preview`'s DOM at the start of a new run but never reset its
+  `dataset.builtFor` marker — since every stack method writes to the same
+  result path, `showStackPreview()`'s "skip rebuilding if this path is
+  already built" check (added for the stretch-mode fix two rounds ago)
+  saw the unchanged path and skipped rebuilding forever, leaving the
+  just-cleared element permanently blank. Fixed by resetting
+  `dataset.builtFor` alongside the DOM clear. Verified by actually running
+  three back-to-back stacks (rej/max/med) against real two-night data and
+  confirming a fresh preview after each one; 8) `DELETE
+  /projects/{name}` (new endpoint, `shutil.rmtree` on the project dir —
+  safe despite `raw/`'s symlinks into `CAPTURES_DIR`, since `rmtree`
+  never follows a symlink into its target) plus a "🗑 Delete project"
+  button gated behind typing the project's name back, matching a
+  standard "you have to mean it" destructive-delete pattern. All 8
+  verified via the same headless-Chrome CDP approach; the delete flow was
+  checked against disk (`ls` before/after), the stack-method bug against
+  three real successive stacks, not just one.
 - ✅ **Frontend redesigned per Chris's 19-item live-usage feedback and
   re-validated end-to-end (2026-09-2x)**, superseding the first-version
   frontend described below. Chris used the first version, listed 19
