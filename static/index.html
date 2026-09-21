@@ -54,14 +54,14 @@
           <div class="field">
             <label>Biases dir (relative to captures)</label>
             <div style="display:flex; gap:6px;">
-              <input type="text" id="biases-dir" value="biases" style="flex:1;" readonly />
+              <input type="text" id="biases-dir" placeholder="click … to browse" style="flex:1;" readonly />
               <button type="button" class="small" id="biases-browse">…</button>
             </div>
           </div>
           <div class="field">
             <label>Darks dir (relative to captures)</label>
             <div style="display:flex; gap:6px;">
-              <input type="text" id="darks-dir" value="darks" style="flex:1;" readonly />
+              <input type="text" id="darks-dir" placeholder="click … to browse" style="flex:1;" readonly />
               <button type="button" class="small" id="darks-browse">…</button>
             </div>
           </div>
@@ -242,6 +242,7 @@
         <div class="field">
           <label>Excluded frames (<span id="exclude-count">0</span> selected in Review)</label>
           <div id="exclude-list" class="hint">none</div>
+          <p class="hint">Applies across every night selected above — excluding a frame in Review removes it from the stack no matter which night it belongs to.</p>
         </div>
 
         <button id="stack-render-btn" class="script-toggle-btn"><span class="arrow">▾</span> Preview script</button>

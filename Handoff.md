@@ -434,6 +434,64 @@ Siril ones, but the same "don't rediscover this" spirit applies.
    that turns out to be a HEAD-based health check or test script.
 
 ## Current validated status
+- ✅ **Four "Immediate next steps" items completed in one round, plus a
+  real bug found and fixed along the way (2026-09-2x)**: 1) **UI hint for
+  cross-night frame exclusion** — a one-line note added to the Stack
+  step's excluded-frames field explaining it applies across every
+  selected night, not just one; 2) **real (bilinear) debayer algorithm**
+  — `_debayer_bilinear()` replaces `_debayer_block_mean()` in
+  `app/imaging.py`: each missing Bayer-mosaic sample is now a proper
+  weighted average of its real same-channel neighbors (`[[1,2,1],
+  [2,4,2],[1,2,1]]/4` for R/B, `[[0,1,0],[1,4,1],[0,1,0]]/4` for G —
+  standard bilinear-demosaic kernels, verified by hand against actual
+  Bayer tile positions), implemented as pure-numpy shifted-slice
+  convolution (`_convolve3x3()`) rather than adding scipy as a
+  dependency. Produces full native resolution (verified: 6248x4176 out,
+  matching the sensor, vs. the old block-mean's implicit half-resolution
+  output) with visibly better quality — round stars, faint nebulosity
+  already visible in a single unstacked sub, no color-fringing
+  artifacts; 3) **lightbox nav staleness fixed** — `lightboxNav` no
+  longer snapshots a frame-list array at open time; `currentLightboxFrames()`
+  recomputes the live (survivors-only-filtered) list from
+  `state.lastAnalyzeResult` on every navigation, and the current frame is
+  tracked by filename (a stable identity) rather than a numeric index
+  into a now-possibly-stale array. If the currently-viewed frame drops
+  out of the live list (e.g. you exclude it via the lightbox's own
+  checkbox, then switch on survivors-only), it lands on the nearest
+  neighbor instead of showing wrong data — verified exactly this
+  sequence against real data; 4) **large-night collapsing validated
+  against real data** — Chris added real bulk captures (Night 2 grew to
+  110 real lights, 5.9GB). Staged and analyzed for real: the >20-frame
+  collapse behavior worked correctly (110 frames → 24 visible cards + 2
+  expandable "N more" groups, expanding one correctly grew to 85 visible
+  without disturbing the other), and the real data's own anomaly cluster
+  (a genuine dawn-twilight run near the end of the night) was visible
+  exactly where expected in both the metric graphs and the flagged-frame
+  clustering. Found a real, previously-unknown bug during this same
+  testing: **`/lights/analyze/run` crashed on any project that had never
+  had a Siril-based job (`/masters/run` or `/stack/run`) run against it
+  first** — `create_python_job()` (`app/jobs.py`) never created its log
+  directory before opening the log file, unlike
+  `siril_runner.run_script()` (used by the Siril-based job types), which
+  does this itself. A project staged and taken straight to Review (a
+  perfectly normal thing to do, since Review needs no masters) had no
+  `project/logs/` directory yet and crashed immediately with a bare
+  `FileNotFoundError`. Fixed by having `create_python_job()` create its
+  own log directory the same way, verified by reproducing the exact
+  failure against a freshly-staged project and confirming it now
+  succeeds.
+- ✅ **Stage no longer assumes "biases"/"darks" as default folder names**
+  (2026-09-2x, Chris: "I don't want the app to assume the path to biases
+  and darks when a new project is created... in the future I'm going to
+  point the captures folder at my entire directory of astrophotos, which
+  means it won't be as cleanly organized"). `StageProjectRequest.biases_dir`/
+  `darks_dir` now default to `None` (skip) instead of the literal strings
+  `"biases"`/`"darks"`, and the frontend's Stage form no longer pre-fills
+  those fields — both start empty with a "click … to browse" placeholder,
+  same ellipsis-only picker as everywhere else. This was previously a
+  reasonable assumption when `CAPTURES_DIR` was a small, purpose-built
+  test folder with exactly those two subdirectories; it stops being safe
+  the moment it points at a real, less uniformly organized archive.
 - ✅ **Two items off the "Immediate next steps" gap list, re-validated
   end-to-end (2026-09-2x)** — Chris picked these two out of item 1's
   bundle of six distinct gaps via an explicit choice, deferring the rest
@@ -995,43 +1053,26 @@ the `raw/` staging layer exists at all — don't collapse it away):
 Everything from prior rounds is **done** — see "Current validated status"
 for the full history. Crop is permanently out of scope (Architecture
 decisions), not deferred. Archive/cleanup is explicitly deferred per
-Chris, not started. Open work items, smallest/most self-contained first:
+Chris, not started. **Format note (Chris, 2026-09-2x): keep this list
+numbered going forward** — makes it easy to say "do 1 and 2" and have
+that mean something unambiguous. Open work items:
 
-- **UI hint for cross-night frame exclusion.** `exclude_frames` on
-  `StackLightsRequest` applies globally across every selected night in
-  one request (matches the API's own semantics — not a bug), but nothing
-  in the UI says so. Add a one-line note wherever exclusions are shown on
-  the Stack step.
-- **Real debayer algorithm.** `_debayer_block_mean` (`app/imaging.py`) is
-  a quick 2x2-block-average demosaic — fine for a review thumbnail, not
-  for anything claiming photometric accuracy. Swap in a real
-  bilinear/AHD demosaic for review and master-preview thumbnails.
-- **Lightbox nav staleness.** `lightboxNav` (`app.js`) captures its frame
-  list by reference at open time. Toggling survivors-only or excluding
-  the frame you're currently viewing doesn't refresh what the prev/next
-  arrows navigate — a minor edge case, not a crash. Recompute the list
-  live from `state.lastAnalyzeResult` instead of snapshotting it.
-- **Validate large-night collapsing against real data.** The >20-frame
-  collapse-to-flagged-±2-neighbors behavior (`computeVisibleItems()`) has
-  never been exercised against an actual night that size — no current
-  test project has one. Needs a look once real data that large exists,
-  not a code change on its own.
-- **Job history.** Only the most recently started job's progress is
-  shown per section; nothing persists across a page reload or lets you
-  browse past jobs.
-- **Cross-tab/cross-client job awareness.** No polling or auto-refresh of
-  project status while a job started from *another* browser tab or the
-  Swagger UI is running. Combined with Frontend/web gotcha #4, two
-  clients running jobs against the same project at once can still 500.
-- **Per-night master flat/dark overrides.** `master_dark`/`master_flat`
-  on `StackLightsRequest` are single values applied uniformly to every
-  selected night. Correct for `master_dark` (genuinely shared — see the
-  master reuse policy in Architecture decisions), but `master_flat`
-  really wants a per-night override (e.g. "night3 is missing its own
-  flats, reuse night2's," or a library entry) instead of one value forced
-  onto every night in the request. The Stack section's file picker (see
-  "Current validated status") makes *setting* the existing global
-  override easier but doesn't add per-night granularity. Needs design
-  thought before building — how should the UI represent "this override
-  applies to this specific night" without over-complicating the common
-  case where no override is needed at all?
+1. **Job history.** Only the most recently started job's progress is
+   shown per section; nothing persists across a page reload or lets you
+   browse past jobs.
+2. **Cross-tab/cross-client job awareness.** No polling or auto-refresh
+   of project status while a job started from *another* browser tab or
+   the Swagger UI is running. Combined with Frontend/web gotcha #4, two
+   clients running jobs against the same project at once can still 500.
+3. **Per-night master flat/dark overrides.** `master_dark`/`master_flat`
+   on `StackLightsRequest` are single values applied uniformly to every
+   selected night. Correct for `master_dark` (genuinely shared — see the
+   master reuse policy in Architecture decisions), but `master_flat`
+   really wants a per-night override (e.g. "night3 is missing its own
+   flats, reuse night2's," or a library entry) instead of one value
+   forced onto every night in the request. The Stack section's file
+   picker (see "Current validated status") makes *setting* the existing
+   global override easier but doesn't add per-night granularity. Needs
+   design thought before building — how should the UI represent "this
+   override applies to this specific night" without over-complicating
+   the common case where no override is needed at all?

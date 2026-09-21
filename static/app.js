@@ -655,11 +655,36 @@ function openPlainLightbox(url, title) {
   openLightbox(url, title);
 }
 
+function currentLightboxFrames() {
+  // Recomputed fresh every call from live state, never cached: the old
+  // version snapshotted this array once at open time, so toggling
+  // survivors-only or excluding the very frame being viewed left the
+  // prev/next arrows navigating a list that no longer matched what was
+  // actually on screen.
+  if (!lightboxNav || !state.lastAnalyzeResult) return [];
+  const allFrames = state.lastAnalyzeResult.nights[lightboxNav.night] || [];
+  return state.showSurvivorsOnly ? allFrames.filter((f) => !state.excludeFrames.has(f.filename)) : allFrames;
+}
+
 function renderLightboxFrame() {
-  const { night, frames, index } = lightboxNav;
+  const frames = currentLightboxFrames();
+  let index = frames.findIndex((f) => f.filename === lightboxNav.filename);
+  if (index === -1) {
+    // The frame we were on dropped out of the live list (e.g.
+    // survivors-only just got switched on and this was the frame that
+    // got excluded) - land on the nearest neighbor instead of just
+    // breaking, or close if the night has nothing left to show.
+    if (!frames.length) {
+      document.getElementById("lightbox").classList.remove("open");
+      return;
+    }
+    index = Math.min(lightboxNav.lastIndex, frames.length - 1);
+    lightboxNav.filename = frames[index].filename;
+  }
+  lightboxNav.lastIndex = index;
   const f = frames[index];
   const { date, time } = formatCaptured(f.captured_at);
-  openLightbox(frameLightboxUrl(night, f), `${f.filename} — ${date} ${time}`, {
+  openLightbox(frameLightboxUrl(lightboxNav.night, f), `${f.filename} — ${date} ${time}`, {
     stats: frameStatsLine(f),
     indicator: isFrameFlagged(f) ? "flagged" : "ok",
   });
@@ -670,7 +695,7 @@ function renderLightboxFrame() {
 }
 
 function openLightboxForFrame(night, frames, index) {
-  lightboxNav = { night, frames, index };
+  lightboxNav = { night, filename: frames[index].filename, lastIndex: index };
   renderLightboxFrame();
 }
 
@@ -679,14 +704,20 @@ document.getElementById("lightbox").addEventListener("click", () => {
 });
 document.getElementById("lightbox-prev").addEventListener("click", (e) => {
   e.stopPropagation();
-  if (!lightboxNav || lightboxNav.index <= 0) return;
-  lightboxNav.index -= 1;
+  if (!lightboxNav) return;
+  const frames = currentLightboxFrames();
+  const index = frames.findIndex((f) => f.filename === lightboxNav.filename);
+  if (index <= 0) return;
+  lightboxNav.filename = frames[index - 1].filename;
   renderLightboxFrame();
 });
 document.getElementById("lightbox-next").addEventListener("click", (e) => {
   e.stopPropagation();
-  if (!lightboxNav || lightboxNav.index >= lightboxNav.frames.length - 1) return;
-  lightboxNav.index += 1;
+  if (!lightboxNav) return;
+  const frames = currentLightboxFrames();
+  const index = frames.findIndex((f) => f.filename === lightboxNav.filename);
+  if (index === -1 || index >= frames.length - 1) return;
+  lightboxNav.filename = frames[index + 1].filename;
   renderLightboxFrame();
 });
 document.addEventListener("keydown", (e) => {
@@ -698,15 +729,19 @@ document.addEventListener("keydown", (e) => {
 document.getElementById("lightbox-exclude-row").addEventListener("click", (e) => e.stopPropagation());
 document.getElementById("lightbox-exclude").addEventListener("change", (e) => {
   if (!lightboxNav) return;
-  const f = lightboxNav.frames[lightboxNav.index];
-  if (e.target.checked) state.excludeFrames.add(f.filename);
-  else state.excludeFrames.delete(f.filename);
+  if (e.target.checked) state.excludeFrames.add(lightboxNav.filename);
+  else state.excludeFrames.delete(lightboxNav.filename);
   refreshExcludeDisplay();
   // Rebuilds the review grid behind the (still-open) lightbox, including
   // the matching frame-card's own checkbox/border - scroll position
   // (both the page and the per-night horizontal strip) is already
   // preserved by renderAnalyzeOutput/frameCard's own handling of this.
   renderAnalyzeOutput();
+  // If survivors-only is on, excluding the frame just now may have
+  // dropped it from the live list entirely - refresh the lightbox itself
+  // so the arrows/checkbox reflect wherever that lands (a neighbor, or
+  // closing if nothing's left), per currentLightboxFrames() above.
+  renderLightboxFrame();
 });
 document.getElementById("lightbox-scroll").addEventListener("click", (e) => {
   // Toggle zoom instead of letting the click bubble to the overlay's
@@ -898,7 +933,11 @@ function renderAnalyzeOutput() {
       ]),
       el("button", {
         class: "small" + (state.showSurvivorsOnly ? " primary" : ""),
-        onclick: () => { state.showSurvivorsOnly = !state.showSurvivorsOnly; renderAnalyzeOutput(); },
+        onclick: () => {
+          state.showSurvivorsOnly = !state.showSurvivorsOnly;
+          renderAnalyzeOutput();
+          if (lightboxNav) renderLightboxFrame();
+        },
       }, [state.showSurvivorsOnly ? "Show all frames" : "Accept exclusions — show survivors only"]),
     ]);
     outputEl.insertBefore(banner, outputEl.firstChild);
