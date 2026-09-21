@@ -1293,15 +1293,31 @@ Chris, not started. **Format note (Chris, 2026-09-2x): keep this list
 numbered going forward** — makes it easy to say "do 1 and 2" and have
 that mean something unambiguous.
 
-1. **Package and deploy the production container on UnRAID.** The
+1. **Two one-time GitHub settings Chris needs to set before the new CI
+   workflow's first push will actually succeed** (see item 2) —
+   `.github/workflows/docker-publish.yml` needs "Read and write
+   permissions" for `GITHUB_TOKEN` under Settings → Actions → General →
+   Workflow permissions (repos sometimes default this to read-only,
+   which would make the GHCR push fail with a 403); and after the first
+   successful run, the new `ghcr.io/cfmorrell/astro-stacker` package
+   needs its visibility flipped from the default "private" to "public"
+   (Package settings, in GitHub's UI — not something a workflow can set
+   for itself without extra token scope) so UnRAID can `docker pull` it
+   with no login. Chris chose public + GHCR + build-on-push-to-main when
+   asked (2026-09-21).
+2. **Package and deploy the production container on UnRAID.** The
    Dockerfile itself is built and smoke-tested (see "Current validated
-   status") — what's left is Chris's own call to make: an UnRAID Community
-   Applications template (or a plain `docker run`/compose setup),
-   deciding the real `-p`/volume mappings for the production container
-   (distinct from `astro-stacker-dev`, which should probably keep running
-   independently rather than being replaced), and actually exposing it.
-   Not started — deliberately deferred to its own round per Chris ("we'll
-   handle this part of it afterwards").
+   status"), and CI now builds+pushes it to `ghcr.io/cfmorrell/
+   astro-stacker:latest` automatically on every push to main that
+   touches the Dockerfile/app/static/templates/requirements.txt (see
+   `.github/workflows/docker-publish.yml`). What's left is Chris's own
+   call to make: an UnRAID Community Applications template (or a plain
+   `docker run`/compose setup) pointed at that image, deciding the real
+   `-p`/volume mappings for the production container (distinct from
+   `astro-stacker-dev`, which should probably keep running independently
+   rather than being replaced), and actually exposing it. Not started —
+   deliberately deferred to its own round per Chris ("we'll handle this
+   part of it afterwards").
 
 The one future idea on the table (deleting an obviously-bad frame instead
 of just excluding it) is real but deliberately **not** listed as a next
