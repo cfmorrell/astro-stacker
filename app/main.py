@@ -70,6 +70,33 @@ def delete_project(name: str):
     return {"deleted": name}
 
 
+@app.delete("/projects/{name}/nights/{night}")
+def delete_night(name: str, night: str):
+    """Remove one staged night: its raw/nights/<night> symlinks and any
+    process/nights/<night> artifacts (master flat, per-night stack
+    scratch/result) — not the whole project. Frees up the "remove and
+    re-stage" workflow the frontend didn't previously support at all.
+    Shared master_bias/master_dark and any already-completed merged stack
+    are untouched (a merged result that included this night becomes
+    stale, but that's the same situation as excluding frames after a
+    stack already ran — nothing here tries to detect or clean that up).
+    """
+    project = _project_or_404(name)
+    if not night or "/" in night or night in (".", ".."):
+        raise HTTPException(status_code=400, detail=f"invalid night name: {night!r}")
+    raw_night = project / "raw" / "nights" / night
+    if not raw_night.is_dir():
+        raise HTTPException(status_code=404, detail=f"unknown night {night!r}")
+    shutil.rmtree(raw_night)
+    process_night = project / "process" / "nights" / night
+    if process_night.is_dir():
+        shutil.rmtree(process_night)
+    meta = config.read_project_meta(project)
+    meta.get("night_labels", {}).pop(night, None)
+    config.write_project_meta(project, meta)
+    return {"deleted": night}
+
+
 @app.get("/projects/{name}/status")
 def project_status(name: str):
     project = _project_or_404(name)
