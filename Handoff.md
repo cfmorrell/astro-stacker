@@ -1207,6 +1207,419 @@ Siril ones, but the same "don't rediscover this" spirit applies.
   and served the frontend correctly — then torn down, nothing left
   running. Actually packaging/publishing this on UnRAID is explicitly
   the next round, not done here.
+- ✅ **GitHub Actions CI + UnRAID deployment complete (2026-09-2x)**:
+  `.github/workflows/docker-publish.yml` builds and pushes to
+  `ghcr.io/cfmorrell/astro-stacker` on every push to main; Chris set the
+  repo's Actions permissions to read/write and flipped the package to
+  public, then deployed the container on UnRAID — confirmed up and
+  running. The dev container (`astro-stacker-dev`) stays running
+  independently for ongoing development; the two are separate containers
+  now, not one replacing the other.
+- ✅ **Seven feature requests from real usage, implemented and verified
+  end-to-end against a real, reorganized test dataset (2026-09-22)**.
+  Chris restructured his test captures to mirror his actual astrophoto
+  library layout — `<Target>/<date>-<target>-<camera>-<scope>/{lights,flats}`
+  (optionally with `Night 1`/`Night 2` subfolders for multi-night
+  targets) for light targets, plus a separate shared
+  `000-CalibrationFrames/{Bias,Dark}/<camera>/<exposure-or-date>/` tree —
+  with deliberately few frames per target to keep test stacks fast. All
+  seven were verified against this real layout (curl for the backend,
+  headless Chrome + CDP for the frontend), not just code review:
+  1. **Output filename = project name + total integration time.**
+     `app/ssf.py`'s new `output_basename()` sums each actually-included
+     light frame's exposure (parsed from its filename via the new
+     `app/frameinfo.py`, post-exclusion — computed from the RAW night
+     dirs before `_resolve_nights()` swaps in the excluded/selected dir,
+     since that one isn't populated on disk until later) and formats it
+     as e.g. `ElephantTrunkNebula-IC1396_5h24m` (or `_55m` under an hour,
+     `_2h` for an exact-hour total with no leftover minutes) — Chris's
+     own follow-up correction from an initial `5.4h`-style decimal format
+     that shipped first. `_format_integration()` rounds to whole minutes
+     BEFORE splitting into h/m specifically to dodge a 59.6-minute-style
+     rounding-carry bug. Falls back to just the project name if no
+     frame's exposure could be parsed. The `-out=` target in both
+     `register_stack_*.ssf.j2` templates is now this computed name, not
+     a hardcoded `result`. Since the filename is now dynamic, `/status`
+     can no longer assume `result.fit` — `run_stack()` records the
+     actual filename into project meta
+     (`night_result_filenames`/`merged_result_filename`) right before
+     the job starts, and `app/status.py` reads it from there (falling
+     back to `result.fit` for any project stacked before this existed).
+     Verified for real: a 15-light, 300s-exposure single night produced
+     `heart-test_1h15m.fit` on disk, and `/status` correctly reported
+     and previewed it at that exact path; a real 2-night, 28-light merge
+     produced `live-test-3_2h20m`.
+  2. **Stacking methods narrowed to Rejection (Sigma) / Winsorized Sigma
+     / Mean, sigma fields hidden for Mean.** Confirmed via `siril-cli`'s
+     own `help stack` (1.4.3) that Siril's real model is: one stack type
+     (`rej`/`mean` — literally the same keyword) plus a separate
+     REJECTION TYPE argument (`sigma`, `winsorized`, `none`,
+     `percentile`, `median`, `linear`, `generalized`, `mad`), and that
+     Winsorized is Siril's own default when no type is given — meaning
+     the old UI's plain `rej 3 3` (no explicit type) was **already**
+     running Winsorized under the hood the whole time. `StackMethod`
+     (`app/models.py`) is now exactly `sigma`/`winsorized`/`none`
+     (`none` = `rej none`, a plain mean with no clipping at all — sigma
+     values are meaningless for it and Siril's CLI doesn't even accept
+     them for `none`). Frontend hides the sigma low/high fields via a
+     `change` listener on the method `<select>` whenever `Mean` is
+     selected, for both the Masters and Stack sections (same enum backs
+     both). Winsorized Sigma is now the default, matching Siril's own
+     prior default behavior exactly — no behavior change for anyone who
+     never touched this dropdown.
+  3. **Root working directory per project.** `StageProjectRequest`
+     gained `root_dir` (relative to `CAPTURES_DIR`, validated the same
+     way as `biases_dir`/`darks_dir`), stored in project meta and
+     exposed via `/status`. Every Stage-step folder picker
+     (`attachFolderBrowser` in `app.js`) now starts browsing from a
+     project's `root_dir` instead of the full captures root whenever its
+     own field is still empty — a starting point only, never a
+     restriction, since the breadcrumb still reaches anywhere else under
+     captures. **Known tradeoff, not a bug**: since biases/darks live in
+     a completely separate shared tree
+     (`000-CalibrationFrames/...`) from a target's own root, picking
+     them still means backing out via the breadcrumb once first — root_dir
+     helps lights/flats (the deeply-nested, per-project-specific fields)
+     far more than it helps calibration frames. Flagged to Chris; not
+     changed without his say-so, since a separate "calibration frames
+     root" is a bigger, separate feature if he wants it.
+  4. **Drizzle**, adjustable scale/pixel-fraction/kernel. New
+     `DrizzleOptions` (`app/models.py`) maps directly to `register`'s own
+     `-drizzle -scale= -pixfrac= -kernel=` options (confirmed via
+     `siril-cli`'s `help register`). Critical interaction, also
+     confirmed from that same help text: *"when using -drizzle on images
+     taken with a color camera, the input images must not be
+     debayered"* — `render_stack_lights()` now drops calibrate's
+     `-debayer` flag (keeping `-cfa`/`-equalize_cfa`, which are
+     unrelated to demosaicing) whenever drizzle is enabled on an OSC
+     project. Verified for real, not just script-text review: ran an
+     actual drizzle stack (scale 1.0, pixfrac 0.9, square kernel)
+     against real HeartNebula OSC data end-to-end — calibrate, register
+     with drizzle, and stack all completed successfully producing a
+     correctly-named, full-color result.
+  5. **Header "astro-stacker" text is now a link** back to no-project-
+     selected with Stage as the step that'll show once a project is
+     picked (`switchToProject(null, "stage")`).
+  6. **Project row simplified to just a dropdown + "+ New project"
+     button.** Clicking it prompts for a name (native `prompt()`, same
+     pattern as the existing delete-confirmation), then opens a one-off
+     folder-picker (`pickCapturesFolder()` in `app.js`, sharing
+     `/captures/browse` + the breadcrumb UI with `attachFolderBrowser`
+     but resolving a promise instead of writing into a persistent input)
+     to choose the new project's `root_dir` — skippable, in which case
+     pickers just fall back to the full captures root as before. This
+     also made project creation eager rather than lazy: it now calls
+     `POST /stage` immediately (creating the project directory + meta
+     right away) instead of only existing once "Stage files" is first
+     clicked, since `root_dir` needs somewhere to be recorded
+     immediately.
+  7. **Darks-vs-lights exposure mismatch warning.** New
+     `app/frameinfo.py` (factored out of what used to be
+     `main.py`'s `_detect_frame_type`, now shared) adds
+     `detect_exposure_seconds()`, parsing each filename's `_<number>
+     <s|ms>_` pattern (e.g. `_300.0s_`, `_1.0ms_`) the same way frame
+     type is already detected, with the same "≥90% agreement or don't
+     claim to know" rule. `/captures/browse` now also returns
+     `detected_exposure_s`. The frontend remembers the darks folder's
+     detected exposure (module-level, since darks are staged once per
+     project) and checks it against each session's lights whenever
+     either is (re)picked, via the same combined
+     `.session-mismatch-warning` used for the existing lights/flats
+     checks — not a hard block, same as those. Verified for real by
+     deliberately staging the Bias folder (1ms) as "darks": both the
+     existing type-mismatch warning ("looks like bias frames, not
+     darks") and the new exposure warning ("These lights are 300s
+     exposures, but the darks are 1ms") fired together, combined into
+     one message.
+- ✅ **Data-safety question answered + verified against Chris's real
+  production data (2026-09-22)**: Chris asked whether pushing/deploying
+  an update is safe for existing projects, and whether a migration plan
+  is needed. Checked directly against his actual running containers
+  (`docker inspect`) rather than assuming: the production container
+  (`AstroStacker`, on `ghcr.io/cfmorrell/astro-stacker`) mounts
+  `/mnt/user/docker_appdata/astrostacker/data` and
+  `/mnt/user/Astronomy` (his whole library), while the dev container
+  (`astro-stacker-dev`) mounts the completely different
+  `/mnt/user/docker_appdata/astro-stacker/data` (note the hyphen) and
+  just the test subfolder — **no shared-volume collision risk between
+  dev and prod**, confirmed, not assumed. Also inspected Chris's one
+  real production project (`HeartNebula-2026-09-15`, already staged,
+  masters built, and stacked to a plain `result.fit` under
+  pre-this-session code) directly against everything built this
+  session: its `meta.json` has neither `root_dir` nor
+  `night_result_filenames`/`night_dark_overrides`/etc., and every read
+  of those fields anywhere in the codebase goes through `.get(key,
+  default)` (verified by grepping for any *direct* `meta[...]` read,
+  finding only writes) — so `/status` on this real project still
+  correctly reports its existing `result.fit` via the fallback default,
+  `root_dir` just comes back `null` (pickers fall back to full captures
+  root), and nothing crashes or silently misbehaves. **The actual
+  answer, going forward**: this project's schema evolves by ADDING
+  optional, defaulted meta fields, never by renaming/removing existing
+  ones or requiring a field to exist — that discipline is what makes
+  deploys safe without a migration step, and it should keep being
+  followed rather than treated as a one-time fix. No forward-migration
+  UI (prompt-to-repair or offer-to-delete) was built, since there's
+  currently no real incompatibility for it to handle — revisit only if
+  a future change actually needs to break this pattern.
+- ✅ **Calibration frames now aligned per night from the Masters step,
+  not overridden uniformly from Stack (2026-09-22)** — Chris: "let's get
+  rid of the master overrides [from Stack] and move them back to
+  calibration frames. That is the panel where we should be aligning
+  calibration frames to nights... choose different darks for different
+  nights... use a different night's flats on a particular night, not
+  necessarily universally." The old Stack-step `master_dark`/
+  `master_flat` fields on `StackLightsRequest` applied ONE override to
+  EVERY selected night at once — the exact opposite of what's actually
+  useful for the case Chris described (a project spanning months, where
+  different nights genuinely need different calibration). Replaced with
+  a new persistent per-project setting: `CalibrationOverridesRequest`
+  (`app/models.py`) sets `night_dark_overrides`/`night_flat_overrides`
+  (night name → absolute file path) via new `POST /projects/{name}/
+  calibration-overrides`, stored in project meta (not on the stack
+  request itself, since it's project configuration, not a one-off
+  run-time parameter) and read back via `/status` (each night's
+  `dark_override`/`flat_override`). `ssf.py`'s `_resolve_nights()` now
+  resolves `dark_master` PER NIGHT (previously one shared value for
+  every night in a request) from these overrides, falling back to the
+  normal shared `process/master_dark` / that night's own
+  `process/nights/<name>/master_flat`. Frontend: the Masters step (now
+  genuinely "where calibration frames get aligned to nights," matching
+  Chris's framing) gained a per-night table — dark/flat file pickers per
+  staged night, reusing the existing project-file-browser component,
+  auto-saving the complete current picture on every change (no separate
+  save button). Verified for real against `live-test-3`: set a per-night
+  dark override and confirmed only that night's calibrate step picked it
+  up in the rendered script while the other night kept its own default;
+  set and cleared a flat override the same way; confirmed via headless
+  Chrome that picking a file through the UI actually persists
+  server-side.
+- ✅ **Drizzle promoted out of "advanced options" (2026-09-22)** — with
+  the master overrides gone, Stack's advanced-options section would have
+  held only drizzle, so the whole toggle was removed for Stack and
+  drizzle now sits directly in the card body, always visible. (Review's
+  own separate "advanced options" — star-detection threshold/bin factor
+  — is untouched.)
+- ✅ **User-facing text audit (2026-09-22)** — Chris: "double check all
+  comments that are displayed on the page and ensure they are targeted
+  at a user of the app, not the developer." Found and fixed two real
+  leaks: the Review card's title named the actual Python libraries
+  ("astropy + photutils, no Siril") instead of describing what the step
+  does for the user; and a hint referenced "photutils' own conventions"
+  by library name when explaining why roundness numbers don't match
+  Siril's — reworded to compare against Siril directly (a comparison
+  genuinely useful to Chris, who already knows Siril) without naming the
+  library doing the computation. Also fixed a stale Stack card title
+  that still said "into result.fit" even though the output filename is
+  now dynamic (see the integration-time bullet above), and removed a
+  leftover "See Handoff.md" from a hint that got deleted along with the
+  old master-override fields anyway. Swept the rest of `index.html`'s
+  labels/hints and `app.js`'s dynamically-generated user-facing strings
+  (hints, warnings, alert/confirm/prompt text) for the same pattern —
+  nothing else found. (Source-code `//` comments are a separate thing,
+  deliberately left alone — those are for whoever maintains this code
+  next, not something the running app ever shows anyone.)
+- ✅ **Two small follow-up tweaks (2026-09-22)**: drizzle's default
+  `scale` changed from `1.0` (no upscale) to `2.0` per Chris ("we don't
+  want to start at 1") — `DrizzleOptions` in `app/models.py`, the
+  `stack-drizzle-scale` input's default in `index.html`, and its JS
+  parse-failure fallback all updated together so they can't drift out of
+  sync. Stack's "Excluded frames" display now groups by night instead of
+  one flat comma-joined list — `refreshExcludeDisplay()` (`app.js`)
+  cross-references `state.excludeFrames` against
+  `state.lastAnalyzeResult.nights` to find each excluded filename's
+  night, falling back to the old flat list only if no analyze result is
+  loaded at all (shouldn't normally happen, since exclusions only ever
+  come from the Review step). Verified via headless Chrome.
+- ✅ **Two small UI fixes (2026-09-22)**: Stage's "Biases dir"/"Darks dir"
+  labels dropped "(relative to captures)" — an implementation detail the
+  user doesn't need, not something that changes what they do. Stage's
+  layout reordered: the lights/flats session builder now comes first,
+  biases/darks moved below it (was the reverse).
+- ✅ **Verified — and then genuinely fixed — that a project with zero
+  calibration frames can stack successfully (2026-09-22)**. Chris asked
+  directly: "have we tested a scenario where a user may have no
+  calibration frames? Can we stack successfully if we skip past the
+  calibration frame process entirely?" Tested it for real and found the
+  answer was actually **no**: `_resolve_nights()` hard-required both a
+  dark AND a flat master to exist for every night, raising a 400
+  ("master dark not found...") the moment either was missing — even
+  though bias was already fully optional (confirmed
+  `render_build_masters()` already skips it cleanly when `raw/biases`
+  doesn't exist) and even though Siril's own `calibrate` command treats
+  `-bias=`/`-dark=`/`-flat=`/`-cc=` as ALL genuinely optional (confirmed
+  via `help calibrate`). Fixed in `ssf.py`: `_resolve_master()` now
+  distinguishes an EXPLICIT override that's missing (still a hard
+  error — that's a real mistake) from a DEFAULT that's simply not built
+  (now resolves to `None`, meaning "skip this calibration step for this
+  night" instead of failing); `calibrate_night.ssf.j2`'s `-dark=`/
+  `-flat=` and `render_stack_lights()`'s `-cc=dark` (which needs a dark
+  master to reference and makes no sense without one) are now all
+  conditional on the corresponding master actually existing. Verified
+  for real, not just rendered-script review: ran an actual stack job
+  with flats but no bias/dark at all (succeeded), and a second one with
+  **zero** calibration frames of any kind — no bias, no dark, no flat
+  master — which also completed successfully end to end and produced a
+  real, correctly-named result file.
+- ✅ **Narrowband/mono workflow explored against Chris's new real test
+  data and the missing piece (per-folder filter selection) built
+  end-to-end (2026-09-22)**. Chris added a real mono (ZWO 2600MM, not
+  MC) narrowband session — `HeartNebula-IC1805/2025-10-04-HeartNebula-
+  2600MM-WO61/{Light,Flat}` — with H/O/S filters all mixed together in
+  ONE Light folder and ONE Flat folder (30 files each, 10 per filter);
+  deliberately no matching 2600MM calibration frames exist at all
+  (only 2600MC ones do), making this dataset exercise the
+  zero-calibration-frames fix above too. Filename convention here
+  differs structurally from the OSC test data (no `<angle>deg` field,
+  but an added filter code right before `_gain<N>_`, e.g.
+  `..._2600MM_H_gain100_...`) — confirmed the existing exposure/type
+  detectors keep working unmodified against it (they search for
+  specific substrings, not a fixed overall structure), and Review's
+  astropy/photutils analysis runs cleanly on genuinely single-channel
+  mono FITS data with no changes needed there either.
+  **What was actually missing**, exactly as Chris predicted ("I think
+  top of mind is... some way of filtering by filter inside of a
+  folder"): staging had no concept of "filter" at all — picking a mixed
+  folder as `lights_dir`/`flats_dir` would symlink all 30 files
+  regardless of filter into one "night," which is meaningless (H/O/S
+  each need their own master flat and their own independent
+  calibrate/stack pass — they only get combined later, in other
+  software, as a narrowband-to-RGB palette). Built:
+  - `app/frameinfo.py` gained `parse_filter()`/`detect_filters()` — the
+    filter code sits right before `_gain<N>_` in this convention
+    (`_([A-Za-z]{1,6})_gain\d+_`); an OSC filename has nothing there at
+    all (camera model sits directly against `_gain`), so this correctly
+    returns nothing for OSC data rather than a false match. Confirmed
+    against real filenames from both datasets before writing the regex,
+    not just assumed.
+  - `/captures/browse` now also returns `detected_filters` (e.g.
+    `["H","O","S"]`, empty for OSC).
+  - `NightSource` (the per-session staging request) gained an optional
+    `filter` field. `staging._link_dir()` now filters by it when
+    staging BOTH lights and flats for that session (one filter applies
+    to both, since a session's flats only make sense matched to that
+    same session's filter) — and now also wipes stale FITS symlinks
+    from the destination before relinking (previously only added/
+    overwrote), needed so re-staging a night with a DIFFERENT filter
+    can't leave the previous filter's files mixed in. An explicit
+    filter that matches zero files is a hard 400, not a silently-empty
+    night. The night's display label gets the filter appended (e.g.
+    "2025-10-04-HeartNebula-2600MM-WO61 (S)") so same-folder,
+    different-filter sessions are distinguishable in every checklist.
+  - Frontend (Stage): picking a lights or flats folder that resolves to
+    exactly one filter applies it automatically, no extra click; a
+    folder mixing 2+ filters shows a required "Filter" dropdown for
+    that session (populated from `detected_filters`), and "Stage files"
+    is blocked with a clear alert if it's left unset. Fixed a real bug
+    caught during testing: picking flats (also ambiguous) after already
+    choosing a filter for lights was resetting the choice back to
+    unset — now preserves the current selection across both pickers as
+    long as it's still valid for the newly-detected set.
+  - **Also caught and fixed a related, previously-invisible gap**: with
+    filter-tagged nights now possible, nothing stopped selecting two
+    DIFFERENT-filter nights together in Stack's "nights to stack"
+    checklist, which would silently `merge` two different wavelengths
+    into one nonsensical stack — verified this was a real, live gap by
+    actually rendering the script for an O+S selection and watching it
+    produce a `merge "...O.../pp_light" "...S.../pp_light"` line with
+    no warning at all. Fixed: each night's `filter` is now tracked in
+    project meta and exposed via `/status`; a new
+    `checkStackFilterMismatch()` (matching this app's established
+    warn-don't-block pattern — same as the lights/flats and exposure
+    mismatch warnings) shows an inline warning under "Nights to stack"
+    whenever the currently-checked nights span more than one distinct
+    filter.
+  - **Real, incidental discovery, not an app bug — since fixed by
+    Chris**: one flat frame in the test data
+    (`Flat_..._2600MM_H_..._0008.fit`) was genuinely truncated (~50.3MB
+    vs. the uniform ~52.2MB every sibling flat is), which crashed
+    Siril's own preprocessing for the H filter's flat build specifically
+    (`Fitsio error reading data... Could not load image 7 from
+    sequence`) — confirmed via file size comparison across all 30
+    flats, isolated to exactly that one file; O and S built and stacked
+    cleanly the whole time. Chris replaced the file (2026-09-22);
+    re-verified end to end afterward — H's master flat build and full
+    stack both now succeed too, all three filters confirmed working.
+- ✅ **Calibration-frame preview stretch fixed (2026-09-22)** — Chris:
+  "the preview is showing extremely strong dust motes, but not much from
+  the vignetting... exceptionally blown out." Root-caused on real data
+  before touching any code: pulled a real master flat's actual pixel
+  stats and found the true vignetting signal is only a ~5-10% brightness
+  falloff center-to-corner, while dust motes are sharp outlier pixels
+  covering under ~0.5% of the frame — `PercentileInterval(99.5) +
+  AsinhStretch(0.1)` (the existing "unlinked" mode, tuned for the
+  OPPOSITE problem: huge-dynamic-range light frames with faint
+  nebulosity against near-black sky) clips its black point right at the
+  motes' dark cores, crushing the entire smooth vignetting gradient
+  toward white while making the motes look extreme by comparison —
+  confirmed by rendering the same frame multiple ways and comparing
+  actual output histograms, not just eyeballing it. New `"calibration"`
+  stretch mode (`app/imaging.py`): per-channel `ZScaleInterval` (the
+  same robust-to-outliers algorithm DS9/IRAF use), no curve at all —
+  visibly fixed on the real flat (vignetting now clearly visible, motes
+  proportionate) before it was wired in. `renderMastersPreviews()`
+  (`app.js`) now requests `stretch=calibration` instead of `unlinked`
+  for master bias/dark/flat thumbnails specifically; raw light frame
+  previews (Review) and the final stack preview are untouched — they
+  still want the strong asinh stretch, which is right for THAT content.
+  Also fixed a real bug caught while making this change: the per-channel
+  dispatch in `render_preview_png()` hardcoded `"linked"` for EVERY
+  per-channel call regardless of the actual requested mode — harmless
+  before (since "linked" and "unlinked" happen to compute identically
+  for a single channel), but would have silently discarded the new
+  "calibration" mode's whole point if left as-is.
+- ✅ **Real cross-project state-leak bug found and fixed (2026-09-22)** —
+  Chris: "I was just running an OSC test, and while it was stacking
+  built a mono test. The OSC test finished, but when I clicked into
+  stack on the mono test, the calibrate/register/stack status markers
+  were already green." Root cause: this app has ONE shared set of DOM
+  elements for Stage/Masters/Review/Stack, repainted for whichever
+  project `switchToProject()` last opened — not one DOM tree per
+  project (deliberate, simple-SPA design). `pollJob()` (the loop started
+  by clicking Masters/Analyze/Stack's own Run button, distinct from the
+  ALREADY-correct global active-jobs panel) had no idea the user could
+  navigate to a completely different project while it kept running in
+  the background: it wrote into `#stack-pipeline`/`#stack-progress`/log
+  views and fired its `onDone` callback (which touches `state.status`,
+  `state.lastAnalyzeResult`, etc.) unconditionally, every tick, forever
+  — so a still-running OSC job's pipeline markers ended up painted
+  directly onto whatever OTHER project's Stack panel the user had since
+  opened. Two-part fix: (1) `pollJob()` now takes an `ownerProject`
+  (the project captured at the moment the job was started) and only
+  touches shared DOM / fires `onDone` while `state.project` still
+  matches it — going quiet rather than stopping outright, so it
+  correctly resumes updating if the user switches back before the job
+  finishes; (2) `switchToProject()` now explicitly resets
+  `#stack-pipeline`/`#stack-progress`/`#masters-progress`/
+  `#analyze-progress`/every `[data-log-view]` panel on every switch,
+  since part (1) alone only stops FUTURE contamination — DOM already
+  painted by another project's job before the user switched away needed
+  an explicit clear, not just a guard against further writes. Also
+  fixed the same underlying class of bug in `wireToggleButton()`
+  ("Preview script"): it cached its rendered output after the first
+  fetch and never re-fetched, so reopening the SAME panel after
+  switching projects would keep showing the FIRST project's script
+  forever — removed the caching entirely (a script-preview render is
+  cheap; there was no real reason to cache it across projects in the
+  first place). Verified for real via headless Chrome: started an
+  actual stack job on one project, switched to a completely different
+  one mid-run, confirmed the pipeline/progress areas were fully hidden
+  and empty immediately on switch AND stayed that way even after
+  waiting well past when the background job would have finished.
+- ✅ **Mono/narrowband output filenames now include the filter
+  (2026-09-22)** — Chris: "we also need to indicate the filter in the
+  final filename so that we can combine it appropriately in the
+  future." `output_basename()` (`app/ssf.py`) now takes the set of
+  filters actually present among the stack's included nights (read from
+  the same `night_filters` project-meta that backs the Stage-time
+  filter picker and the Stack-panel mismatch warning) and inserts them
+  between the project name and integration time — e.g.
+  `HeartNebula-IC1805_H_1h15m.fit` for a single-filter narrowband stack,
+  vs. `ElephantTrunkNebula-IC1396_5h24m.fit` for OSC data (no filter
+  segment at all, unchanged). If a stack somehow includes more than one
+  distinct filter — only possible by overriding the Stack panel's own
+  mismatch warning — they're joined with "+" rather than silently
+  picking one. Verified for real against a staged S-filter session.
 - ❌ **Crop is permanently out of scope**, not deferred — see Architecture
   decisions. Don't reopen this.
 - ❌ Archive/cleanup (the Endstate's last bullet) is explicitly deferred
@@ -1282,42 +1695,43 @@ the `raw/` staging layer exists at all — don't collapse it away):
   OSC-specific (this camera is Bayer/RGGB). A mono-camera path would drop
   `-cfa`/`-equalize_cfa`/`-debayer`.
 - The "few different stacking algorithms" knob Chris wants in the web UI
-  is the `stack ... rej 3 3 ...` line — swap `rej 3 3` for another Siril
-  rejection method, that's the whole parameterization surface.
+  is the `stack ... rej <type> <sigma_low> <sigma_high> ...` line's
+  rejection type — see "Current validated status"'s stacking-methods
+  entry (2026-09-22) for the three the UI actually exposes today.
 
 ## Immediate next steps
 Everything from prior rounds is **done** — see "Current validated status"
-for the full history. Crop is permanently out of scope (Architecture
-decisions), not deferred. Archive/cleanup is explicitly deferred per
-Chris, not started. **Format note (Chris, 2026-09-2x): keep this list
-numbered going forward** — makes it easy to say "do 1 and 2" and have
-that mean something unambiguous.
+for the full history, including CI + the UnRAID production deployment
+(both confirmed working, 2026-09-2x), the initial seven-feature round
+(output naming, stacking methods, root_dir, drizzle, header link,
+project-creation redesign, exposure mismatch warning), and a same-day
+follow-up round (integration-time format fix, the data-safety check
+against Chris's real production project, per-night calibration
+alignment replacing Stack's uniform master overrides, drizzle promoted
+out of advanced options, and a user-facing text audit) — all verified
+against Chris's reorganized real-layout test dataset. Crop is
+permanently out of scope (Architecture decisions), not deferred.
+Archive/cleanup is explicitly deferred per Chris, not started. **Format
+note (Chris, 2026-09-2x): keep this list numbered going forward.**
 
-1. **Two one-time GitHub settings Chris needs to set before the new CI
-   workflow's first push will actually succeed** (see item 2) —
-   `.github/workflows/docker-publish.yml` needs "Read and write
-   permissions" for `GITHUB_TOKEN` under Settings → Actions → General →
-   Workflow permissions (repos sometimes default this to read-only,
-   which would make the GHCR push fail with a 403); and after the first
-   successful run, the new `ghcr.io/cfmorrell/astro-stacker` package
-   needs its visibility flipped from the default "private" to "public"
-   (Package settings, in GitHub's UI — not something a workflow can set
-   for itself without extra token scope) so UnRAID can `docker pull` it
-   with no login. Chris chose public + GHCR + build-on-push-to-main when
-   asked (2026-09-21).
-2. **Package and deploy the production container on UnRAID.** The
-   Dockerfile itself is built and smoke-tested (see "Current validated
-   status"), and CI now builds+pushes it to `ghcr.io/cfmorrell/
-   astro-stacker:latest` automatically on every push to main that
-   touches the Dockerfile/app/static/templates/requirements.txt (see
-   `.github/workflows/docker-publish.yml`). What's left is Chris's own
-   call to make: an UnRAID Community Applications template (or a plain
-   `docker run`/compose setup) pointed at that image, deciding the real
-   `-p`/volume mappings for the production container (distinct from
-   `astro-stacker-dev`, which should probably keep running independently
-   rather than being replaced), and actually exposing it. Not started —
-   deliberately deferred to its own round per Chris ("we'll handle this
-   part of it afterwards").
+**Nothing open right now.** One known, deliberate tradeoff worth
+surfacing next time Chris is around calibration frames: a project's
+`root_dir` speeds up picking that target's own lights/flats but doesn't
+help navigate to shared calibration frames under
+`000-CalibrationFrames/...`, since those live in a completely separate
+part of the tree — see "Current validated status" item 3 above. Not
+changed without Chris's say-so; a separate remembered "calibration
+frames root" would be a reasonable follow-up if this friction turns out
+to matter in practice.
+
+**Incidental finding, not urgent**: while verifying the cross-project
+state-leak fix, found that `live-test-3`/`-4`/`-5`/`-6`/`-7`/`live-test1`/
+`live-test2` are now 100% broken symlinks (`/projects/{name}/broken-links`
+confirms it for each) — stale test projects staged before Chris's
+captures folder reorganization, pointing at paths that no longer exist.
+`live-test-8` and `mono-test-1` are still valid. Purely leftover clutter
+from earlier testing rounds, not a bug; worth a cleanup pass (delete via
+the UI) whenever Chris wants to tidy the dev container, no rush.
 
 The one future idea on the table (deleting an obviously-bad frame instead
 of just excluding it) is real but deliberately **not** listed as a next

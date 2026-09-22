@@ -103,7 +103,7 @@ function setStepBadge(badgeId, kind, text) {
 
 // ---------- job polling ----------
 
-async function pollJob(jobId, { progressEl, logViewEl, pipelineEl, onDone, lockButtons }) {
+async function pollJob(jobId, { progressEl, logViewEl, pipelineEl, onDone, lockButtons, ownerProject }) {
   const fill = progressEl ? progressEl.querySelector(".progress-fill") : null;
   const pct = progressEl ? progressEl.querySelector(".pct") : null;
   const msg = progressEl ? progressEl.querySelector(".msg") : null;
@@ -120,24 +120,45 @@ async function pollJob(jobId, { progressEl, logViewEl, pipelineEl, onDone, lockB
     try {
       snap = await api("GET", `/jobs/${jobId}`);
     } catch (e) {
-      (lockButtons || []).forEach((b) => { b.disabled = false; });
-      if (onDone) onDone({ status: "failed", error: String(e) });
+      // This app has ONE shared set of DOM elements for Stack/Masters/
+      // Review, repainted for whichever project switchToProject() last
+      // opened - not one tree per project. If the user has since
+      // navigated to a DIFFERENT project, every element this loop was
+      // given (progressEl, pipelineEl, lockButtons, and whatever onDone
+      // touches - e.g. state.lastAnalyzeResult) now belongs to THAT
+      // project, not this job's. Confirmed as a real bug (not
+      // hypothetical): Chris ran an OSC stack, started staging a mono
+      // project while it ran, and saw the OSC job's pipeline markers
+      // painted onto the mono project's Stack panel once he opened it -
+      // this loop had no idea he'd navigated away and kept writing into
+      // the (now reassigned) shared elements regardless. Going quiet
+      // once ownerProject no longer matches - rather than stopping the
+      // poll outright - still lets onDone fire correctly if the user
+      // switches BACK to this project before the job finishes.
+      if (!ownerProject || state.project === ownerProject) {
+        (lockButtons || []).forEach((b) => { b.disabled = false; });
+        if (onDone) onDone({ status: "failed", error: String(e) });
+      }
       return;
     }
-    const p = snap.percent_complete || 0;
-    if (fill) fill.style.width = `${Math.min(100, Math.max(0, p)).toFixed(0)}%`;
-    if (pct) pct.textContent = `${p.toFixed(0)}%`;
-    if (msg) msg.textContent = snap.current_command ? `[${snap.current_command}] ${snap.current_line || ""}` : (snap.current_line || "");
-    if (pipelineEl && snap.steps && snap.steps.length) renderPipelineSteps(pipelineEl, snap.steps, snap.current_step_index, snap.status);
-    if (logViewEl) {
-      try {
-        logViewEl.textContent = await api("GET", `/jobs/${jobId}/log`);
-        logViewEl.scrollTop = logViewEl.scrollHeight;
-      } catch (_) { /* log may not exist yet */ }
+    if (!ownerProject || state.project === ownerProject) {
+      const p = snap.percent_complete || 0;
+      if (fill) fill.style.width = `${Math.min(100, Math.max(0, p)).toFixed(0)}%`;
+      if (pct) pct.textContent = `${p.toFixed(0)}%`;
+      if (msg) msg.textContent = snap.current_command ? `[${snap.current_command}] ${snap.current_line || ""}` : (snap.current_line || "");
+      if (pipelineEl && snap.steps && snap.steps.length) renderPipelineSteps(pipelineEl, snap.steps, snap.current_step_index, snap.status);
+      if (logViewEl) {
+        try {
+          logViewEl.textContent = await api("GET", `/jobs/${jobId}/log`);
+          logViewEl.scrollTop = logViewEl.scrollHeight;
+        } catch (_) { /* log may not exist yet */ }
+      }
     }
     if (snap.status === "succeeded" || snap.status === "failed") {
-      (lockButtons || []).forEach((b) => { b.disabled = false; });
-      if (onDone) onDone(snap);
+      if (!ownerProject || state.project === ownerProject) {
+        (lockButtons || []).forEach((b) => { b.disabled = false; });
+        if (onDone) onDone(snap);
+      }
       return;
     }
     await new Promise((r) => setTimeout(r, 1200));
@@ -163,7 +184,6 @@ function wireToggleButton(btnId, logKey, fetchFn) {
   const btn = document.getElementById(btnId);
   const arrow = btn.querySelector(".arrow");
   const view = document.querySelector(`[data-log-view="${logKey}"]`);
-  let loaded = false;
   btn.addEventListener("click", async () => {
     const isOpen = view.classList.contains("open");
     if (isOpen) {
@@ -171,14 +191,18 @@ function wireToggleButton(btnId, logKey, fetchFn) {
       arrow.textContent = "▾";
       return;
     }
-    if (!loaded) {
-      view.textContent = "loading…";
-      try {
-        view.textContent = await fetchFn();
-        loaded = true;
-      } catch (e) {
-        view.textContent = String(e);
-      }
+    // Always re-fetch rather than caching after the first load - this
+    // view is shared across whichever project is currently open (see
+    // switchToProject()'s reset), and caching once meant switching
+    // projects and reopening this same panel kept showing the FIRST
+    // project's rendered script forever. Rendering a script preview is
+    // a cheap local template render, not a Siril run, so there's no real
+    // cost to just always asking again.
+    view.textContent = "loading…";
+    try {
+      view.textContent = await fetchFn();
+    } catch (e) {
+      view.textContent = String(e);
     }
     view.classList.add("open");
     arrow.textContent = "▴";
@@ -211,7 +235,13 @@ function renderBreadcrumb(rootLabel, path, onNavigate) {
 function attachFolderBrowser(inputEl, browseBtn, onSelect) {
   async function open() {
     closeAnyBrowser();
-    let path = inputEl.value || "";
+    // Start browsing from this project's own root_dir (set at creation -
+    // see the create-project flow below) rather than always the full
+    // captures root, so picking lights/flats/darks/biases doesn't mean
+    // walking the whole tree every time. Only a starting point, never a
+    // restriction: the breadcrumb below still reaches anywhere else under
+    // captures. Doesn't apply once a field already has its own value.
+    let path = inputEl.value || (state.status && state.status.root_dir) || "";
     const panel = el("div", { class: "card", style: "position:fixed; z-index:50; min-width:280px;" }, []);
     document.body.appendChild(panel);
     const rect = browseBtn.getBoundingClientRect();
@@ -239,7 +269,7 @@ function attachFolderBrowser(inputEl, browseBtn, onSelect) {
       }
       panel.appendChild(list);
       const actions = el("div", { style: "margin-top:8px; display:flex; gap:8px;" }, [
-        el("button", { class: "primary small", onclick: () => { inputEl.value = path; closeAnyBrowser(); if (onSelect) onSelect(data.detected_type); } }, ["Use this folder"]),
+        el("button", { class: "primary small", onclick: () => { inputEl.value = path; closeAnyBrowser(); if (onSelect) onSelect(data.detected_type, data.detected_exposure_s, data.detected_filters); } }, ["Use this folder"]),
         el("button", { class: "small ghost", onclick: () => closeAnyBrowser() }, ["Cancel"]),
       ]);
       panel.appendChild(actions);
@@ -260,9 +290,59 @@ function closeAnyBrowser() {
   }
 }
 
+// One-off captures folder pick, not tied to any persistent input field -
+// used by the create-project flow below to choose a project's root_dir.
+// Resolves the chosen path, or null if skipped. Shares the same
+// /captures/browse + breadcrumb UI as attachFolderBrowser above, just
+// resolving a promise instead of writing into an input on "use this".
+function pickCapturesFolder(anchorEl) {
+  return new Promise((resolve) => {
+    closeAnyBrowser();
+    let path = "";
+    const panel = el("div", { class: "card", style: "position:fixed; z-index:50; min-width:280px;" }, []);
+    document.body.appendChild(panel);
+    const rect = anchorEl.getBoundingClientRect();
+    panel.style.top = `${rect.bottom + 4}px`;
+    panel.style.left = `${rect.left}px`;
+    window.__openBrowserPanel = panel;
+
+    function finish(value) {
+      closeAnyBrowser();
+      resolve(value);
+    }
+
+    async function render() {
+      panel.innerHTML = "";
+      let data;
+      try {
+        data = await api("GET", `/captures/browse?path=${encodeURIComponent(path)}`);
+      } catch (e) {
+        panel.appendChild(el("div", { class: "status-line err" }, [String(e)]));
+        return;
+      }
+      panel.appendChild(renderBreadcrumb("captures", data.path, (target) => { path = target; render(); }));
+      panel.appendChild(el("div", { class: "hint mono" }, [`${data.fit_count} .fit files here`]));
+      const list = el("div", { style: "margin-top:6px; max-height:220px; overflow-y:auto;" }, []);
+      for (const d of data.dirs) {
+        list.appendChild(el("div", {
+          class: "night-row", style: "cursor:pointer; justify-content:space-between;",
+          onclick: () => { path = data.path ? `${data.path}/${d}` : d; render(); },
+        }, [d]));
+      }
+      panel.appendChild(list);
+      const actions = el("div", { style: "margin-top:8px; display:flex; gap:8px;" }, [
+        el("button", { class: "primary small", onclick: () => finish(path) }, ["Use this folder"]),
+        el("button", { class: "small ghost", onclick: () => finish(null) }, ["Skip"]),
+      ]);
+      panel.appendChild(actions);
+    }
+    render();
+  });
+}
+
 // ---------- project file browser (for Stack's master overrides) ----------
 
-function attachFileBrowser(inputEl, browseBtn, startPath) {
+function attachFileBrowser(inputEl, browseBtn, startPath, onSelect) {
   async function open() {
     closeAnyBrowser();
     let path = startPath;
@@ -293,12 +373,12 @@ function attachFileBrowser(inputEl, browseBtn, startPath) {
       for (const f of data.files) {
         list.appendChild(el("div", {
           class: "night-row", style: "cursor:pointer; justify-content:space-between;",
-          onclick: () => { inputEl.value = f.abs_path; closeAnyBrowser(); },
+          onclick: () => { inputEl.value = f.abs_path; closeAnyBrowser(); if (onSelect) onSelect(f.abs_path); },
         }, [f.name]));
       }
       panel.appendChild(list);
       const actions = el("div", { style: "margin-top:8px; display:flex; gap:8px;" }, [
-        el("button", { class: "small ghost", onclick: () => { inputEl.value = ""; closeAnyBrowser(); } }, ["✕ Clear (use default)"]),
+        el("button", { class: "small ghost", onclick: () => { inputEl.value = ""; closeAnyBrowser(); if (onSelect) onSelect(""); } }, ["✕ Clear (use default)"]),
         el("button", { class: "small ghost", onclick: () => closeAnyBrowser() }, ["Cancel"]),
       ]);
       panel.appendChild(actions);
@@ -349,6 +429,64 @@ function renderExistingStagedNights() {
   }
 }
 
+// Lets each night use a different dark/flat than its normal default (a
+// shared dark, its own flat) - e.g. a project spanning months where one
+// night was shot at a different temperature, or a night that's missing
+// its own flats and should borrow another night's. Saves immediately on
+// each change (POSTing the complete current picture, not just what
+// changed - see CalibrationOverridesRequest) rather than needing a
+// separate save step.
+function renderCalibrationAlignment(nights) {
+  const container = document.getElementById("calibration-alignment");
+  container.innerHTML = "";
+  if (!nights.length) {
+    container.appendChild(el("span", { class: "empty-hint" }, ["Stage at least one night first."]));
+    return;
+  }
+
+  async function saveOverrides() {
+    const night_dark_overrides = {};
+    const night_flat_overrides = {};
+    for (const row of Array.from(container.children)) {
+      const darkVal = row.querySelector(".calib-dark-input").value.trim();
+      const flatVal = row.querySelector(".calib-flat-input").value.trim();
+      if (darkVal) night_dark_overrides[row.dataset.night] = darkVal;
+      if (flatVal) night_flat_overrides[row.dataset.night] = flatVal;
+    }
+    try {
+      await api("POST", `/projects/${encodeURIComponent(state.project)}/calibration-overrides`, { night_dark_overrides, night_flat_overrides });
+    } catch (e) {
+      alert(`Saving calibration alignment failed: ${e}`);
+    }
+  }
+
+  for (const night of nights) {
+    const darkInput = el("input", {
+      type: "text", class: "dirpick calib-dark-input", placeholder: "default: shared dark",
+      readonly: "readonly", value: night.dark_override || "",
+    }, []);
+    const flatInput = el("input", {
+      type: "text", class: "dirpick calib-flat-input", placeholder: "default: this night's own flat",
+      readonly: "readonly", value: night.flat_override || "",
+    }, []);
+    const darkBrowse = el("button", { type: "button", class: "small" }, ["…"]);
+    const flatBrowse = el("button", { type: "button", class: "small" }, ["…"]);
+    attachFileBrowser(darkInput, darkBrowse, "process", saveOverrides);
+    attachFileBrowser(flatInput, flatBrowse, "process", saveOverrides);
+    container.appendChild(el("div", { class: "night-row", "data-night": night.name }, [
+      el("span", { class: "session-label" }, [nightDisplayLabel(night)]),
+      el("div", { class: "dirpick-group" }, [
+        el("span", { class: "dirpick-label" }, ["Dark"]),
+        el("div", { class: "dirpick-row" }, [darkInput, darkBrowse]),
+      ]),
+      el("div", { class: "dirpick-group" }, [
+        el("span", { class: "dirpick-label" }, ["Flat"]),
+        el("div", { class: "dirpick-row" }, [flatInput, flatBrowse]),
+      ]),
+    ]));
+  }
+}
+
 function addNightRow() {
   const container = document.getElementById("stage-nights");
   // Continue after whatever's already staged, not just count draft rows
@@ -369,17 +507,60 @@ function addNightRow() {
   const mismatchWarning = el("div", { class: "session-mismatch-warning", style: "display:none;" }, []);
   let lightsDetectedType = null;
   let flatsDetectedType = null;
+  let lightsDetectedExposureS = null;
+  // A filter-wheel camera's lights/flats folders can mix several filters
+  // together (e.g. narrowband H/O/S all in one "Light" folder) - see
+  // app/frameinfo.py's detect_filters(). One filter picked here applies
+  // to BOTH lights and flats when staging (see the stage-btn handler
+  // below, which reads it off row.dataset.filter), since a session's
+  // flats only make sense matched to that same session's filter.
+  const filterSelect = el("select", { class: "dirpick" }, []);
+  const filterGroup = el("div", { class: "dirpick-group", style: "display:none;" }, [
+    el("span", { class: "dirpick-label" }, ["Filter"]),
+    filterSelect,
+  ]);
+  filterSelect.addEventListener("change", () => { row.dataset.filter = filterSelect.value; });
+  function applyDetectedFilters(detectedFilters) {
+    if (!detectedFilters || !detectedFilters.length) return; // OSC/no filter wheel - leave as-is
+    if (detectedFilters.length === 1) {
+      row.dataset.filter = detectedFilters[0];
+      delete row.dataset.filterRequired;
+      filterGroup.style.display = "none";
+      return;
+    }
+    // Genuinely ambiguous - require an explicit pick rather than
+    // guessing or silently staging every filter mixed together. Keep
+    // whatever was already picked if it's still a valid choice for this
+    // new set (e.g. lights resolved to "S", then flats - ALSO mixed -
+    // gets picked next: don't throw away the S choice just because
+    // flats's own folder is ambiguous too).
+    row.dataset.filterRequired = "1";
+    const current = row.dataset.filter;
+    filterSelect.innerHTML = "";
+    filterSelect.appendChild(el("option", { value: "" }, ["— choose filter —"]));
+    for (const f of detectedFilters) filterSelect.appendChild(el("option", { value: f }, [f]));
+    if (current && detectedFilters.includes(current)) {
+      filterSelect.value = current;
+    } else {
+      delete row.dataset.filter;
+    }
+    filterGroup.style.display = "flex";
+  }
   // Not a hard block - Chris explicitly wants these catchable but still
   // possible (e.g. deliberately reusing one night's flats for another, or
-  // unusual filenames that don't include a type keyword). Combines two
-  // independent checks into one message so picking either field
-  // re-evaluates both without stacking multiple warning lines:
+  // unusual filenames that don't include a type keyword). Combines three
+  // independent checks into one message so picking any field re-evaluates
+  // all of them without stacking multiple warning lines:
   // 1) same parent folder = same session, matching how a real capture
   //    folder is normally laid out (Night 1/{lights,flats}) - catches a
   //    misclick like night1 lights + night2 flats;
   // 2) the folder's filenames actually look like the type being picked
   //    for (most capture software puts "Light"/"Flat"/etc. right in the
-  //    name - see _detect_frame_type() in app/main.py).
+  //    name - see _detect_frame_type() in app/main.py);
+  // 3) this night's lights exposure matches the project's darks exposure
+  //    (darks calibrate out sensor noise at a SPECIFIC exposure length -
+  //    a mismatch here silently produces a badly-calibrated stack, not
+  //    an error, so it's worth flagging same as the others).
   function updateSessionWarnings() {
     const messages = [];
     const lightsParent = lightsInput.value ? lightsInput.value.split("/").slice(0, -1).join("/") : "";
@@ -393,6 +574,9 @@ function addNightRow() {
     if (flatsDetectedType && flatsDetectedType !== "flat") {
       messages.push(`The flats folder looks like it contains ${flatsDetectedType === "mixed" ? "a mix of frame types" : `${flatsDetectedType} frames`}, not flats.`);
     }
+    if (lightsDetectedExposureS != null && darksDetectedExposureS != null && Math.abs(lightsDetectedExposureS - darksDetectedExposureS) > 0.01) {
+      messages.push(`These lights are ${formatExposure(lightsDetectedExposureS)} exposures, but the darks are ${formatExposure(darksDetectedExposureS)} — they won't calibrate correctly.`);
+    }
     if (messages.length) {
       mismatchWarning.textContent = "⚠ " + messages.join(" ") + " Double check you picked the right folders.";
       mismatchWarning.style.display = "block";
@@ -400,8 +584,18 @@ function addNightRow() {
       mismatchWarning.style.display = "none";
     }
   }
-  attachFolderBrowser(lightsInput, lightsBrowse, (detectedType) => { lightsDetectedType = detectedType; updateSessionWarnings(); });
-  attachFolderBrowser(flatsInput, flatsBrowse, (detectedType) => { flatsDetectedType = detectedType; updateSessionWarnings(); });
+  sessionWarningUpdaters.push(updateSessionWarnings);
+  attachFolderBrowser(lightsInput, lightsBrowse, (detectedType, detectedExposureS, detectedFilters) => {
+    lightsDetectedType = detectedType;
+    lightsDetectedExposureS = detectedExposureS;
+    applyDetectedFilters(detectedFilters);
+    updateSessionWarnings();
+  });
+  attachFolderBrowser(flatsInput, flatsBrowse, (detectedType, _detectedExposureS, detectedFilters) => {
+    flatsDetectedType = detectedType;
+    applyDetectedFilters(detectedFilters);
+    updateSessionWarnings();
+  });
   const lightsGroup = el("div", { class: "dirpick-group" }, [
     el("span", { class: "dirpick-label" }, ["Lights"]),
     el("div", { class: "dirpick-row" }, [lightsInput, lightsBrowse]),
@@ -410,8 +604,16 @@ function addNightRow() {
     el("span", { class: "dirpick-label" }, ["Flats"]),
     el("div", { class: "dirpick-row" }, [flatsInput, flatsBrowse]),
   ]);
-  const removeBtn = el("button", { type: "button", class: "small ghost", onclick: () => { row.remove(); renumberSessions(); } }, ["✕"]);
-  row.append(label, lightsGroup, flatsGroup, removeBtn, mismatchWarning);
+  const removeBtn = el("button", {
+    type: "button", class: "small ghost",
+    onclick: () => {
+      row.remove();
+      renumberSessions();
+      const idx = sessionWarningUpdaters.indexOf(updateSessionWarnings);
+      if (idx !== -1) sessionWarningUpdaters.splice(idx, 1);
+    },
+  }, ["✕"]);
+  row.append(label, lightsGroup, flatsGroup, filterGroup, removeBtn, mismatchWarning);
   container.appendChild(row);
 }
 
@@ -424,6 +626,10 @@ function renumberSessions() {
 }
 
 document.getElementById("add-night-btn").addEventListener("click", () => addNightRow());
+function formatExposure(seconds) {
+  return seconds < 1 ? `${Math.round(seconds * 1000)}ms` : `${seconds}s`;
+}
+
 function warnIfWrongType(expected, detectedType, warningEl) {
   if (detectedType && detectedType !== expected) {
     const what = detectedType === "mixed" ? "a mix of frame types, not consistently" : `${detectedType} frames, not`;
@@ -434,21 +640,42 @@ function warnIfWrongType(expected, detectedType, warningEl) {
   }
 }
 
+// Darks' own detected exposure, remembered so each session's lights
+// picker (added below) can warn if it doesn't match - darks are staged
+// once per project, lights per night, so this has to live above any one
+// session row. Re-checked against every already-rendered row's lights
+// whenever darks changes, via sessionWarningUpdaters (not just forward,
+// in case darks gets (re)picked after sessions already exist).
+let darksDetectedExposureS = null;
+const sessionWarningUpdaters = [];
+
 attachFolderBrowser(document.getElementById("biases-dir"), document.getElementById("biases-browse"), (detectedType) => {
   warnIfWrongType("bias", detectedType, document.getElementById("biases-type-warning"));
 });
-attachFolderBrowser(document.getElementById("darks-dir"), document.getElementById("darks-browse"), (detectedType) => {
+attachFolderBrowser(document.getElementById("darks-dir"), document.getElementById("darks-browse"), (detectedType, detectedExposureS) => {
   warnIfWrongType("dark", detectedType, document.getElementById("darks-type-warning"));
+  darksDetectedExposureS = detectedExposureS;
+  sessionWarningUpdaters.forEach((fn) => fn());
 });
 
 document.getElementById("stage-btn").addEventListener("click", async () => {
   if (!state.project) return;
-  let nextNum = nextNightNumber();
   const rows = Array.from(document.getElementById("stage-nights").children);
+  // A folder mixing several filters together (narrowband H/O/S etc. all
+  // in one "Light"/"Flat" folder - see app/frameinfo.py's
+  // detect_filters()) needs an explicit filter choice before staging;
+  // silently stacking every filter together would be a real, hard-to-
+  // notice mistake, not just a cosmetic one.
+  const pendingRow = rows.find((row) => row.dataset.filterRequired && !row.dataset.filter);
+  if (pendingRow) {
+    alert("One of your sessions has lights/flats mixing more than one filter — pick which filter that session is for before staging.");
+    return;
+  }
+  let nextNum = nextNightNumber();
   const nights = rows
     .map((row) => {
       const inputs = row.querySelectorAll("input");
-      return { lights_dir: inputs[0].value.trim(), flats_dir: inputs[1].value.trim() };
+      return { lights_dir: inputs[0].value.trim(), flats_dir: inputs[1].value.trim(), filter: row.dataset.filter || null };
     })
     .filter((n) => n.lights_dir && n.flats_dir)
     .map((n) => ({ ...n, name: `night${nextNum++}` }));
@@ -491,7 +718,7 @@ function renderStageSummary(staged) {
 
 // ---------- night checklists (shared pattern) ----------
 
-function renderChecklist(containerId, nights, selected, countFn) {
+function renderChecklist(containerId, nights, selected, countFn, onChange) {
   const container = document.getElementById(containerId);
   container.innerHTML = "";
   if (!nights.length) {
@@ -507,12 +734,14 @@ function renderChecklist(containerId, nights, selected, countFn) {
         onchange: (e) => {
           if (e.target.checked) selected.add(n.name); else selected.delete(n.name);
           chip.classList.toggle("checked", e.target.checked);
+          if (onChange) onChange();
         },
       }, []),
       document.createTextNode(`${nightDisplayLabel(n)} (${count(n)})`),
     ]);
     container.appendChild(chip);
   }
+  if (onChange) onChange();
 }
 
 function survivorCountForNight(n) {
@@ -522,9 +751,28 @@ function survivorCountForNight(n) {
   return analyzed.length - excluded;
 }
 
+// Selecting nights with DIFFERENT filters together would merge two
+// different wavelengths' data into one nonsensical stack (Siril has no
+// concept of "filter" - it'll happily merge anything) - not a hard
+// block, matching this app's other mismatch warnings, but worth a clear
+// heads-up before that mistake ships an hour-long stack job.
+function checkStackFilterMismatch() {
+  const warningEl = document.getElementById("stack-filter-warning");
+  if (!warningEl || !state.status) return;
+  const filters = new Set(
+    state.status.nights.filter((n) => stackSelected.has(n.name) && n.filter).map((n) => n.filter)
+  );
+  if (filters.size > 1) {
+    warningEl.textContent = `⚠ Selected nights use different filters (${Array.from(filters).join(", ")}) — merging different filters into one stack doesn't make sense. Double check your selection.`;
+    warningEl.style.display = "block";
+  } else {
+    warningEl.style.display = "none";
+  }
+}
+
 function refreshStackNightsChecklist() {
   if (!state.status) return;
-  renderChecklist("stack-nights", state.status.nights, stackSelected, survivorCountForNight);
+  renderChecklist("stack-nights", state.status.nights, stackSelected, survivorCountForNight, checkStackFilterMismatch);
 }
 
 const mastersSelected = new Set();
@@ -549,16 +797,19 @@ function renderMastersPreviews() {
   // Master bias/dark/flat are never debayered by Siril (only light
   // calibration gets -cfa/-debayer - see Handoff.md), so they're still a
   // raw Bayer mosaic same as an unstaged raw light; debayer them here the
-  // same way for a real look rather than grainy grayscale. "unlinked"
-  // (independent per-channel percentile+asinh) rather than "none": Chris
-  // asked for it specifically to actually see what these calibration
-  // frames look like - same reasoning as review's raw-light thumbnails,
-  // which are unbalanced straight off the sensor and need a per-channel
-  // stretch to look like more than a flat color wash.
+  // same way for a real look rather than grainy grayscale. "calibration"
+  // (per-channel ZScale, no asinh curve) rather than "unlinked" - a
+  // flat's real signal (vignetting) is a subtle, smooth few-percent
+  // gradient next to sharp, outlier dust-mote pixels, and the
+  // percentile+asinh curve "unlinked" uses (tuned for the opposite
+  // problem: huge-dynamic-range light frames) clips its black point
+  // right at the motes, crushing the whole vignetting gradient toward
+  // white - confirmed on real master flat data before choosing this fix
+  // (see app/imaging.py's docstring for the pixel-level before/after).
   const debayer = state.status.is_osc ? "&debayer=1" : "";
   for (const item of items) {
-    const thumbUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(item.path)}&max_size=220&stretch=unlinked${debayer}`;
-    const largeUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(item.path)}&max_size=1600&stretch=unlinked${debayer}`;
+    const thumbUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(item.path)}&max_size=220&stretch=calibration${debayer}`;
+    const largeUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(item.path)}&max_size=1600&stretch=calibration${debayer}`;
     container.appendChild(el("div", { class: "master-preview-card" }, [
       el("img", { src: thumbUrl, onclick: () => openPlainLightbox(largeUrl, item.label) }, []),
       el("div", { class: "master-preview-label" }, [item.label]),
@@ -587,12 +838,14 @@ document.getElementById("masters-run-btn").addEventListener("click", async () =>
   resultEl.innerHTML = "";
   resultEl.appendChild(el("div", { class: "status-line" }, ["starting…"]));
   runBtn.disabled = true;
+  const ownerProject = state.project;
   try {
-    const { job_id } = await api("POST", `/projects/${encodeURIComponent(state.project)}/masters/run`, mastersBody());
+    const { job_id } = await api("POST", `/projects/${encodeURIComponent(ownerProject)}/masters/run`, mastersBody());
     await pollJob(job_id, {
       progressEl: document.getElementById("masters-progress"),
       logViewEl: document.querySelector('[data-log-view="masters"]'),
       lockButtons: [runBtn],
+      ownerProject,
       onDone: async (snap) => {
         if (snap.status === "succeeded") setStepBadge("masters-status-badge", "ok", "masters built");
         else setOutcome(resultEl, false, `Failed: ${snap.error || ""}`);
@@ -1015,11 +1268,13 @@ async function runAnalyze() {
   setStepBadge("review-status-badge", null, "not analyzed");
   runBtn.disabled = true;
   rerunBtn.disabled = true;
+  const ownerProject = state.project;
   try {
-    const { job_id } = await api("POST", `/projects/${encodeURIComponent(state.project)}/lights/analyze/run`, body);
+    const { job_id } = await api("POST", `/projects/${encodeURIComponent(ownerProject)}/lights/analyze/run`, body);
     await pollJob(job_id, {
       progressEl: document.getElementById("analyze-progress"),
       lockButtons: [runBtn, rerunBtn],
+      ownerProject,
       onDone: (snap) => {
         if (snap.status !== "succeeded") {
           setOutcome(resultEl, false, `Failed: ${snap.error || ""}`);
@@ -1098,7 +1353,24 @@ document.getElementById("analyze-reset-btn").addEventListener("click", () => {
 function refreshExcludeDisplay() {
   document.getElementById("exclude-count").textContent = state.excludeFrames.size;
   const listEl = document.getElementById("exclude-list");
-  listEl.textContent = state.excludeFrames.size ? Array.from(state.excludeFrames).join(", ") : "none";
+  listEl.innerHTML = "";
+  if (!state.excludeFrames.size) {
+    listEl.textContent = "none";
+    return;
+  }
+  if (!state.lastAnalyzeResult) {
+    // No per-night breakdown available - fall back to a flat list rather
+    // than showing nothing.
+    listEl.textContent = Array.from(state.excludeFrames).join(", ");
+    return;
+  }
+  for (const [nightKey, frames] of Object.entries(state.lastAnalyzeResult.nights)) {
+    const excludedHere = frames.filter((f) => state.excludeFrames.has(f.filename)).map((f) => f.filename);
+    if (!excludedHere.length) continue;
+    const statusNight = state.status && state.status.nights.find((n) => n.name === nightKey);
+    const label = statusNight ? nightDisplayLabel(statusNight) : nightKey;
+    listEl.appendChild(el("div", {}, [el("b", {}, [`${label}: `]), excludedHere.join(", ")]));
+  }
 }
 
 function stackBody() {
@@ -1111,16 +1383,36 @@ function stackBody() {
     },
     is_osc: state.status ? state.status.is_osc !== false : true,
     exclude_frames: Array.from(state.excludeFrames),
+    drizzle: {
+      enabled: document.getElementById("stack-drizzle-enabled").checked,
+      scale: parseFloat(document.getElementById("stack-drizzle-scale").value) || 2.0,
+      pixel_fraction: parseFloat(document.getElementById("stack-drizzle-pixfrac").value) || 1.0,
+      kernel: document.getElementById("stack-drizzle-kernel").value,
+    },
   };
-  const dark = document.getElementById("stack-master-dark").value.trim();
-  const flat = document.getElementById("stack-master-flat").value.trim();
-  if (dark) body.master_dark = dark;
-  if (flat) body.master_flat = flat;
   return body;
 }
 
-attachFileBrowser(document.getElementById("stack-master-dark"), document.getElementById("stack-master-dark-browse"), "process");
-attachFileBrowser(document.getElementById("stack-master-flat"), document.getElementById("stack-master-flat-browse"), "process");
+// Sigma low/high are meaningless for "Mean" (rej none — no clipping at
+// all), so hiding them there rather than just leaving greyed-out inputs
+// matches Chris's ask ("only show Sigma values for Sigma Options").
+function wireSigmaVisibility(methodSelectId, lowFieldId, highFieldId) {
+  const select = document.getElementById(methodSelectId);
+  const update = () => {
+    const show = select.value !== "none";
+    document.getElementById(lowFieldId).style.display = show ? "" : "none";
+    document.getElementById(highFieldId).style.display = show ? "" : "none";
+  };
+  select.addEventListener("change", update);
+  update();
+}
+wireSigmaVisibility("masters-method", "masters-sigma-low-field", "masters-sigma-high-field");
+wireSigmaVisibility("stack-method", "stack-sigma-low-field", "stack-sigma-high-field");
+
+document.getElementById("stack-drizzle-enabled").addEventListener("change", (e) => {
+  document.getElementById("stack-drizzle-options").style.display = e.target.checked ? "flex" : "none";
+  document.getElementById("stack-drizzle-hint").style.display = e.target.checked ? "block" : "none";
+});
 
 wireToggleButton("stack-render-btn", "stack", () =>
   api("POST", `/projects/${encodeURIComponent(state.project)}/stack/render`, stackBody())
@@ -1143,13 +1435,15 @@ document.getElementById("stack-run-btn").addEventListener("click", async () => {
   previewEl.innerHTML = "";
   previewEl.dataset.builtFor = "";
   runBtn.disabled = true;
+  const ownerProject = state.project;
   try {
-    const { job_id } = await api("POST", `/projects/${encodeURIComponent(state.project)}/stack/run`, stackBody());
+    const { job_id } = await api("POST", `/projects/${encodeURIComponent(ownerProject)}/stack/run`, stackBody());
     await pollJob(job_id, {
       progressEl: document.getElementById("stack-progress"),
       logViewEl: document.querySelector('[data-log-view="stack"]'),
       pipelineEl: document.getElementById("stack-pipeline"),
       lockButtons: [runBtn],
+      ownerProject,
       onDone: async (snap) => {
         if (snap.status === "succeeded") setOutcome(resultEl, true, "Stack complete");
         else setOutcome(resultEl, false, `Failed: ${snap.error || ""}`);
@@ -1314,6 +1608,7 @@ async function loadProjectStatus() {
   renderChecklist("analyze-nights", nights, analyzeSelected);
   refreshStackNightsChecklist();
   renderExistingStagedNights();
+  renderCalibrationAlignment(nights);
   // The draft "Session N" row(s) in the Stage form are created by
   // addNightRow() at project-switch time, BEFORE this function's fetch
   // resolves - at that point state.status is still null (just reset),
@@ -1431,8 +1726,6 @@ async function switchToProject(name, initialStep) {
   document.getElementById("stage-next-btn").style.display = "none";
   document.getElementById("masters-next-btn").style.display = "none";
   document.getElementById("review-next-btn").style.display = "none";
-  document.getElementById("stack-master-dark").value = "";
-  document.getElementById("stack-master-flat").value = "";
   setStepBadge("review-status-badge", null, "not analyzed");
   // Same staleness risk as state.status above: these otherwise only get
   // updated inside loadProjectStatus()'s success path, so a project that
@@ -1453,6 +1746,22 @@ async function switchToProject(name, initialStep) {
   // from whichever project was open before.
   document.getElementById("stack-preview").innerHTML = "";
   document.getElementById("stack-preview").dataset.builtFor = "";
+  // A running job's pollJob() loop now stops updating these once the user
+  // navigates to a different project (see pollJob's ownerProject guard),
+  // but it can't retroactively undo DOM it already painted BEFORE that
+  // navigation happened - without this, opening a different project's
+  // Stack panel could still show another project's leftover progress bar
+  // or pipeline-step markers (confirmed as a real bug: Chris saw a mono
+  // project's calibrate/register/stack markers already green, painted
+  // there by an OSC project's stack job that was still running when he
+  // switched away from it). Every project shares these same DOM elements
+  // (repainted per switch, not one tree per project - see module intro),
+  // so a full reset here is the fix, not just guarding future writes.
+  for (const id of ["masters-progress", "analyze-progress", "stack-progress", "stack-pipeline"]) {
+    document.getElementById(id).style.display = "none";
+  }
+  document.getElementById("stack-pipeline").innerHTML = "";
+  document.querySelectorAll("[data-log-view]").forEach((el) => { el.textContent = ""; el.classList.remove("open"); });
   showActiveStep();
   if (state.project) await loadProjectStatus();
   // Restore a cached review session for the INCOMING project, if this
@@ -1478,20 +1787,31 @@ async function switchToProject(name, initialStep) {
 
 document.getElementById("project-select").addEventListener("change", (e) => switchToProject(e.target.value || null, "stage"));
 
+document.getElementById("brand-link").addEventListener("click", (e) => {
+  e.preventDefault();
+  document.getElementById("project-select").value = "";
+  switchToProject(null, "stage");
+});
+
 document.getElementById("create-project-btn").addEventListener("click", async () => {
-  const name = document.getElementById("new-project-name").value.trim();
+  const name = (prompt("New project name:") || "").trim();
   if (!name) return;
-  // A project is "created" the moment it's staged with at least biases/
-  // darks — /projects/{name}/stage makes the directory if needed, so just
-  // select it here and let Stage below do the actual creation.
-  await loadProjects();
-  const sel = document.getElementById("project-select");
-  if (!Array.from(sel.options).some((o) => o.value === name)) {
-    sel.appendChild(el("option", { value: name }, [name]));
+  // root_dir is optional (Skip leaves it unset - pickers just fall back
+  // to browsing from the full captures root, same as before this
+  // existed) but asked for up front since it's meant to seed every
+  // picker for the rest of this project's Stage step.
+  const rootDir = await pickCapturesFolder(document.getElementById("create-project-btn"));
+  try {
+    // /stage creates the project directory (and writes root_dir into its
+    // meta) even with nothing else to stage yet - see staging.py.
+    await api("POST", `/projects/${encodeURIComponent(name)}/stage`, rootDir ? { root_dir: rootDir } : {});
+  } catch (e) {
+    alert(`Create failed: ${e}`);
+    return;
   }
-  sel.value = name;
-  sel.dispatchEvent(new Event("change"));
-  document.getElementById("new-project-name").value = "";
+  await loadProjects();
+  document.getElementById("project-select").value = name;
+  await switchToProject(name, "stage");
 });
 
 document.getElementById("refresh-status-btn").addEventListener("click", loadProjectStatus);

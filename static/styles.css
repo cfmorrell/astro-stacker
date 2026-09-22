@@ -44,6 +44,12 @@ header.topbar {
   font-weight: 700;
   color: var(--accent);
   letter-spacing: -0.01em;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.brand:hover {
+  text-decoration: underline;
 }
 
 .brand-sub {

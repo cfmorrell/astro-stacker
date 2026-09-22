@@ -8,7 +8,7 @@
 </head>
 <body>
 <header class="topbar">
-  <div><span class="brand">astro-stacker</span><span class="brand-sub">calibrate · review · stack</span></div>
+  <div><a href="#" id="brand-link" class="brand">astro-stacker</a><span class="brand-sub">calibrate · review · stack</span></div>
   <div id="health-badge" class="badge">checking…</div>
 </header>
 
@@ -20,11 +20,7 @@
     </div>
     <div class="field" style="margin-bottom:0;">
       <label>&nbsp;</label>
-      <input type="text" id="new-project-name" placeholder="new-project-name" />
-    </div>
-    <div class="field" style="margin-bottom:0;">
-      <label>&nbsp;</label>
-      <button id="create-project-btn">+ Create</button>
+      <button id="create-project-btn">+ New project</button>
     </div>
     <div class="field" style="margin-bottom:0; margin-left:auto;">
       <label>&nbsp;</label>
@@ -72,25 +68,6 @@
           <div id="stage-status-badge" class="badge">not staged</div>
         </div>
 
-        <div class="field-row">
-          <div class="field">
-            <label>Biases dir (relative to captures)</label>
-            <div style="display:flex; gap:6px;">
-              <input type="text" id="biases-dir" placeholder="click … to browse" style="flex:1;" readonly />
-              <button type="button" class="small" id="biases-browse">…</button>
-            </div>
-            <div id="biases-type-warning" class="session-mismatch-warning" style="display:none;"></div>
-          </div>
-          <div class="field">
-            <label>Darks dir (relative to captures)</label>
-            <div style="display:flex; gap:6px;">
-              <input type="text" id="darks-dir" placeholder="click … to browse" style="flex:1;" readonly />
-              <button type="button" class="small" id="darks-browse">…</button>
-            </div>
-            <div id="darks-type-warning" class="session-mismatch-warning" style="display:none;"></div>
-          </div>
-        </div>
-
         <div class="field">
           <label><input type="checkbox" id="stage-is-osc" checked /> OSC / Bayer color camera (e.g. ASI2600MC) — used to debayer review thumbnails/previews</label>
         </div>
@@ -102,6 +79,25 @@
         <div id="stage-nights"></div>
         <button id="add-night-btn" class="small">+ Add session</button>
         <p class="hint">Sessions are numbered automatically — you never need to name them; internally they're stored as night1, night2, etc. Checkboxes elsewhere show whatever your source folder was actually called.</p>
+
+        <div class="field-row" style="margin-top:14px;">
+          <div class="field">
+            <label>Biases dir</label>
+            <div style="display:flex; gap:6px;">
+              <input type="text" id="biases-dir" placeholder="click … to browse" style="flex:1;" readonly />
+              <button type="button" class="small" id="biases-browse">…</button>
+            </div>
+            <div id="biases-type-warning" class="session-mismatch-warning" style="display:none;"></div>
+          </div>
+          <div class="field">
+            <label>Darks dir</label>
+            <div style="display:flex; gap:6px;">
+              <input type="text" id="darks-dir" placeholder="click … to browse" style="flex:1;" readonly />
+              <button type="button" class="small" id="darks-browse">…</button>
+            </div>
+            <div id="darks-type-warning" class="session-mismatch-warning" style="display:none;"></div>
+          </div>
+        </div>
 
         <div class="progress-wrap">
           <button id="stage-btn" class="primary">Stage files</button>
@@ -122,22 +118,24 @@
         <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Nights to build flats for</label>
         <div id="masters-nights" class="checklist"></div>
 
+        <label style="display:block; font-size:12px; color:var(--text-muted); margin: 14px 0 6px;">Calibration alignment</label>
+        <div id="calibration-alignment"></div>
+        <p class="hint">By default, every night shares the same dark and uses its own flat. Point a night at a different file if it needs its own dark (e.g. shot at a different temperature) or should reuse another night's flat (e.g. it doesn't have its own).</p>
+
         <div class="field-row">
           <div class="field">
             <label>Stack method</label>
             <select id="masters-method">
-              <option value="rej">Rejection (sigma)</option>
-              <option value="med">Median</option>
-              <option value="sum">Sum</option>
-              <option value="max">Max</option>
-              <option value="min">Min</option>
+              <option value="sigma">Rejection (Sigma)</option>
+              <option value="winsorized" selected>Winsorized Sigma</option>
+              <option value="none">Mean</option>
             </select>
           </div>
-          <div class="field">
+          <div class="field" id="masters-sigma-low-field">
             <label>Sigma low</label>
             <input type="number" id="masters-sigma-low" value="3.0" step="0.1" />
           </div>
-          <div class="field">
+          <div class="field" id="masters-sigma-high-field">
             <label>Sigma high</label>
             <input type="number" id="masters-sigma-high" value="3.0" step="0.1" />
           </div>
@@ -161,7 +159,7 @@
     <section class="step-panel" data-step="review">
       <div class="card">
         <div class="card-header">
-          <div class="card-title">Per-frame quality check (astropy + photutils, no Siril)</div>
+          <div class="card-title">Per-frame quality check</div>
           <div id="review-status-badge" class="badge">not analyzed</div>
         </div>
 
@@ -207,7 +205,7 @@
           <button id="analyze-accept-recommended-btn" class="small">✓ Accept recommended exclusions</button>
         </div>
         <div id="analyze-output"></div>
-        <p class="hint">Flags are recommendations only — nothing is excluded unless you check it below. FWHM/eccentricity use photutils' own conventions (eccentricity here = "roundness": 0 = round, higher = more elongated) and are not comparable to Siril's.</p>
+        <p class="hint">Flags are recommendations only — nothing is excluded unless you check it below. Roundness here is 0 for a round star and grows as it gets more elongated — the opposite direction from Siril's own eccentricity number, so don't expect these values to match what you're used to seeing there.</p>
       </div>
     </section>
 
@@ -215,53 +213,57 @@
     <section class="step-panel" data-step="stack">
       <div class="card">
         <div class="card-header">
-          <div class="card-title">Calibrate, register, stack into result.fit</div>
+          <div class="card-title">Calibrate, register, and stack into the final image</div>
           <div id="stack-status-badge" class="badge">not stacked</div>
         </div>
 
         <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Nights to stack</label>
         <div id="stack-nights" class="checklist"></div>
+        <div id="stack-filter-warning" class="session-mismatch-warning" style="display:none;"></div>
 
         <div class="field-row">
           <div class="field">
             <label>Stack method</label>
             <select id="stack-method">
-              <option value="rej">Rejection (sigma)</option>
-              <option value="med">Median</option>
-              <option value="sum">Sum</option>
-              <option value="max">Max</option>
-              <option value="min">Min</option>
+              <option value="sigma">Rejection (Sigma)</option>
+              <option value="winsorized" selected>Winsorized Sigma</option>
+              <option value="none">Mean</option>
             </select>
           </div>
-          <div class="field">
+          <div class="field" id="stack-sigma-low-field">
             <label>Sigma low</label>
             <input type="number" id="stack-sigma-low" value="3.0" step="0.1" />
           </div>
-          <div class="field">
+          <div class="field" id="stack-sigma-high-field">
             <label>Sigma high</label>
             <input type="number" id="stack-sigma-high" value="3.0" step="0.1" />
           </div>
         </div>
-        <span class="toggle-adv" data-adv-for="stack">advanced options</span>
-        <div class="adv-fields" data-adv="stack">
-          <div class="field-row">
-            <div class="field">
-              <label>Master dark override</label>
-              <div style="display:flex; gap:6px;">
-                <input type="text" id="stack-master-dark" placeholder="default: shared master_dark" style="flex:1;" readonly />
-                <button type="button" class="small" id="stack-master-dark-browse">…</button>
-              </div>
-            </div>
-            <div class="field">
-              <label>Master flat override</label>
-              <div style="display:flex; gap:6px;">
-                <input type="text" id="stack-master-flat" placeholder="default: per-night master_flat" style="flex:1;" readonly />
-                <button type="button" class="small" id="stack-master-flat-browse">…</button>
-              </div>
-            </div>
-          </div>
-          <p class="hint">Master flat override applies to ALL selected nights uniformly — use only if a night is missing its own flats. See Handoff.md.</p>
+        <div class="field">
+          <label><input type="checkbox" id="stack-drizzle-enabled" /> Drizzle</label>
         </div>
+        <div class="field-row" id="stack-drizzle-options" style="display:none;">
+          <div class="field">
+            <label>Scale</label>
+            <input type="number" id="stack-drizzle-scale" value="2.0" step="0.1" min="0.1" max="3.0" />
+          </div>
+          <div class="field">
+            <label>Pixel fraction</label>
+            <input type="number" id="stack-drizzle-pixfrac" value="1.0" step="0.1" min="0.1" max="2.0" />
+          </div>
+          <div class="field">
+            <label>Kernel</label>
+            <select id="stack-drizzle-kernel">
+              <option value="square" selected>Square</option>
+              <option value="point">Point</option>
+              <option value="turbo">Turbo</option>
+              <option value="gaussian">Gaussian</option>
+              <option value="lanczos2">Lanczos2</option>
+              <option value="lanczos3">Lanczos3</option>
+            </select>
+          </div>
+        </div>
+        <p class="hint" id="stack-drizzle-hint" style="display:none;">For a color camera, drizzled frames are never demosaiced into color before registration — color reconstruction happens as part of the drizzle process itself instead. This is expected and doesn't affect the final result's color.</p>
 
         <div class="field">
           <label>Excluded frames (<span id="exclude-count">0</span> selected in Review)</label>
