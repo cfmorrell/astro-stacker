@@ -7,8 +7,13 @@ requires 1.4.0
 # or register_stack_merge.ssf.j2) once every night's pp_light exists.
 # NOTE: `cd "path"` strips quotes correctly, but `-key="path"` style
 # options (-out=/-dark=/-flat=) do NOT — keep those unquoted.
+# -dark=/-flat=/-cc= are all genuinely optional to Siril's own `calibrate`
+# command - included here only when a dark/flat master is actually
+# available for this night, so a project with no calibration frames at
+# all (or missing just one of dark/flat) still stacks successfully
+# instead of hard-failing.
 cd "{{ raw_lights }}"
 convert light -out={{ process_dir }}
 cd "{{ process_dir }}"
-calibrate light -dark={{ dark_master }} -flat={{ flat_master }}{{ cc_flag }}{{ osc_flags }}
+calibrate light{% if dark_master %} -dark={{ dark_master }}{% endif %}{% if flat_master %} -flat={{ flat_master }}{% endif %}{{ cc_flag }}{{ osc_flags }}
 close

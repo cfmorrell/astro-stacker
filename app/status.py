@@ -30,6 +30,20 @@ def project_status(project: Path) -> dict:
     process = project / "process"
     meta = config.read_project_meta(project)
     night_labels = meta.get("night_labels", {})
+    # Actual `-out=` filename from the most recent single-night stack for
+    # this night, recorded by main.py's run_stack() right before the job
+    # starts (see app/ssf.py's output_basename() — Project Name + total
+    # integration time, not always literally "result.fit" anymore).
+    # Falls back to "result.fit" for a project stacked before this existed.
+    night_result_filenames = meta.get("night_result_filenames", {})
+    # Per-night calibration alignment (see CalibrationOverridesRequest) -
+    # a night absent from either dict just uses its normal default
+    # (shared master_dark / that night's own master_flat).
+    night_dark_overrides = meta.get("night_dark_overrides", {})
+    night_flat_overrides = meta.get("night_flat_overrides", {})
+    # Filter code staged for this night (see NightSource.filter), None for
+    # an unfiltered/OSC session or a project staged before this existed.
+    night_filters = meta.get("night_filters", {})
 
     nights = []
     nights_dir = raw / "nights"
@@ -42,7 +56,8 @@ def project_status(project: Path) -> dict:
             # docstring's raw/process layout. Paths returned are relative
             # to the project dir, ready to pass straight to
             # GET /projects/{name}/preview?path=... .
-            result_rel = f"process/nights/{name}/lights/result.fit"
+            result_filename = night_result_filenames.get(name, "result.fit")
+            result_rel = f"process/nights/{name}/lights/{result_filename}"
             nights.append(
                 {
                     "name": name,
@@ -57,12 +72,16 @@ def project_status(project: Path) -> dict:
                     "master_flat_built": _master_exists(night_process / "master_flat"),
                     "result_path": result_rel if (project / result_rel).exists() else None,
                     "sample_light_path": _sample_light_path(night_dir / "lights", project),
+                    "dark_override": night_dark_overrides.get(name),
+                    "flat_override": night_flat_overrides.get(name),
+                    "filter": night_filters.get(name),
                 }
             )
 
     # A multi-night stack's merged result lands in the shared
     # process/lights/_merged/ workspace (see app/ssf.py).
-    merged_rel = "process/lights/_merged/result.fit"
+    merged_filename = meta.get("merged_result_filename", "result.fit")
+    merged_rel = f"process/lights/_merged/{merged_filename}"
     return {
         "biases_count": _count_fits(raw / "biases"),
         "darks_count": _count_fits(raw / "darks"),
@@ -73,6 +92,10 @@ def project_status(project: Path) -> dict:
         # Defaults True (matches StackLightsRequest.is_osc's own default)
         # for projects staged before this setting existed.
         "is_osc": meta.get("is_osc", True),
+        # Starting path for this project's folder pickers, relative to
+        # CAPTURES_DIR - None for projects created before this existed
+        # (pickers just fall back to browsing from the captures root).
+        "root_dir": meta.get("root_dir"),
     }
 
 

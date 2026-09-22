@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import config
+from . import config, frameinfo
 from .models import StageProjectRequest
 
 _FIT_SUFFIXES = {".fit", ".fits"}
@@ -45,16 +45,32 @@ def _resolve_capture_dir(rel: str) -> Path:
     return candidate
 
 
-def _link_dir(source: Path, dest: Path) -> int:
+def _link_dir(source: Path, dest: Path, filter_code: str | None = None) -> int:
+    """Symlink every FITS file from source into dest, or (when filter_code
+    is given) only those whose filename matches that filter — see
+    NightSource's docstring. dest is wiped of stale FITS symlinks first
+    (not just added to) so re-staging with a different/no filter can't
+    leave a previous filter's files behind mixed in with the new ones.
+    """
     dest.mkdir(parents=True, exist_ok=True)
+    for existing in dest.iterdir():
+        if existing.is_symlink() and existing.suffix.lower() in _FIT_SUFFIXES:
+            existing.unlink()
     count = 0
     for src in sorted(source.iterdir()):
         if src.suffix.lower() not in _FIT_SUFFIXES:
+            continue
+        if filter_code is not None and frameinfo.parse_filter(src.name) != filter_code.upper():
             continue
         link = dest / src.name
         link.unlink(missing_ok=True)
         link.symlink_to(src.resolve())
         count += 1
+    if filter_code is not None and count == 0:
+        raise ValueError(
+            f"no files in {str(source)!r} matched filter {filter_code!r} — "
+            "check the filter code against what's actually in this folder"
+        )
     return count
 
 
@@ -84,21 +100,35 @@ def stage_project(project: Path, req: StageProjectRequest) -> dict:
         flats_source = _resolve_capture_dir(night.flats_dir)
         night_root = project / "raw" / "nights" / night.name
         nights_summary[night.name] = {
-            "lights": _link_dir(lights_source, night_root / "lights"),
-            "flats": _link_dir(flats_source, night_root / "flats"),
+            "lights": _link_dir(lights_source, night_root / "lights", night.filter),
+            "flats": _link_dir(flats_source, night_root / "flats", night.filter),
         }
         # The frontend never asks for a night name (auto-numbered night1,
         # night2, ...) but Chris wants the checkboxes elsewhere in the UI
         # to show whatever the SOURCE folder was actually called (e.g. his
         # real capture folders are literally "Night 1"/"Night 2") — so
         # remember that original folder name here, keyed by our internal
-        # name, purely for display.
-        night_labels[night.name] = Path(night.lights_dir).parent.name or night.name
+        # name, purely for display. A filter gets appended so three
+        # sessions built from the same physical folder (one per filter)
+        # don't all show up with the identical label.
+        base_label = Path(night.lights_dir).parent.name or night.name
+        night_labels[night.name] = f"{base_label} ({night.filter})" if night.filter else base_label
+        # Tracked separately (structured, not just baked into the display
+        # label) so the frontend can warn if nights with DIFFERENT filters
+        # ever get selected together for a merge+stack - combining two
+        # different filters' lights into one stack is never correct.
+        meta.setdefault("night_filters", {})[night.name] = night.filter
     if nights_summary:
         summary["nights"] = nights_summary
 
     if req.is_osc is not None:
         meta["is_osc"] = req.is_osc
+    if req.root_dir is not None:
+        # Validated the same way as biases_dir/darks_dir (must actually
+        # exist under CAPTURES_DIR) even though nothing is linked from it
+        # directly - it's purely a remembered starting path for pickers.
+        _resolve_capture_dir(req.root_dir)
+        meta["root_dir"] = req.root_dir
     config.write_project_meta(project, meta)
 
     return summary

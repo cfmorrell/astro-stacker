@@ -36,6 +36,7 @@ Raw/process layout:
 
 from __future__ import annotations
 
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +44,7 @@ from typing import Optional
 
 from jinja2 import Environment, FileSystemLoader
 
+from . import config, frameinfo
 from .models import BuildMastersRequest, StackLightsRequest
 
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
@@ -227,16 +229,69 @@ def render_build_masters(project: Path, req: BuildMastersRequest) -> list[SirilS
     return steps
 
 
+_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def _format_integration(total_seconds: float) -> str:
+    # Rounds to whole minutes FIRST, then splits into h/m - avoids a
+    # rounding-carry bug (e.g. 59.6 minutes must become "1h0m", not
+    # "0h60m") that computing hours and minutes as separate roundings
+    # independently would risk.
+    total_minutes = round(total_seconds / 60)
+    hours, minutes = divmod(total_minutes, 60)
+    if hours == 0:
+        return f"{minutes}m"
+    return f"{hours}h{minutes}m" if minutes else f"{hours}h"
+
+
+def output_basename(project: Path, total_seconds: float, filters: frozenset[str] = frozenset()) -> str:
+    """The final stacked file's name (without extension): the project
+    name, its filter(s) if any, and total integration time actually
+    going into this stack (Chris: "rename output file as Project Name +
+    total integration time", format "1h12m" not "1.2h" per follow-up
+    feedback) — e.g. "ElephantTrunkNebula-IC1396_5h24m" for OSC data, or
+    "HeartNebula-IC1805_H_1h15m" for a mono/narrowband stack, so the
+    filter is recoverable from the filename alone when combining several
+    filters' results later (in other software - out of scope here).
+    Falls back to just the project name if no frame's exposure could be
+    determined at all, rather than a misleading "_0m". Multiple distinct
+    filters (only possible by ignoring the Stack step's own mismatch
+    warning - see checkStackFilterMismatch() in app.js) are joined with
+    "+" rather than silently picking one.
+    """
+    safe_name = _SAFE_NAME_RE.sub("_", project.name).strip("_") or project.name
+    if filters:
+        safe_name = f"{safe_name}_{'+'.join(sorted(filters))}"
+    if total_seconds <= 0:
+        return safe_name
+    return f"{safe_name}_{_format_integration(total_seconds)}"
+
+
 def _resolve_nights(
     project: Path, req: StackLightsRequest
-) -> tuple[list[dict], str, list[LightSelection], Path | None]:
+) -> tuple[list[dict], list[LightSelection], Path | None, float]:
     """Night/master resolution for /stack/run. Returns
-    (nights, dark_master, light_selections, merge_dir), raising
+    (nights, light_selections, merge_dir, total_light_seconds), raising
     ValueError (-> HTTP 400 in main.py) for anything that would otherwise
     reach siril-cli as a silent, confusing failure: a bad night name, a
     missing lights directory, or a missing master file (see Handoff.md
     gotcha #4 and the 2026-09-20 "string" placeholder incident this
     validation was added for).
+
+    Each night's dark_master/flat_master come from this project's
+    calibration overrides (project meta, set via
+    /projects/{name}/calibration-overrides — see
+    CalibrationOverridesRequest) when present, falling back to the
+    normal shared process/master_dark / that night's own
+    process/nights/<name>/master_flat otherwise. dark_master is
+    genuinely per-night now (not one shared value for every night in the
+    request) so a project spanning months can use a different dark for a
+    night shot under different conditions. Either can resolve to None —
+    no override AND nothing built for the default — in which case that
+    night's calibrate step simply omits that argument (Siril's own
+    -dark=/-flat=/-cc= are all optional) rather than failing; an
+    override that's set but doesn't actually exist on disk is still a
+    hard error, since that's a real mistake, not "nothing available."
 
     Every project always uses the raw/nights/<name>/{lights,flats} layout
     — there is no separate single-night layout (dropped 2026-09-20 after
@@ -265,6 +320,33 @@ def _resolve_nights(
     """
     raw = project / "raw"
     process = project / "process"
+    meta = config.read_project_meta(project)
+    dark_overrides: dict = meta.get("night_dark_overrides", {})
+    flat_overrides: dict = meta.get("night_flat_overrides", {})
+    night_filters: dict = meta.get("night_filters", {})
+
+    def _master_exists(master: str) -> bool:
+        return Path(master).exists() or Path(master + ".fit").exists()
+
+    def _resolve_master(explicit: Optional[str], default: str, kind: str, night_name: str) -> Optional[str]:
+        """An explicitly-set override that doesn't actually exist is a real
+        mistake worth a hard error; a default (nothing built, no override)
+        that's simply not there just means "skip this calibration step for
+        this night" — Chris: "can we stack successfully if we skip past
+        the calibration frame process entirely?" Siril's own `calibrate`
+        command already treats -dark=/-flat= as fully optional (confirmed
+        via `help calibrate`), so this mirrors that rather than assuming
+        every project has full calibration frames.
+        """
+        if explicit:
+            if not _master_exists(explicit):
+                raise ValueError(
+                    f"master {kind} override not found at {explicit!r} (or "
+                    f"{explicit}.fit) for night {night_name!r} — check the "
+                    "calibration alignment set for this night"
+                )
+            return explicit
+        return default if _master_exists(default) else None
 
     nights: list[dict] = []
     for name in req.nights:
@@ -275,14 +357,19 @@ def _resolve_nights(
                 "key": name,
                 "raw_lights": raw / "nights" / name / "lights",
                 "process_dir": process / "nights" / name / "lights",
-                "flat_master": req.master_flat or str(process / "nights" / name / "master_flat"),
+                "dark_master": _resolve_master(dark_overrides.get(name), str(process / "master_dark"), "dark", name),
+                "flat_master": _resolve_master(
+                    flat_overrides.get(name), str(process / "nights" / name / "master_flat"), "flat", name
+                ),
+                "filter": night_filters.get(name),
             }
         )
     merge_dir = process / "lights" / "_merged" if len(nights) > 1 else None
 
-    dark_master = req.master_dark or str(process / "master_dark")
+    exclude = frozenset(req.exclude_frames)
 
     selections: list[LightSelection] = []
+    total_seconds = 0.0
     for night in nights:
         raw_lights: Path = night["raw_lights"]
         if not raw_lights.is_dir():
@@ -291,6 +378,17 @@ def _resolve_nights(
                 "project's raw/ layout, or the `nights` list if this is a "
                 "multi-night request)"
             )
+        # Computed from the RAW dir (before the selected/filtered dir
+        # below is substituted in) minus excluded names, rather than from
+        # whatever raw_lights ends up pointing at - the selected dir is
+        # only actually populated on disk later, by
+        # apply_light_selections(), well after this function returns.
+        for f in raw_lights.iterdir():
+            if f.suffix.lower() not in _FIT_SUFFIXES or f.name in exclude:
+                continue
+            seconds = frameinfo.parse_exposure_seconds(f.name)
+            if seconds is not None:
+                total_seconds += seconds
         if req.exclude_frames:
             selected_dir = process / "_selected" / night["key"] / "lights"
             selections.append(
@@ -304,41 +402,40 @@ def _resolve_nights(
         else:
             night["raw_lights"] = raw_lights
 
-    def _master_exists(master: str) -> bool:
-        return Path(master).exists() or Path(master + ".fit").exists()
-
-    if not _master_exists(dark_master):
-        raise ValueError(
-            f"master dark not found at {dark_master!r} (or {dark_master}.fit) "
-            "— build masters first via /masters/run, or pass an explicit "
-            "master_dark override"
-        )
-    for night in nights:
-        flat_master = night["flat_master"]
-        if not _master_exists(flat_master):
-            raise ValueError(
-                f"master flat not found at {flat_master!r} (or {flat_master}.fit) "
-                f"for night {night['key']!r} — build masters first via "
-                "/masters/run (with matching `nights`), or pass an explicit "
-                "master_flat override"
-            )
-
-    return nights, dark_master, selections, merge_dir
+    return nights, selections, merge_dir, total_seconds
 
 
 def render_stack_lights(
     project: Path, req: StackLightsRequest
-) -> tuple[list[SirilStep], list[dict], list[LightSelection]]:
+) -> tuple[list[SirilStep], list[dict], list[LightSelection], str]:
     """Calibrate each night independently (its own siril-cli process —
     Handoff.md gotcha #8), then register+stack (single night) or
     merge+register+stack (2+ nights) in one final step. Returns
-    (steps, nights, light_selections) — `nights` (the resolved per-night
-    dicts) is exposed for callers that need to locate output after the
-    job runs; `light_selections` must be applied via
-    apply_light_selections() before the job's steps run, same as before.
+    (steps, nights, light_selections, output_basename) — `nights` (the
+    resolved per-night dicts) is exposed for callers that need to locate
+    output after the job runs; `light_selections` must be applied via
+    apply_light_selections() before the job's steps run, same as before;
+    `output_basename` (project name, filter if any, and total integration
+    time, e.g. "ElephantTrunkNebula-IC1396_5h24m" or, for a mono/
+    narrowband stack, "HeartNebula-IC1805_H_1h15m") is the actual `-out=`
+    filename used below, exposed so main.py can record it in project meta
+    for /status to find the result afterward (see output_basename()'s
+    docstring — a project's Siril output is no longer always "result").
     """
-    nights, dark_master, selections, merge_dir = _resolve_nights(project, req)
-    osc_flags = " -cfa -equalize_cfa -debayer" if req.is_osc else ""
+    nights, selections, merge_dir, total_seconds = _resolve_nights(project, req)
+    filters = frozenset(n["filter"] for n in nights if n["filter"])
+    output_name = output_basename(project, total_seconds, filters)
+
+    # Siril's own drizzle docs (confirmed via `help register`): "when
+    # using -drizzle on images taken with a color camera, the input
+    # images must not be debayered" - -cfa (cosmetic correction) and
+    # -equalize_cfa (flat tint correction) still apply either way, only
+    # -debayer itself is conditional on drizzle being off.
+    if req.is_osc:
+        osc_flags = " -cfa -equalize_cfa" + ("" if req.drizzle.enabled else " -debayer")
+    else:
+        osc_flags = ""
+    register_flags = req.drizzle.to_ssf()
 
     steps: list[SirilStep] = []
     calibrate_tpl = _env.get_template("calibrate_night.ssf.j2")
@@ -347,9 +444,11 @@ def render_stack_lights(
         text = calibrate_tpl.render(
             raw_lights=str(night["raw_lights"]),
             process_dir=str(process_dir),
-            dark_master=dark_master,
+            dark_master=night["dark_master"],
             flat_master=night["flat_master"],
-            cc_flag=" -cc=dark",
+            # -cc=dark detects hot/cold pixels FROM the dark master, so it
+            # needs one to reference - can't be used without one.
+            cc_flag=" -cc=dark" if night["dark_master"] else "",
             osc_flags=osc_flags,
         )
         steps.append(
@@ -366,6 +465,8 @@ def render_stack_lights(
             merge_dir=str(merge_dir),
             pp_light_dirs=[str(n["process_dir"]) for n in nights],
             stack_cmd=req.stack.to_ssf(),
+            register_flags=register_flags,
+            output_name=output_name,
         )
         steps.append(
             SirilStep(
@@ -380,10 +481,12 @@ def render_stack_lights(
         text = _env.get_template("register_stack_single.ssf.j2").render(
             process_dir=str(only),
             stack_cmd=req.stack.to_ssf(),
+            register_flags=register_flags,
+            output_name=output_name,
         )
         # fresh_dir=None: this reuses the SAME dir the one calibrate step
         # above just populated with pp_light — wiping it here would
         # delete that sequence before register ever sees it.
         steps.append(SirilStep(script=text, workdir=only, label="register+stack"))
 
-    return steps, nights, selections
+    return steps, nights, selections, output_name

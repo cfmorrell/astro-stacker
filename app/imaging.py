@@ -3,17 +3,32 @@
 for eyeballing a finished result.fit. Not used anywhere in the actual
 calibration/stacking pipeline; purely a display convenience.
 
-Three stretch modes (Chris asked for these on the final stack preview,
-matching a common astro-processing choice):
+Four stretch modes:
 - "none": percentile-clipped linear — no curve, closest to the raw data.
 - "linked": percentile + asinh stretch computed jointly across all
   channels (one black/white point for R+G+B together) — preserves
   relative color balance; the default.
 - "unlinked": percentile + asinh computed separately PER channel — can
   correct color balance (each channel gets its own black/white point) at
-  the cost of it no longer reflecting the true relative color.
-Only "linked" vs "unlinked" differ for multi-channel (calibrated/stacked)
-data; a raw single-plane Bayer sub has no channels to link or not.
+  the cost of it no longer reflecting the true relative color. Chris
+  asked for "none"/"linked"/"unlinked" on the final stack preview,
+  matching a common astro-processing choice.
+- "calibration": for master bias/dark/flat previews specifically, not a
+  choice exposed to Chris. A flat's real signal (vignetting) is only a
+  ~5-10% brightness variation, while dust motes are sharp outlier pixels
+  covering under ~0.5% of the frame - PercentileInterval+AsinhStretch
+  (tuned for the opposite problem: huge-dynamic-range light frames with
+  faint nebulosity against near-black sky) clips its black point right
+  at the motes' dark cores, crushing the entire smooth vignetting
+  gradient into the top of the visible range ("blown out, vignetting
+  barely visible, motes way too strong" - confirmed by rendering real
+  master flat data and comparing pixel histograms before choosing this
+  fix, not guessed at). ZScaleInterval (per channel, no curve at all) is
+  built for exactly this — robust to a small fraction of outlier pixels
+  while preserving midtone contrast — and visibly fixed it on real data.
+Only "linked" vs "unlinked"/"calibration" differ for multi-channel
+(calibrated/stacked) data; a raw single-plane Bayer sub has no channels
+to link or not.
 """
 
 from __future__ import annotations
@@ -23,12 +38,12 @@ from pathlib import Path
 
 import numpy as np
 from astropy.io import fits
-from astropy.visualization import AsinhStretch, PercentileInterval
+from astropy.visualization import AsinhStretch, PercentileInterval, ZScaleInterval
 from PIL import Image
 
 DEFAULT_MAX_SIZE = 1024
 DEFAULT_STRETCH = "linked"
-_STRETCH_MODES = ("none", "linked", "unlinked")
+_STRETCH_MODES = ("none", "linked", "unlinked", "calibration")
 
 # (R, G1, B, G2) sample offsets within a 2x2 Bayer tile, keyed by the FITS
 # BAYERPAT convention (top-left pixel first, reading left-to-right).
@@ -127,6 +142,11 @@ def _block_average(arr: np.ndarray, stride: int) -> np.ndarray:
 
 
 def _apply_stretch(arr: np.ndarray, mode: str) -> np.ndarray:
+    if mode == "calibration":
+        lo, hi = ZScaleInterval().get_limits(arr)
+        if hi <= lo:  # degenerate (perfectly flat) input - avoid a divide-by-zero
+            return np.zeros_like(arr)
+        return np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
     interval = PercentileInterval(99.5)
     if mode == "none":
         return np.clip(interval(arr), 0.0, 1.0)
@@ -193,12 +213,18 @@ def render_preview_png(
     if stride > 1:
         rgb = _block_average(rgb, stride)
 
-    if rgb.ndim == 3 and stretch == "unlinked":
-        # Per-channel: each gets its own percentile+asinh curve, i.e. its
-        # own black/white point — "linked" is what _apply_stretch(..,
-        # "linked") does to a single channel too, just called once per
-        # channel here instead of once across all of them jointly.
-        normed = np.stack([_apply_stretch(rgb[..., c], "linked") for c in range(rgb.shape[-1])], axis=-1)
+    if rgb.ndim == 3 and stretch in ("unlinked", "calibration"):
+        # Per-channel: each gets its own curve/black-white-point, computed
+        # independently instead of once across all channels jointly. For
+        # "unlinked" this passes "linked" into _apply_stretch() per
+        # channel — deliberately NOT "unlinked" again, since that mode
+        # only means anything at the multi-channel level handled right
+        # here; a single channel's own percentile+asinh math is identical
+        # either way. "calibration" DOES need to stay "calibration" here
+        # though, since that's a genuinely different curve (ZScale, no
+        # asinh) - collapsing it to "linked" would silently undo the fix.
+        per_channel_mode = "linked" if stretch == "unlinked" else "calibration"
+        normed = np.stack([_apply_stretch(rgb[..., c], per_channel_mode) for c in range(rgb.shape[-1])], axis=-1)
     else:
         normed = _apply_stretch(rgb, stretch)
     img8 = (normed * 255).astype(np.uint8)

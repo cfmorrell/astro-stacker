@@ -9,6 +9,6 @@ requires 1.4.0
 # one place; per-night calibrate is what gotcha #8 actually made expensive.
 cd "{{ merge_dir }}"
 merge {% for p in pp_light_dirs %}"{{ p }}/pp_light"{{ " " if not loop.last else "" }}{% endfor %} all_lights
-register all_lights -layer=0
-stack r_all_lights {{ stack_cmd }} -norm=addscale -output_norm -out=result
+register all_lights -layer=0{{ register_flags }}
+stack r_all_lights {{ stack_cmd }} -norm=addscale -output_norm -out={{ output_name }}
 close

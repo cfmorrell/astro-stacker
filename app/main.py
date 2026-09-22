@@ -16,10 +16,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import config, framestats, imaging, jobs, ssf, staging, status
+from . import config, frameinfo, framestats, imaging, jobs, ssf, staging, status
 from .models import (
     AnalyzeLightsRequest,
     BuildMastersRequest,
+    CalibrationOverridesRequest,
     StackLightsRequest,
     StageProjectRequest,
 )
@@ -129,35 +130,6 @@ def check_broken_links(name: str):
     return {"checked": checked, "broken": broken}
 
 
-_FRAME_TYPE_KEYWORDS = ("light", "dark", "flat", "bias")
-
-
-def _detect_frame_type(filenames: list[str]) -> str | None:
-    """Guess what kind of frames a directory holds by checking each
-    filename (case-insensitive) for one of the standard type keywords —
-    most capture software (ASIAIR, N.I.N.A., etc.) puts this right in the
-    name, e.g. "Light_Target_300.0s_...fit". Backs a Stage-time warning
-    when a picked folder doesn't look like the field it was picked for
-    (e.g. a "flats" folder full of files that all say "Dark").
-
-    Returns the dominant type if at least 90% of files that mention ANY
-    keyword agree on which one; "mixed" if they don't (inconsistent
-    naming — still worth a warning); None if no file mentions a keyword
-    at all, since that's "we can't tell," not "this looks wrong."
-    """
-    counts = {k: 0 for k in _FRAME_TYPE_KEYWORDS}
-    for name in filenames:
-        lower = name.lower()
-        matched = [k for k in _FRAME_TYPE_KEYWORDS if k in lower]
-        if len(matched) == 1:
-            counts[matched[0]] += 1
-    total = sum(counts.values())
-    if total == 0:
-        return None
-    dominant_type, dominant_count = max(counts.items(), key=lambda kv: kv[1])
-    return dominant_type if dominant_count / total >= 0.9 else "mixed"
-
-
 @app.get("/captures/browse")
 def browse_captures(path: str = ""):
     """List subdirectories under CAPTURES_DIR (read-only) so the frontend
@@ -173,7 +145,18 @@ def browse_captures(path: str = ""):
         raise HTTPException(status_code=404, detail=f"not a directory under captures: {path!r}")
     dirs = sorted(p.name for p in target.iterdir() if p.is_dir())
     fit_names = [p.name for pat in ("*.fit", "*.fits") for p in target.glob(pat)]
-    return {"path": path, "dirs": dirs, "fit_count": len(fit_names), "detected_type": _detect_frame_type(fit_names)}
+    return {
+        "path": path,
+        "dirs": dirs,
+        "fit_count": len(fit_names),
+        "detected_type": frameinfo.detect_frame_type(fit_names),
+        "detected_exposure_s": frameinfo.detect_exposure_seconds(fit_names),
+        # Distinct filter codes found in this folder (e.g. ["H","O","S"]
+        # for a mixed narrowband folder), empty for OSC/no-filter-wheel
+        # data - lets the frontend offer a filter picker only when this
+        # folder actually mixes more than one filter together.
+        "detected_filters": frameinfo.detect_filters(fit_names),
+    }
 
 
 def _project_relative_file(project: Path, path: str) -> Path:
@@ -270,6 +253,22 @@ def stage_project(name: str, req: StageProjectRequest | None = None):
     return {"project": name, "staged": summary}
 
 
+@app.post("/projects/{name}/calibration-overrides")
+def set_calibration_overrides(name: str, req: CalibrationOverridesRequest):
+    """Set which nights use a different dark/flat master than their normal
+    default (see CalibrationOverridesRequest) - the "aligning calibration
+    frames to nights" panel on the frontend's Masters step. Replaces
+    whatever was recorded before entirely; the frontend always sends its
+    complete current picture, not an incremental change.
+    """
+    project = _project_or_404(name)
+    meta = config.read_project_meta(project)
+    meta["night_dark_overrides"] = req.night_dark_overrides
+    meta["night_flat_overrides"] = req.night_flat_overrides
+    config.write_project_meta(project, meta)
+    return {"ok": True}
+
+
 def _render_steps_text(steps: list[ssf.SirilStep]) -> str:
     """Join several independent siril-cli scripts into one dry-run preview,
     clearly marked as separate invocations — see Handoff.md gotcha #8 for
@@ -337,7 +336,7 @@ def run_masters(name: str, req: BuildMastersRequest):
 def render_stack(name: str, req: StackLightsRequest):
     project = _project_or_404(name)
     try:
-        steps, _nights, _selections = ssf.render_stack_lights(project, req)
+        steps, _nights, _selections, _output_name = ssf.render_stack_lights(project, req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _render_steps_text(steps)
@@ -348,10 +347,20 @@ def run_stack(name: str, req: StackLightsRequest):
     project = _project_or_404(name)
     _reject_if_job_running(name)
     try:
-        steps, _nights, selections = ssf.render_stack_lights(project, req)
+        steps, nights, selections, output_name = ssf.render_stack_lights(project, req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     ssf.apply_light_selections(selections)
+    # Recorded before the job actually runs (its output filename is fixed
+    # once rendered, and /status only ever reports a result as present if
+    # the file exists on disk anyway - a failed run just leaves a stale,
+    # harmless filename here until the next successful one overwrites it).
+    meta = config.read_project_meta(project)
+    if len(nights) > 1:
+        meta["merged_result_filename"] = f"{output_name}.fit"
+    else:
+        meta.setdefault("night_result_filenames", {})[nights[0]["key"]] = f"{output_name}.fit"
+    config.write_project_meta(project, meta)
     return _run_steps(steps, project, name, "stack")
 
 

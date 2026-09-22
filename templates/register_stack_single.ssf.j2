@@ -5,6 +5,6 @@ requires 1.4.0
 # calibrate_night.ssf.j2's sibling step, which already produced it, and
 # Handoff.md gotcha #7: Siril's `merge` refuses fewer than two inputs).
 cd "{{ process_dir }}"
-register pp_light
-stack r_pp_light {{ stack_cmd }} -norm=addscale -output_norm -out=result
+register pp_light{{ register_flags }}
+stack r_pp_light {{ stack_cmd }} -norm=addscale -output_norm -out={{ output_name }}
 close

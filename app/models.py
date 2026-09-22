@@ -14,23 +14,31 @@ from pydantic import BaseModel, Field
 
 
 class StackMethod(str, Enum):
-    rejection = "rej"  # sigma-clipped rejection stacking (validated default: rej 3 3)
-    median = "med"
-    sum = "sum"
-    maximum = "max"
-    minimum = "min"
+    """Per `siril-cli`'s own `help stack` (1.4.3): `rej`/`mean` are the same
+    stack type, with a REJECTION TYPE sub-argument (sigma, winsorized,
+    none, percentile, median, linear, generalized, mad — Winsorized is
+    Siril's own default if omitted). Chris asked to narrow the UI to just
+    these three (2026-09-2x): plain sigma-clipping, Winsorized sigma
+    (usually the better-behaved choice against outliers with small
+    per-night frame counts), and a plain mean (rejection type `none` — no
+    clipping at all, so sigma_low/sigma_high are meaningless for it).
+    """
+
+    rejection_sigma = "sigma"
+    winsorized_sigma = "winsorized"
+    mean = "none"
 
 
 class StackOptions(BaseModel):
-    method: StackMethod = StackMethod.rejection
+    method: StackMethod = StackMethod.winsorized_sigma
     sigma_low: float = 3.0
     sigma_high: float = 3.0
 
     def to_ssf(self) -> str:
         """Render the method portion of a Siril `stack` command line."""
-        if self.method == StackMethod.rejection:
-            return f"rej {self.sigma_low:g} {self.sigma_high:g}"
-        return self.method.value
+        if self.method == StackMethod.mean:
+            return "rej none"
+        return f"rej {self.method.value} {self.sigma_low:g} {self.sigma_high:g}"
 
 
 class BuildMastersRequest(BaseModel):
@@ -58,11 +66,68 @@ class BuildMastersRequest(BaseModel):
     model_config = {
         "json_schema_extra": {
             "example": {
-                "stack": {"method": "rej", "sigma_low": 3.0, "sigma_high": 3.0},
+                "stack": {"method": "winsorized", "sigma_low": 3.0, "sigma_high": 3.0},
                 "nights": ["night1"],
             }
         }
     }
+
+
+class DrizzleKernel(str, Enum):
+    point = "point"
+    turbo = "turbo"
+    square = "square"
+    gaussian = "gaussian"
+    lanczos2 = "lanczos2"
+    lanczos3 = "lanczos3"
+
+
+class DrizzleOptions(BaseModel):
+    """Maps directly to `register`'s `-drizzle` sub-options (per `siril-cli`'s
+    own `help register`, 1.4.3). `scale` is register's own `-scale=` option
+    (0.1-3.0) — a plain rescale that isn't drizzle-specific but is normally
+    paired with it (e.g. 2x drizzle for oversampled/undersampled data).
+
+    IMPORTANT interaction confirmed from Siril's own help text: "when using
+    -drizzle on images taken with a color camera, the input images must not
+    be debayered" — see ssf.py's render_stack_lights(), which drops the
+    `-debayer` calibrate flag (but keeps `-cfa`/`-equalize_cfa`) whenever
+    this is enabled on an OSC project.
+    """
+
+    enabled: bool = False
+    scale: float = Field(default=2.0, ge=0.1, le=3.0)  # Chris: default to 2x, not 1x (no upscale)
+    pixel_fraction: float = Field(default=1.0, gt=0.0, le=2.0)
+    kernel: DrizzleKernel = DrizzleKernel.square
+
+    def to_ssf(self) -> str:
+        if not self.enabled:
+            return ""
+        return f" -drizzle -scale={self.scale:g} -pixfrac={self.pixel_fraction:g} -kernel={self.kernel.value}"
+
+
+class CalibrationOverridesRequest(BaseModel):
+    """Per-night dark/flat master alignment for a project — Chris's own
+    framing: "aligning calibration frames to nights." Lives in project
+    meta (set via /projects/{name}/calibration-overrides, read back by
+    /status), not on a per-stack-run request, since it's a property of
+    how this project's calibration is set up rather than something to
+    re-specify every time a stack runs.
+
+    Each dict maps a night's internal name to an absolute .fit path to
+    use INSTEAD of that night's normal default (the shared
+    process/master_dark for dark; that night's own
+    process/nights/<name>/master_flat for flat) — e.g. a long-running
+    project spanning months might use a different dark for a night shot
+    at a different camera temperature, or borrow another night's flat
+    for a night that never got its own. A night simply absent from
+    either dict uses its normal default; this is the full desired state
+    each call (the frontend always resends its complete current
+    picture), not a partial merge.
+    """
+
+    night_dark_overrides: dict[str, str] = Field(default_factory=dict)
+    night_flat_overrides: dict[str, str] = Field(default_factory=dict)
 
 
 class StackLightsRequest(BaseModel):
@@ -85,17 +150,16 @@ class StackLightsRequest(BaseModel):
     default (process/nights/<name>/master_flat), because flats capture
     dust/vignetting that genuinely changes night to night and get retaken
     for that reason — don't default this to one shared flat "for
-    simplicity." The `master_flat` override below exists for the actual
-    exception: a specific night that's missing its own flats and should
-    reuse another night's (or an external master library's) instead.
+    simplicity." Either default can be overridden per night — see
+    CalibrationOverridesRequest above — rather than uniformly for every
+    selected night at once.
     """
 
     nights: list[str] = Field(..., min_length=1)
     stack: StackOptions = Field(default_factory=StackOptions)
     is_osc: bool = True  # False drops -cfa/-equalize_cfa/-debayer for mono cameras
-    master_dark: Optional[str] = None  # absolute path override; default process/master_dark (shared)
-    master_flat: Optional[str] = None  # override for a night missing its own flats; default is per-night, not shared
     exclude_frames: list[str] = Field(default_factory=list)  # raw light frame basenames to skip (see /lights/analyze)
+    drizzle: DrizzleOptions = Field(default_factory=DrizzleOptions)
 
     model_config = {
         # FastAPI/Swagger has no way to know [] is a meaningful sentinel
@@ -109,10 +173,8 @@ class StackLightsRequest(BaseModel):
         "json_schema_extra": {
             "example": {
                 "nights": ["night1"],
-                "stack": {"method": "rej", "sigma_low": 3.0, "sigma_high": 3.0},
+                "stack": {"method": "winsorized", "sigma_low": 3.0, "sigma_high": 3.0},
                 "is_osc": True,
-                "master_dark": None,
-                "master_flat": None,
                 "exclude_frames": [],
             }
         }
@@ -182,15 +244,25 @@ class NightSource(BaseModel):
     mapping. `name` is chosen by the caller and is what actually lands on
     disk (raw/nights/<name>/...) — source folder names (e.g. "Night 1",
     with a space) never need to match any naming convention.
+
+    `filter` handles a filter-wheel camera whose lights/flats folders mix
+    several filters together (e.g. a narrowband mono session with H/O/S
+    all in one "Light" folder and one "Flat" folder) — when set, only
+    files whose filename matches this filter code (case-insensitive; see
+    app/frameinfo.py's parse_filter()) are staged from EITHER dir, so one
+    physical folder pair can back several independent sessions, one per
+    filter. None stages everything in both dirs, unfiltered — the normal
+    case for an OSC camera with no filter wheel at all.
     """
 
     name: str
     lights_dir: str  # path relative to CAPTURES_DIR, e.g. "Night 1/lights"
     flats_dir: str  # path relative to CAPTURES_DIR, e.g. "Night 1/flats"
+    filter: Optional[str] = None
 
     model_config = {
         "json_schema_extra": {
-            "example": {"name": "night1", "lights_dir": "Night 1/lights", "flats_dir": "Night 1/flats"}
+            "example": {"name": "night1", "lights_dir": "Night 1/lights", "flats_dir": "Night 1/flats", "filter": None}
         }
     }
 
@@ -210,6 +282,14 @@ class StageProjectRequest(BaseModel):
     darks_dir: Optional[str] = None  # relative to CAPTURES_DIR
     nights: list[NightSource] = Field(default_factory=list)
     is_osc: Optional[bool] = None  # None = leave any previously-recorded setting alone; see app/config.py's project meta
+    # Starting point for this project's folder pickers (relative to
+    # CAPTURES_DIR), set once at project creation — e.g. a target's own
+    # dated capture folder, so browsing lights/flats/darks/biases doesn't
+    # mean walking the whole captures tree from its root every time. A
+    # starting point only, never a restriction: every picker still lets you
+    # navigate anywhere else under CAPTURES_DIR via its breadcrumb. None
+    # leaves any previously-recorded value alone, same as is_osc above.
+    root_dir: Optional[str] = None
 
     model_config = {
         "json_schema_extra": {
