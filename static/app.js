@@ -269,7 +269,7 @@ function attachFolderBrowser(inputEl, browseBtn, onSelect) {
       }
       panel.appendChild(list);
       const actions = el("div", { style: "margin-top:8px; display:flex; gap:8px;" }, [
-        el("button", { class: "primary small", onclick: () => { inputEl.value = path; closeAnyBrowser(); if (onSelect) onSelect(data.detected_type, data.detected_exposure_s, data.detected_filters); } }, ["Use this folder"]),
+        el("button", { class: "primary small", onclick: () => { inputEl.value = path; closeAnyBrowser(); if (onSelect) onSelect(data); } }, ["Use this folder"]),
         el("button", { class: "small ghost", onclick: () => closeAnyBrowser() }, ["Cancel"]),
       ]);
       panel.appendChild(actions);
@@ -508,6 +508,10 @@ function addNightRow() {
   let lightsDetectedType = null;
   let flatsDetectedType = null;
   let lightsDetectedExposureS = null;
+  let lightsSampleDateObs = null;
+  let lightsSampleInstrument = null;
+  let flatsSampleDateObs = null;
+  let flatsSampleInstrument = null;
   // A filter-wheel camera's lights/flats folders can mix several filters
   // together (e.g. narrowband H/O/S all in one "Light" folder) - see
   // app/frameinfo.py's detect_filters(). One filter picked here applies
@@ -548,7 +552,7 @@ function addNightRow() {
   }
   // Not a hard block - Chris explicitly wants these catchable but still
   // possible (e.g. deliberately reusing one night's flats for another, or
-  // unusual filenames that don't include a type keyword). Combines three
+  // unusual filenames that don't include a type keyword). Combines several
   // independent checks into one message so picking any field re-evaluates
   // all of them without stacking multiple warning lines:
   // 1) same parent folder = same session, matching how a real capture
@@ -560,7 +564,19 @@ function addNightRow() {
   // 3) this night's lights exposure matches the project's darks exposure
   //    (darks calibrate out sensor noise at a SPECIFIC exposure length -
   //    a mismatch here silently produces a badly-calibrated stack, not
-  //    an error, so it's worth flagging same as the others).
+  //    an error, so it's worth flagging same as the others);
+  // 4) these flats' actual FITS capture date (not filename - see
+  //    app/fitsinfo.py) is within a day of the lights', since flats
+  //    correct dust/vignetting that can change session to session;
+  // 5) darks/bias aren't more than a year older or a month newer than
+  //    these lights - sensor characteristics drift over that kind of
+  //    span, same reasoning as the flats date check but a looser window
+  //    since dark/bias frames are valid for longer than a single flat is;
+  // 6) every calibration frame type was shot on the SAME PHYSICAL CAMERA
+  //    as these lights (FITS INSTRUME, e.g. "ZWO ASI2600MC Duo") - the
+  //    one thing no filename convention encodes, and the most serious
+  //    mistake to catch (pointing at a completely different camera's
+  //    calibration library, not just an out-of-date one).
   function updateSessionWarnings() {
     const messages = [];
     const lightsParent = lightsInput.value ? lightsInput.value.split("/").slice(0, -1).join("/") : "";
@@ -577,6 +593,30 @@ function addNightRow() {
     if (lightsDetectedExposureS != null && darksDetectedExposureS != null && Math.abs(lightsDetectedExposureS - darksDetectedExposureS) > 0.01) {
       messages.push(`These lights are ${formatExposure(lightsDetectedExposureS)} exposures, but the darks are ${formatExposure(darksDetectedExposureS)} — they won't calibrate correctly.`);
     }
+    const lightsDate = parseFitsDate(lightsSampleDateObs);
+    const flatsDate = parseFitsDate(flatsSampleDateObs);
+    if (lightsDate && flatsDate && Math.abs(daysBetween(lightsDate, flatsDate)) > 1) {
+      messages.push("These flats look like they're from a different session than the lights (more than a day apart) — flats correct dust/vignetting that can change from one session to the next.");
+    }
+    if (lightsSampleInstrument && flatsSampleInstrument && lightsSampleInstrument !== flatsSampleInstrument) {
+      messages.push(`These flats look like they're from a different camera (${flatsSampleInstrument}) than the lights (${lightsSampleInstrument}).`);
+    }
+    const darksDate = parseFitsDate(darksSampleDateObs);
+    if (lightsDate && darksDate) {
+      if (daysBetween(darksDate, lightsDate) > 365) messages.push("These darks are over a year older than the lights they'd calibrate.");
+      else if (daysBetween(lightsDate, darksDate) > 30) messages.push("These darks are more than a month newer than the lights they'd calibrate.");
+    }
+    if (lightsSampleInstrument && darksSampleInstrument && lightsSampleInstrument !== darksSampleInstrument) {
+      messages.push(`The darks look like they're from a different camera (${darksSampleInstrument}) than the lights (${lightsSampleInstrument}).`);
+    }
+    const biasDate = parseFitsDate(biasesSampleDateObs);
+    if (lightsDate && biasDate) {
+      if (daysBetween(biasDate, lightsDate) > 365) messages.push("The bias frames are over a year older than the lights they'd calibrate.");
+      else if (daysBetween(lightsDate, biasDate) > 30) messages.push("The bias frames are more than a month newer than the lights they'd calibrate.");
+    }
+    if (lightsSampleInstrument && biasesSampleInstrument && lightsSampleInstrument !== biasesSampleInstrument) {
+      messages.push(`The bias frames look like they're from a different camera (${biasesSampleInstrument}) than the lights (${lightsSampleInstrument}).`);
+    }
     if (messages.length) {
       mismatchWarning.textContent = "⚠ " + messages.join(" ") + " Double check you picked the right folders.";
       mismatchWarning.style.display = "block";
@@ -585,15 +625,19 @@ function addNightRow() {
     }
   }
   sessionWarningUpdaters.push(updateSessionWarnings);
-  attachFolderBrowser(lightsInput, lightsBrowse, (detectedType, detectedExposureS, detectedFilters) => {
-    lightsDetectedType = detectedType;
-    lightsDetectedExposureS = detectedExposureS;
-    applyDetectedFilters(detectedFilters);
+  attachFolderBrowser(lightsInput, lightsBrowse, (data) => {
+    lightsDetectedType = data.detected_type;
+    lightsDetectedExposureS = data.detected_exposure_s;
+    lightsSampleDateObs = data.sample_date_obs;
+    lightsSampleInstrument = data.sample_instrument;
+    applyDetectedFilters(data.detected_filters);
     updateSessionWarnings();
   });
-  attachFolderBrowser(flatsInput, flatsBrowse, (detectedType, _detectedExposureS, detectedFilters) => {
-    flatsDetectedType = detectedType;
-    applyDetectedFilters(detectedFilters);
+  attachFolderBrowser(flatsInput, flatsBrowse, (data) => {
+    flatsDetectedType = data.detected_type;
+    flatsSampleDateObs = data.sample_date_obs;
+    flatsSampleInstrument = data.sample_instrument;
+    applyDetectedFilters(data.detected_filters);
     updateSessionWarnings();
   });
   const lightsGroup = el("div", { class: "dirpick-group" }, [
@@ -630,6 +674,19 @@ function formatExposure(seconds) {
   return seconds < 1 ? `${Math.round(seconds * 1000)}ms` : `${seconds}s`;
 }
 
+// FITS DATE-OBS has no trailing "Z" but IS UTC per the FITS standard -
+// same parsing convention as formatCaptured() elsewhere in this file.
+function parseFitsDate(iso) {
+  if (!iso) return null;
+  const d = new Date(iso.endsWith("Z") ? iso : `${iso}Z`);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+// Positive when b is after a, in days.
+function daysBetween(a, b) {
+  return (b.getTime() - a.getTime()) / 86400000;
+}
+
 function warnIfWrongType(expected, detectedType, warningEl) {
   if (detectedType && detectedType !== expected) {
     const what = detectedType === "mixed" ? "a mix of frame types, not consistently" : `${detectedType} frames, not`;
@@ -640,21 +697,31 @@ function warnIfWrongType(expected, detectedType, warningEl) {
   }
 }
 
-// Darks' own detected exposure, remembered so each session's lights
-// picker (added below) can warn if it doesn't match - darks are staged
-// once per project, lights per night, so this has to live above any one
-// session row. Re-checked against every already-rendered row's lights
-// whenever darks changes, via sessionWarningUpdaters (not just forward,
-// in case darks gets (re)picked after sessions already exist).
+// Darks'/bias' own detected exposure/date/camera, remembered so each
+// session's lights picker (added below) can warn if any doesn't match -
+// biases/darks are staged once per project, lights per night, so this
+// has to live above any one session row. Re-checked against every
+// already-rendered row's lights whenever biases/darks change, via
+// sessionWarningUpdaters (not just forward, in case they get (re)picked
+// after sessions already exist).
 let darksDetectedExposureS = null;
+let darksSampleDateObs = null;
+let darksSampleInstrument = null;
+let biasesSampleDateObs = null;
+let biasesSampleInstrument = null;
 const sessionWarningUpdaters = [];
 
-attachFolderBrowser(document.getElementById("biases-dir"), document.getElementById("biases-browse"), (detectedType) => {
-  warnIfWrongType("bias", detectedType, document.getElementById("biases-type-warning"));
+attachFolderBrowser(document.getElementById("biases-dir"), document.getElementById("biases-browse"), (data) => {
+  warnIfWrongType("bias", data.detected_type, document.getElementById("biases-type-warning"));
+  biasesSampleDateObs = data.sample_date_obs;
+  biasesSampleInstrument = data.sample_instrument;
+  sessionWarningUpdaters.forEach((fn) => fn());
 });
-attachFolderBrowser(document.getElementById("darks-dir"), document.getElementById("darks-browse"), (detectedType, detectedExposureS) => {
-  warnIfWrongType("dark", detectedType, document.getElementById("darks-type-warning"));
-  darksDetectedExposureS = detectedExposureS;
+attachFolderBrowser(document.getElementById("darks-dir"), document.getElementById("darks-browse"), (data) => {
+  warnIfWrongType("dark", data.detected_type, document.getElementById("darks-type-warning"));
+  darksDetectedExposureS = data.detected_exposure_s;
+  darksSampleDateObs = data.sample_date_obs;
+  darksSampleInstrument = data.sample_instrument;
   sessionWarningUpdaters.forEach((fn) => fn());
 });
 

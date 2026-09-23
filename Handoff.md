@@ -1620,6 +1620,44 @@ Siril ones, but the same "don't rediscover this" spirit applies.
   distinct filter — only possible by overriding the Stack panel's own
   mismatch warning — they're joined with "+" rather than silently
   picking one. Verified for real against a staged S-filter session.
+- ✅ **Camera + date sanity checks on calibration frames, from real FITS
+  headers (2026-09-23)**. Chris asked two things: whether FITS headers
+  carry enough info to confirm calibration frames match the lights'
+  camera, and (assuming yes) to warn if flats aren't within a day of the
+  lights' session, or darks/bias are more than a year older or a month
+  newer. **Answer, confirmed by actually reading real headers from both
+  test cameras, not assumed**: yes — `INSTRUME` reliably distinguishes
+  camera MODEL (`'ZWO ASI2600MC Duo'` vs `'ZWO ASI2600MM Pro'` in this
+  dataset) and is present on every frame type. Caveat worth remembering:
+  there's no serial number field in these headers at all, so this can't
+  tell apart two physical units of the *same* model if Chris ever owns
+  two; and `EGAIN`/pixel size/resolution are identical across both
+  cameras here (same sensor family), so they're not useful as a
+  secondary signal either — `INSTRUME` is the only reliable camera-
+  identity field available. `DATE-OBS` (present on every frame) backs
+  the date checks directly.
+  New `app/fitsinfo.py` reads ONE representative file's header per
+  folder (first that opens cleanly, trying up to 5 before giving up) —
+  deliberately not every file, matching this app's existing
+  filename-based detectors' "one cheap sample is representative enough"
+  philosophy, and confirmed fast in practice (~35ms round trip
+  including the browse listing itself). `/captures/browse` now also
+  returns `sample_date_obs`/`sample_instrument`. Frontend: extended the
+  same per-session `updateSessionWarnings()` this app already uses for
+  the lights/flats and exposure mismatches, adding flats-vs-lights date
+  (>1 day) and camera, and darks/bias-vs-lights age (>365 days older or
+  >30 days newer, boundary-tested to land exactly on "more than," not
+  "at least") and camera — all combined into the same one warning
+  message per session, non-blocking, same as every other check here.
+  Refactored `attachFolderBrowser()`'s `onSelect` callback from
+  positional args to a single data object while touching every call
+  site anyway, since it was about to grow past a sane number of
+  positional params. Verified against real data: matched same-session
+  OSC lights+flats shows nothing; MC lights against real MM flats
+  (wrong camera AND ~1 year apart) shows both messages combined; a
+  same-camera, realistic ~17-day calibration gap shows nothing; MC
+  lights against MM darks (wrong camera only, no date issue) shows only
+  the camera message.
 - ❌ **Crop is permanently out of scope**, not deferred — see Architecture
   decisions. Don't reopen this.
 - ❌ Archive/cleanup (the Endstate's last bullet) is explicitly deferred
