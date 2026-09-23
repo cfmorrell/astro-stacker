@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import config, frameinfo, framestats, imaging, jobs, ssf, staging, status
+from . import config, fitsinfo, frameinfo, framestats, imaging, jobs, ssf, staging, status
 from .models import (
     AnalyzeLightsRequest,
     BuildMastersRequest,
@@ -145,6 +145,12 @@ def browse_captures(path: str = ""):
         raise HTTPException(status_code=404, detail=f"not a directory under captures: {path!r}")
     dirs = sorted(p.name for p in target.iterdir() if p.is_dir())
     fit_names = [p.name for pat in ("*.fit", "*.fits") for p in target.glob(pat)]
+    # One representative file's actual FITS header - not filename-based
+    # like everything else above, and only read once per browse call
+    # (see fitsinfo.py) since it needs real file I/O. Backs Stage-time
+    # warnings for the wrong camera or a too-far-off capture date on
+    # calibration frames, which no filename convention encodes.
+    sample = fitsinfo.read_sample_fits_info(target)
     return {
         "path": path,
         "dirs": dirs,
@@ -156,6 +162,8 @@ def browse_captures(path: str = ""):
         # data - lets the frontend offer a filter picker only when this
         # folder actually mixes more than one filter together.
         "detected_filters": frameinfo.detect_filters(fit_names),
+        "sample_date_obs": sample["date_obs"],
+        "sample_instrument": sample["instrument"],
     }
 
 
