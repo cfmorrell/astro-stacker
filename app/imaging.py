@@ -3,7 +3,7 @@
 for eyeballing a finished result.fit. Not used anywhere in the actual
 calibration/stacking pipeline; purely a display convenience.
 
-Four stretch modes:
+Five stretch modes:
 - "none": percentile-clipped linear — no curve, closest to the raw data.
 - "linked": percentile + asinh stretch computed jointly across all
   channels (one black/white point for R+G+B together) — preserves
@@ -13,9 +13,9 @@ Four stretch modes:
   the cost of it no longer reflecting the true relative color. Chris
   asked for "none"/"linked"/"unlinked" on the final stack preview,
   matching a common astro-processing choice.
-- "calibration": for master bias/dark/flat previews specifically, not a
-  choice exposed to Chris. A flat's real signal (vignetting) is only a
-  ~5-10% brightness variation, while dust motes are sharp outlier pixels
+- "calibration": for master FLAT previews specifically, not a choice
+  exposed to Chris. A flat's real signal (vignetting) is only a ~5-10%
+  brightness variation, while dust motes are sharp outlier pixels
   covering under ~0.5% of the frame - PercentileInterval+AsinhStretch
   (tuned for the opposite problem: huge-dynamic-range light frames with
   faint nebulosity against near-black sky) clips its black point right
@@ -26,7 +26,21 @@ Four stretch modes:
   fix, not guessed at). ZScaleInterval (per channel, no curve at all) is
   built for exactly this — robust to a small fraction of outlier pixels
   while preserving midtone contrast — and visibly fixed it on real data.
-Only "linked" vs "unlinked"/"calibration" differ for multi-channel
+- "noise": for master BIAS/DARK previews specifically (also not a choice
+  exposed to Chris). A bias/dark frame is the opposite case from a flat:
+  no smooth gradient at all, just a near-uniform noise floor plus a
+  sparse handful of hot/cold pixel outliers - there IS no "sky
+  background" to display at a comfortable midtone the way ZScaleInterval
+  targets (confirmed on real master bias/dark data: ZScaleInterval maps
+  the median pixel to ~50% gray, a washed-out field, not the "mostly
+  solid dark field with a small handful of hot/cold pixels" Chris gets
+  from Siril's own unlinked autostretch on the same frames). "noise" mode
+  uses a midtones transfer function (MTF) autostretch instead - the same
+  algorithm PixInsight's ScreenTransferFunction and Siril's own "Auto
+  Stretch" use - which pushes the frame's OWN median down to a dark
+  target background (0.25) via a nonlinear curve, with anything below a
+  robust (MAD-based) shadow clip crushed to pure black. See _autostretch().
+Only "linked" vs "unlinked"/"calibration"/"noise" differ for multi-channel
 (calibrated/stacked) data; a raw single-plane Bayer sub has no channels
 to link or not.
 """
@@ -43,7 +57,7 @@ from PIL import Image
 
 DEFAULT_MAX_SIZE = 1024
 DEFAULT_STRETCH = "linked"
-_STRETCH_MODES = ("none", "linked", "unlinked", "calibration")
+_STRETCH_MODES = ("none", "linked", "unlinked", "calibration", "noise")
 
 # (R, G1, B, G2) sample offsets within a 2x2 Bayer tile, keyed by the FITS
 # BAYERPAT convention (top-left pixel first, reading left-to-right).
@@ -71,11 +85,33 @@ _BAYER_OFFSETS = {
 
 def _convolve3x3(img: np.ndarray, kernel: np.ndarray) -> np.ndarray:
     """3x3 convolution via shifted-slice addition — avoids adding scipy as
-    a dependency just for this. Edge-padded so the border pixels get a
-    (slightly duplicated-edge) answer instead of shrinking the output.
+    a dependency just for this.
+
+    A REAL, previously-undiscovered border artifact lived here: this is
+    called on a SPARSE per-channel array (real samples on a period-2
+    checkerboard, zeros everywhere else - see _debayer_bilinear()), and
+    `mode="edge"` padding just duplicates whatever value (real sample or
+    zero) happens to sit at the border, with NO regard for the
+    checkerboard's phase. Depending on which parity the border lands on,
+    that either duplicates a real R/B sample where a zero belongs (over-
+    weighting that channel right at the border) or duplicates a zero where
+    a real sample belongs (under-weighting it) - confirmed on a synthetic
+    uniform test image: the top-left corner came out with R spiking from
+    100 to 225 while B dropped from 200 to 50, and the bottom-right corner
+    did the reverse (R down to 25, B up to 450) - an exact match for what
+    Chris saw: "a red/orange left/top border and a blue right/bottom
+    border" on debayered previews. `mode="reflect"` (mirrors WITHOUT
+    repeating the edge value: pad[-1] = arr[1], not arr[0]) instead
+    correctly preserves the checkerboard's phase at any border or corner -
+    reflecting a period-2 pattern this way always lands back on the same
+    parity, so the padding is itself a plausible continuation of the real
+    Bayer pattern rather than a phase-blind copy. Re-ran the same
+    synthetic test after this fix: every border and corner pixel now
+    correctly comes out at the true uniform value (R=100, B=200
+    everywhere, no fringe at all).
     """
     h, w = img.shape
-    padded = np.pad(img, 1, mode="edge")
+    padded = np.pad(img, 1, mode="reflect")
     out = np.zeros_like(img)
     for ky in range(3):
         for kx in range(3):
@@ -141,12 +177,62 @@ def _block_average(arr: np.ndarray, stride: int) -> np.ndarray:
     return arr[:h2, :w2, :].reshape(h2 // stride, stride, w2 // stride, stride, c).mean(axis=(1, 3))
 
 
-def _apply_stretch(arr: np.ndarray, mode: str) -> np.ndarray:
+def _mtf(x: np.ndarray, m: float) -> np.ndarray:
+    """Midtones Transfer Function - maps 0->0, 1->1, and the midtone
+    parameter m itself to 0.5. Standard nonlinear autostretch curve;
+    PixInsight's ScreenTransferFunction and Siril's own "Auto Stretch"
+    use this identical formula - see _autostretch_params().
+    """
+    denom = (2.0 * m - 1.0) * x - m
+    denom = np.where(np.abs(denom) < 1e-12, 1e-12, denom)
+    return (m - 1.0) * x / denom
+
+
+def _autostretch_params(arr: np.ndarray, target_bkg: float = 0.25, shadow_clip: float = -2.8) -> tuple[float, float, float]:
+    """The (c0, c1, m) an MTF autostretch needs (see "noise" mode below):
+    a robust shadow-clip point (c0 - shadow_clip standard deviations,
+    measured via MAD so it's robust to the very outliers this is meant to
+    isolate, below the frame's own median), the frame's actual peak (c1),
+    and the midtone parameter m that maps the median itself to
+    target_bkg once normalized into [c0, c1] (see _mtf()). Same defaults
+    (0.25 background target, -2.8 shadow clipping) as PixInsight's
+    ScreenTransferFunction and Siril's own "Auto Stretch" - not guessed
+    at, and confirmed by hand against real master bias/dark pixel data
+    (this maps the median to the intended ~0.25, not the ~0.5
+    ZScaleInterval was putting it at) before choosing this.
+    """
+    median = float(np.median(arr))
+    mad = float(np.median(np.abs(arr - median)))
+    sigma = mad * 1.4826  # MAD -> Gaussian-equivalent standard deviation
+    c0 = median + shadow_clip * sigma  # shadow_clip is negative - c0 sits BELOW the median
+    c1 = float(arr.max())
+    if c1 <= c0:
+        return c0, c1, 0.5  # degenerate (perfectly flat) input - m unused, caller short-circuits
+    x_median = min(max((median - c0) / (c1 - c0), 0.0), 1.0)
+    if x_median <= 0.0 or x_median >= 1.0:
+        m = 0.5  # degenerate - nothing sensible to solve for; MTF(x, 0.5) is the identity
+    else:
+        y = target_bkg
+        m = x_median * (y - 1.0) / (2.0 * x_median * y - x_median - y)
+    return c0, c1, m
+
+
+def _apply_stretch(arr: np.ndarray, mode: str, limits=None) -> np.ndarray:
+    # `limits`, when given, is precomputed on the FULL-RESOLUTION data by
+    # the caller (render_preview_png()) - see its own comment for why
+    # these outlier-sensitive stats must never be recomputed on
+    # already-downsampled data.
     if mode == "calibration":
-        lo, hi = ZScaleInterval().get_limits(arr)
+        lo, hi = limits if limits is not None else ZScaleInterval().get_limits(arr)
         if hi <= lo:  # degenerate (perfectly flat) input - avoid a divide-by-zero
             return np.zeros_like(arr)
         return np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+    if mode == "noise":
+        c0, c1, m = limits if limits is not None else _autostretch_params(arr)
+        if c1 <= c0:
+            return np.zeros_like(arr)
+        x = np.clip((arr - c0) / (c1 - c0), 0.0, 1.0)
+        return np.clip(_mtf(x, m), 0.0, 1.0)
     interval = PercentileInterval(99.5)
     if mode == "none":
         return np.clip(interval(arr), 0.0, 1.0)
@@ -187,6 +273,36 @@ def render_preview_png(
         rgb = data
         h, w = rgb.shape
 
+    # Both "calibration" (ZScaleInterval) and "noise" (_autostretch_params())
+    # are outlier-sensitive statistics — their computed black/white points
+    # depend on a small handful of extreme pixels (dust motes on a flat,
+    # hot/cold pixels on a bias/dark) surviving in the sample they're
+    # given. Computed on already-downsampled data (the old order — see the
+    # block-average comment below), a thumbnail's heavy stride smears each
+    # outlier's extreme value into its neighbors' average, diluting or
+    # erasing the very outliers these modes need to anchor a properly dark
+    # background — result: a thumbnail rendered noticeably brighter than
+    # the correctly-anchored full-resolution zoom of the exact same frame
+    # (confirmed the hard way — Chris: "the zoomed version looks right,
+    # but the thumbnail is way too bright"). Computed here, on the
+    # full-resolution data, BEFORE any downsampling, and reused unchanged
+    # below regardless of what size actually gets rendered — thumbnail and
+    # zoom now show the IDENTICAL stretch on the same frame, just at
+    # different pixel dimensions.
+    precomputed_limits = None
+    if stretch == "calibration":
+        precomputed_limits = (
+            [ZScaleInterval().get_limits(rgb[..., c]) for c in range(rgb.shape[-1])]
+            if rgb.ndim == 3
+            else ZScaleInterval().get_limits(rgb)
+        )
+    elif stretch == "noise":
+        precomputed_limits = (
+            [_autostretch_params(rgb[..., c]) for c in range(rgb.shape[-1])]
+            if rgb.ndim == 3
+            else _autostretch_params(rgb)
+        )
+
     # Downsample BEFORE the percentile/stretch computation, not just via
     # PIL's thumbnail() at the end — for a small review-grid thumbnail (a
     # dozen of these load at once, see app/static/), that's the
@@ -213,20 +329,26 @@ def render_preview_png(
     if stride > 1:
         rgb = _block_average(rgb, stride)
 
-    if rgb.ndim == 3 and stretch in ("unlinked", "calibration"):
+    if rgb.ndim == 3 and stretch in ("unlinked", "calibration", "noise"):
         # Per-channel: each gets its own curve/black-white-point, computed
         # independently instead of once across all channels jointly. For
         # "unlinked" this passes "linked" into _apply_stretch() per
         # channel — deliberately NOT "unlinked" again, since that mode
         # only means anything at the multi-channel level handled right
         # here; a single channel's own percentile+asinh math is identical
-        # either way. "calibration" DOES need to stay "calibration" here
-        # though, since that's a genuinely different curve (ZScale, no
-        # asinh) - collapsing it to "linked" would silently undo the fix.
-        per_channel_mode = "linked" if stretch == "unlinked" else "calibration"
-        normed = np.stack([_apply_stretch(rgb[..., c], per_channel_mode) for c in range(rgb.shape[-1])], axis=-1)
+        # either way. "calibration"/"noise" DO need to stay themselves
+        # here though, since those are genuinely different curves -
+        # collapsing either to "linked" would silently undo the fix.
+        per_channel_mode = "linked" if stretch == "unlinked" else stretch
+        normed = np.stack(
+            [
+                _apply_stretch(rgb[..., c], per_channel_mode, precomputed_limits[c] if precomputed_limits else None)
+                for c in range(rgb.shape[-1])
+            ],
+            axis=-1,
+        )
     else:
-        normed = _apply_stretch(rgb, stretch)
+        normed = _apply_stretch(rgb, stretch, precomputed_limits)
     img8 = (normed * 255).astype(np.uint8)
 
     image = Image.fromarray(img8)

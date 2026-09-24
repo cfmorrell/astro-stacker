@@ -112,3 +112,46 @@ def detect_filters(filenames: list[str]) -> list[str]:
     per-session filter picker), not something to average away.
     """
     return sorted({parse_filter(name) for name in filenames} - {None})
+
+
+def count_filters(filenames: list[str]) -> dict[str, int]:
+    """How many filenames matched each filter code (e.g. {"H": 15, "O":
+    14, "S": 16}) - same filter codes as detect_filters(), but with the
+    per-filter frame count Stage's filter picker shows next to each one
+    so Chris can tell at a glance whether e.g. one filter is short a few
+    subs before staging, not just which filters are present.
+    """
+    counts: dict[str, int] = {}
+    for name in filenames:
+        f = parse_filter(name)
+        if f is not None:
+            counts[f] = counts.get(f, 0) + 1
+    return counts
+
+
+def detect_exposures(filenames: list[str]) -> list[float]:
+    """Every distinct exposure length found across a set of filenames
+    (rounded to 3 decimal places, same convention as
+    detect_exposure_seconds()), sorted ascending - e.g. [60.0, 300.0] for
+    an OSC folder mixing two sub lengths. Empty if no filename parsed.
+    Same "surface every value, don't average away a genuine mix"
+    philosophy as detect_filters() - this exists specifically to let
+    Stage's picker split an OSC session into one row per exposure length,
+    the same way a mixed-filter folder already splits into one row per
+    filter.
+    """
+    return sorted({round(s, 3) for name in filenames if (s := parse_exposure_seconds(name)) is not None})
+
+
+def count_exposures(filenames: list[str]) -> dict[float, int]:
+    """How many filenames matched each exposure length (e.g. {60.0: 12,
+    300.0: 8}) - same exposure values as detect_exposures(), but with the
+    per-exposure frame count, mirroring count_filters().
+    """
+    counts: dict[float, int] = {}
+    for name in filenames:
+        s = parse_exposure_seconds(name)
+        if s is not None:
+            key = round(s, 3)
+            counts[key] = counts.get(key, 0) + 1
+    return counts

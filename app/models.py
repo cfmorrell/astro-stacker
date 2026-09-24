@@ -42,22 +42,26 @@ class StackOptions(BaseModel):
 
 
 class BuildMastersRequest(BaseModel):
-    """Build master bias/dark (always shared across the whole project) and
-    one master flat per named night, from project_dir/raw/{biases,darks}
-    and project_dir/raw/nights/<name>/flats.
+    """Build a master bias (always shared across the whole project), one
+    master dark per distinct exposure length, and one master flat per
+    named night, from project_dir/raw/biases,
+    project_dir/raw/nights/<name>/{darks,flats}.
 
-    `nights` is required and must name every night whose flats should get
-    a master built (every project always uses the raw/nights/<name>/...
-    layout — see /projects/{name}/stage — even a "single-night" project is
-    just one name here; there is no separate flat/legacy layout to
-    remember to ask about). Bias/dark are never per-night — per Chris:
-    "usually a single set of bias and dark images that will apply across
-    all nights."
+    `nights` is required and must name every night whose flats/darks
+    should get a master built (every project always uses the
+    raw/nights/<name>/... layout — see /projects/{name}/stage — even a
+    "single-night" project is just one name here; there is no separate
+    flat/legacy layout to remember to ask about). Bias is never per-night.
+    Dark is per-night in the sense that each night picks its own
+    raw/nights/<name>/darks at stage time (see NightSource.darks_dir),
+    but nights whose staged dark frames resolve to the SAME exposure
+    length are built into one shared master, never duplicated — see
+    app/ssf.py's render_build_masters()/_dark_exposure_key().
 
     Any raw/ subdirectory that doesn't exist (including a given night's
-    flats/) is skipped rather than erroring, so re-running this only
+    flats/darks) is skipped rather than erroring, so re-running this only
     rebuilds what's missing (e.g. adding a new night's flats later without
-    rebuilding the shared bias/dark).
+    rebuilding the shared bias, or an already-built dark group).
     """
 
     stack: StackOptions = Field(default_factory=StackOptions)
@@ -115,15 +119,16 @@ class CalibrationOverridesRequest(BaseModel):
     re-specify every time a stack runs.
 
     Each dict maps a night's internal name to an absolute .fit path to
-    use INSTEAD of that night's normal default (the shared
-    process/master_dark for dark; that night's own
-    process/nights/<name>/master_flat for flat) — e.g. a long-running
-    project spanning months might use a different dark for a night shot
-    at a different camera temperature, or borrow another night's flat
-    for a night that never got its own. A night simply absent from
-    either dict uses its normal default; this is the full desired state
-    each call (the frontend always resends its complete current
-    picture), not a partial merge.
+    use INSTEAD of that night's normal default (that night's own
+    process/darks/<exposure-key>/master_dark for dark - shared with any
+    other night whose darks resolved to the same exposure length; that
+    night's own process/nights/<name>/master_flat for flat) — e.g. a
+    long-running project spanning months might use a different dark for a
+    night shot at a different camera temperature, or borrow another
+    night's flat for a night that never got its own. A night simply
+    absent from either dict uses its normal default; this is the full
+    desired state each call (the frontend always resends its complete
+    current picture), not a partial merge.
     """
 
     night_dark_overrides: dict[str, str] = Field(default_factory=dict)
@@ -143,14 +148,17 @@ class StackLightsRequest(BaseModel):
     via Siril's `merge` (which — confirmed the hard way — refuses to run
     with fewer than two inputs, hence the split).
 
-    Master reuse policy (per Chris, settled): `master_dark` (and
-    master_bias, upstream in /masters/run) are shared across the whole
-    project by default — one dark/bias set normally covers every night.
-    `master_flat` is the opposite: EACH night gets its OWN master flat by
-    default (process/nights/<name>/master_flat), because flats capture
-    dust/vignetting that genuinely changes night to night and get retaken
-    for that reason — don't default this to one shared flat "for
-    simplicity." Either default can be overridden per night — see
+    Master reuse policy (per Chris, settled): `master_bias` (built
+    upstream in /masters/run) is shared across the whole project by
+    default — one bias set normally covers every night. `master_dark` and
+    `master_flat` are both per-night by default
+    (process/darks/<exposure-key>/master_dark,
+    process/nights/<name>/master_flat) — flats capture dust/vignetting
+    that genuinely changes night to night and get retaken for that reason,
+    and darks now depend on each night's own picked source and light
+    exposure length, though nights sharing the same exposure automatically
+    share the same built master dark rather than duplicating it (see
+    BuildMastersRequest). Either default can be overridden per night — see
     CalibrationOverridesRequest above — rather than uniformly for every
     selected night at once.
     """
@@ -239,11 +247,25 @@ class AnalyzeLightsRequest(BaseModel):
     }
 
 
+class ReviewStateUpdate(BaseModel):
+    """Saved whenever the frontend's review session changes after the
+    fact (a frame gets excluded/un-excluded, the outlier-sensitivity
+    slider moves) - see /projects/{name}/review-state and
+    config.read_review_state()'s docstring for why this is tracked
+    separately from the (expensive, only written by an actual analyze
+    run) per-frame stats themselves.
+    """
+
+    exclude_frames: list[str] = Field(default_factory=list)
+    anomaly_sigma: float = 3.0
+
+
 class NightSource(BaseModel):
-    """One night's lights+flats to stage, as a source-folder -> internal-name
-    mapping. `name` is chosen by the caller and is what actually lands on
-    disk (raw/nights/<name>/...) — source folder names (e.g. "Night 1",
-    with a space) never need to match any naming convention.
+    """One night's lights+flats+darks to stage, as a source-folder ->
+    internal-name mapping. `name` is chosen by the caller and is what
+    actually lands on disk (raw/nights/<name>/...) — source folder names
+    (e.g. "Night 1", with a space) never need to match any naming
+    convention.
 
     `filter` handles a filter-wheel camera whose lights/flats folders mix
     several filters together (e.g. a narrowband mono session with H/O/S
@@ -253,33 +275,61 @@ class NightSource(BaseModel):
     physical folder pair can back several independent sessions, one per
     filter. None stages everything in both dirs, unfiltered — the normal
     case for an OSC camera with no filter wheel at all.
+
+    `exposure_s` is the OSC-side equivalent of `filter`: when a lights
+    folder mixes more than one exposure length (e.g. 60s and 300s subs of
+    the same target, no filter wheel involved), only lights whose filename
+    matches this exposure (see app/frameinfo.py's parse_exposure_seconds())
+    are staged - lets one physical lights folder back several independent
+    exposure-length sessions the same way `filter` does for mono. Applies
+    to lights only, never flats (a flat's own exposure is unrelated to the
+    light sub length it calibrates). A row uses at most one of `filter`/
+    `exposure_s` in practice (mono sets filter, OSC sets exposure_s), but
+    both are applied together if both happen to be set.
+
+    `darks_dir` is per-session (unlike biases, which stay project-wide) -
+    different filters or exposure lengths commonly need different master
+    darks, so each session picks its own. None means no darks staged for
+    this session (a normal, supported state - see app/ssf.py's dark
+    build/resolve, which just omits that calibrate arg when nothing was
+    built). Darks sharing the same exposure length across sessions are
+    still only built into ONE master, never duplicated - see
+    app/ssf.py's render_build_masters().
     """
 
     name: str
     lights_dir: str  # path relative to CAPTURES_DIR, e.g. "Night 1/lights"
     flats_dir: str  # path relative to CAPTURES_DIR, e.g. "Night 1/flats"
+    darks_dir: Optional[str] = None  # path relative to CAPTURES_DIR
     filter: Optional[str] = None
+    exposure_s: Optional[float] = None
 
     model_config = {
         "json_schema_extra": {
-            "example": {"name": "night1", "lights_dir": "Night 1/lights", "flats_dir": "Night 1/flats", "filter": None}
+            "example": {
+                "name": "night1",
+                "lights_dir": "Night 1/lights",
+                "flats_dir": "Night 1/flats",
+                "darks_dir": "Night 1/darks",
+                "filter": None,
+                "exposure_s": None,
+            }
         }
     }
 
 
 class StageProjectRequest(BaseModel):
     """Symlinks raw frames from CAPTURES_DIR into this project's raw/ tree
-    (creating the project directory if needed). Bias/dark are shared
-    (staged once, at raw/biases and raw/darks); each entry in `nights`
-    stages its own lights+flats at raw/nights/<name>/{lights,flats}.
+    (creating the project directory if needed). Bias is shared (staged
+    once, at raw/biases); each entry in `nights` stages its own
+    lights+flats+darks at raw/nights/<name>/{lights,flats,darks}.
     """
 
     # Deliberately no default folder name (e.g. "biases") to assume — once
     # CAPTURES_DIR points at a whole, less tidily organized astrophotos
-    # library rather than a dedicated per-project folder, "biases"/"darks"
-    # subfolders won't reliably exist at all. None = skip staging that one.
+    # library rather than a dedicated per-project folder, a "biases"
+    # subfolder won't reliably exist at all. None = skip staging it.
     biases_dir: Optional[str] = None  # relative to CAPTURES_DIR
-    darks_dir: Optional[str] = None  # relative to CAPTURES_DIR
     nights: list[NightSource] = Field(default_factory=list)
     is_osc: Optional[bool] = None  # None = leave any previously-recorded setting alone; see app/config.py's project meta
     # Starting point for this project's folder pickers (relative to
@@ -295,10 +345,9 @@ class StageProjectRequest(BaseModel):
         "json_schema_extra": {
             "example": {
                 "biases_dir": "biases",
-                "darks_dir": "darks",
                 "nights": [
-                    {"name": "night1", "lights_dir": "Night 1/lights", "flats_dir": "Night 1/flats"},
-                    {"name": "night2", "lights_dir": "Night 2/lights", "flats_dir": "Night 2/flats"},
+                    {"name": "night1", "lights_dir": "Night 1/lights", "flats_dir": "Night 1/flats", "darks_dir": "Night 1/darks"},
+                    {"name": "night2", "lights_dir": "Night 2/lights", "flats_dir": "Night 2/flats", "darks_dir": "Night 2/darks"},
                 ],
                 "is_osc": True,
             }

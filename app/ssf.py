@@ -24,14 +24,26 @@ rolandet's osc-multi-night-stacking script (GPLv3, referenced for
 structure only, per Handoff.md's licensing note).
 
 Raw/process layout:
-    raw/biases, raw/darks                     — shared across the project
-    raw/nights/<name>/{lights,flats}          — every night, always
-    process/master_bias, process/master_dark  — always shared, stable
+    raw/biases                                — shared across the project
+    raw/nights/<name>/{lights,flats,darks}    — every night, always (darks optional)
+    process/master_bias                       — always shared, stable
+    process/darks/<exposure-key>/master_dark  — one per distinct dark exposure length, stable
     process/nights/<name>/master_flat         — per-night, stable
-    process/_build/{bias,dark}                — disposable scratch (masters)
+    process/_build/bias                       — disposable scratch (masters)
+    process/_build/darks/<exposure-key>       — disposable scratch (masters) — merged
+                                                 input from every night sharing that
+                                                 exposure, when more than one contributes
     process/_build/nights/<name>/flat         — disposable scratch (masters)
     process/nights/<name>/lights              — disposable scratch (stack)
     process/lights/_merged                    — disposable scratch, 2+ nights only
+
+Dark masters are deduplicated by the STAGED darks frames' own detected
+exposure length (see dark_exposure_key()), not by night/row identity —
+two nights whose picked darks folders happen to share an exposure length
+build and reuse exactly one master_dark, never two. This mirrors how a
+mono project's filters and an OSC project's differing exposure lengths
+both fan out into independent Stage-time sessions, without meaning
+independent (and redundant) master-dark builds per session.
 """
 
 from __future__ import annotations
@@ -112,6 +124,43 @@ def apply_light_selections(selections: list[LightSelection]) -> None:
             (sel.dest_dir / src.name).symlink_to(src.resolve())
 
 
+@dataclass
+class DarkMergeInput:
+    """Populates a dark-build step's merged raw_dir when 2+ nights' own
+    staged darks share the same detected exposure length (see
+    render_build_masters()/dark_exposure_key()) — using every contributing
+    night's frames for one bigger, better master dark rather than
+    arbitrarily picking just one night's subset. Same split as
+    LightSelection/apply_light_selections(): applied by
+    apply_dark_merge_inputs() right before a job runs, never inside
+    render_build_masters(), which stays a side-effect-free dry run.
+    """
+
+    source_dirs: list[Path]
+    dest_dir: Path
+
+
+def apply_dark_merge_inputs(merges: list[DarkMergeInput]) -> None:
+    """Populate each DarkMergeInput's dest_dir from scratch, symlinking
+    every dark frame from every contributing night's own raw darks folder.
+    A filename collision (two nights' folders happen to share a name) just
+    keeps whichever one was linked first — harmless, since nights grouped
+    here already share the same exposure length by construction.
+    """
+    for merge in merges:
+        if merge.dest_dir.exists():
+            shutil.rmtree(merge.dest_dir)
+        merge.dest_dir.mkdir(parents=True, exist_ok=True)
+        for source_dir in merge.source_dirs:
+            for src in sorted(source_dir.iterdir()):
+                if src.suffix.lower() not in _FIT_SUFFIXES:
+                    continue
+                link = merge.dest_dir / src.name
+                if link.exists():
+                    continue
+                link.symlink_to(src.resolve())
+
+
 def prepare_fresh_dirs(dirs: list[Path]) -> None:
     """Wipe and recreate each directory from scratch. Used for every
     disposable scratch workspace right before a job's steps run — never
@@ -135,29 +184,56 @@ def perform_move(move: tuple[Path, Path]) -> None:
     shutil.move(str(src), str(dst))
 
 
-def render_build_masters(project: Path, req: BuildMastersRequest) -> list[SirilStep]:
-    """Build shared master bias/dark and one master flat per named night,
-    each as its OWN siril-cli invocation into its own disposable scratch
-    dir (Handoff.md gotchas #6 and #8), moved to its stable location
-    (process/master_bias.fit, process/master_dark.fit,
+def dark_exposure_key(raw_darks_dir: Path) -> str | None:
+    """Groups nights for dark-master purposes by the exposure length
+    actually detected in their OWN staged darks frames — not by row/
+    session identity — so two nights whose picked darks folders happen to
+    share an exposure length build and reuse exactly one master dark,
+    never two (see render_build_masters()). Used identically here and in
+    _resolve_nights() so both always agree on the grouping. None when the
+    exposure can't be reliably determined (mixed/no evidence) — such a
+    night becomes its own singleton group, safer than risking a bad merge.
+    """
+    filenames = [p.name for pat in ("*.fit", "*.fits") for p in raw_darks_dir.glob(pat)]
+    exposure = frameinfo.detect_exposure_seconds(filenames)
+    return f"{exposure:g}s" if exposure is not None else None
+
+
+def render_build_masters(project: Path, req: BuildMastersRequest) -> tuple[list[SirilStep], list[DarkMergeInput]]:
+    """Build a shared master bias, one master dark per distinct exposure
+    length, and one master flat per named night, each as its OWN
+    siril-cli invocation into its own disposable scratch dir (Handoff.md
+    gotchas #6 and #8), moved to its stable location
+    (process/master_bias.fit, process/darks/<key>/master_dark.fit,
     process/nights/<name>/master_flat.fit) once that step succeeds.
 
-    Steps run in order: bias, then dark, then each night's flat. Bias is
-    built (and MOVED to its stable path) before any flat step runs, since
-    a flat's calibration needs to reference the bias — see
-    build_master_flat.ssf.j2's docstring for why that reference is to the
-    bias step's own scratch output, not a not-yet-created stable path, on
-    the rare occasion bias and a flat both build in the same request but
-    bias is skipped (no raw/biases): then there's nothing to move and no
-    -bias= argument at all.
+    Steps run in order: bias, then each dark exposure group, then each
+    night's flat. Bias is built (and MOVED to its stable path) before any
+    flat step runs, since a flat's calibration needs to reference the
+    bias — see build_master_flat.ssf.j2's docstring for why that
+    reference is to the bias step's own scratch output, not a
+    not-yet-created stable path, on the rare occasion bias and a flat both
+    build in the same request but bias is skipped (no raw/biases): then
+    there's nothing to move and no -bias= argument at all.
+
+    Also returns the DarkMergeInput list (empty if no exposure group has
+    more than one contributing night) — the caller must run
+    apply_dark_merge_inputs() on it before actually running the returned
+    steps, same render/apply split as render_stack_lights()'s
+    LightSelections; this function itself stays a side-effect-free dry
+    run (so /masters/render can preview it without touching disk).
     """
+    for name in req.nights:
+        if not name or "/" in name or name in (".", ".."):
+            raise ValueError(f"invalid night name: {name!r}")
+
     raw = project / "raw"
     process = project / "process"
     build_root = process / "_build"
     build_bias = (raw / "biases").is_dir()
-    build_dark = (raw / "darks").is_dir()
 
     steps: list[SirilStep] = []
+    dark_merges: list[DarkMergeInput] = []
 
     if build_bias:
         scratch = build_root / "bias"
@@ -176,10 +252,42 @@ def render_build_masters(project: Path, req: BuildMastersRequest) -> list[SirilS
             )
         )
 
-    if build_dark:
-        scratch = build_root / "dark"
+    # Group nights by their OWN staged darks' detected exposure length
+    # (not by name) - see dark_exposure_key(). A night with no staged
+    # raw/nights/<name>/darks at all is skipped, same "missing means
+    # nothing to build" rule the flat loop below already follows.
+    dark_groups: dict[str, list[str]] = {}
+    for name in req.nights:
+        darks_dir = raw / "nights" / name / "darks"
+        if not darks_dir.is_dir():
+            continue
+        key = dark_exposure_key(darks_dir)
+        dark_groups.setdefault(key if key is not None else f"night_{name}", []).append(name)
+
+    for key, night_names in dark_groups.items():
+        scratch = build_root / "darks" / key
+        if len(night_names) > 1:
+            # More than one night shares this exposure - combine ALL of
+            # their frames into one merged input rather than arbitrarily
+            # picking just one night's subset, for a bigger/better master
+            # (mirrors this app's own existing multi-night lights-merge
+            # precedent in _resolve_nights()). Deliberately a SIBLING of
+            # `scratch` (build_root/"darks"/f"{key}_input"), not nested
+            # under it - `scratch` is a SirilStep.fresh_dir, wiped by
+            # prepare_fresh_dirs() right before the job runs, which would
+            # otherwise delete this merged input out from under it.
+            merged_input = build_root / "darks" / f"{key}_input"
+            dark_merges.append(
+                DarkMergeInput(
+                    source_dirs=[raw / "nights" / n / "darks" for n in night_names],
+                    dest_dir=merged_input,
+                )
+            )
+            dark_raw_dir = merged_input
+        else:
+            dark_raw_dir = raw / "nights" / night_names[0] / "darks"
         text = _env.get_template("build_master_dark.ssf.j2").render(
-            raw_dir=str(raw / "darks"),
+            raw_dir=str(dark_raw_dir),
             process_dir=str(scratch),
             stack_cmd=req.stack.to_ssf(),
         )
@@ -187,9 +295,9 @@ def render_build_masters(project: Path, req: BuildMastersRequest) -> list[SirilS
             SirilStep(
                 script=text,
                 workdir=scratch,
-                label="master_dark",
+                label=f"master_dark ({', '.join(night_names)})",
                 fresh_dir=scratch,
-                move=(scratch / "master_dark.fit", process / "master_dark.fit"),
+                move=(scratch / "master_dark.fit", process / "darks" / key / "master_dark.fit"),
             )
         )
 
@@ -204,8 +312,6 @@ def render_build_masters(project: Path, req: BuildMastersRequest) -> list[SirilS
     bias_arg_abs = str(process / "master_bias") if build_bias else None
 
     for name in req.nights:
-        if not name or "/" in name or name in (".", ".."):
-            raise ValueError(f"invalid night name: {name!r}")
         flats_dir = raw / "nights" / name / "flats"
         if not flats_dir.is_dir():
             continue
@@ -226,7 +332,7 @@ def render_build_masters(project: Path, req: BuildMastersRequest) -> list[SirilS
             )
         )
 
-    return steps
+    return steps, dark_merges
 
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_-]+")
@@ -281,8 +387,10 @@ def _resolve_nights(
     Each night's dark_master/flat_master come from this project's
     calibration overrides (project meta, set via
     /projects/{name}/calibration-overrides — see
-    CalibrationOverridesRequest) when present, falling back to the
-    normal shared process/master_dark / that night's own
+    CalibrationOverridesRequest) when present, falling back to that
+    night's own process/darks/<exposure-key>/master_dark (shared with any
+    other night whose darks resolved to the same exposure length — see
+    dark_exposure_key()/render_build_masters()) / that night's own
     process/nights/<name>/master_flat otherwise. dark_master is
     genuinely per-night now (not one shared value for every night in the
     request) so a project spanning months can use a different dark for a
@@ -324,6 +432,7 @@ def _resolve_nights(
     dark_overrides: dict = meta.get("night_dark_overrides", {})
     flat_overrides: dict = meta.get("night_flat_overrides", {})
     night_filters: dict = meta.get("night_filters", {})
+    night_exposures: dict = meta.get("night_exposures", {})
 
     def _master_exists(master: str) -> bool:
         return Path(master).exists() or Path(master + ".fit").exists()
@@ -352,19 +461,46 @@ def _resolve_nights(
     for name in req.nights:
         if not name or "/" in name or name in (".", ".."):
             raise ValueError(f"invalid night name: {name!r}")
+        # Same key dark_exposure_key()/render_build_masters() use to
+        # group nights for dark building - guarantees this night resolves
+        # to whichever group's master it actually belongs to. A night with
+        # no staged darks at all (or an undeterminable exposure) gets a
+        # key nothing was ever built under, so _resolve_master()'s
+        # _master_exists() check below naturally falls through to None.
+        dark_key = dark_exposure_key(raw / "nights" / name / "darks") or f"night_{name}"
         nights.append(
             {
                 "key": name,
                 "raw_lights": raw / "nights" / name / "lights",
                 "process_dir": process / "nights" / name / "lights",
-                "dark_master": _resolve_master(dark_overrides.get(name), str(process / "master_dark"), "dark", name),
+                "dark_master": _resolve_master(
+                    dark_overrides.get(name), str(process / "darks" / dark_key / "master_dark"), "dark", name
+                ),
                 "flat_master": _resolve_master(
                     flat_overrides.get(name), str(process / "nights" / name / "master_flat"), "flat", name
                 ),
                 "filter": night_filters.get(name),
+                "exposure_s": night_exposures.get(name),
             }
         )
-    merge_dir = process / "lights" / "_merged" if len(nights) > 1 else None
+    # Filter-suffixed (e.g. process/lights/_merged_H) once any night in
+    # this request carries a filter, so a narrowband project's H merge
+    # and S merge land in physically SEPARATE scratch dirs - this is
+    # wiped fresh before every run (see SirilStep.fresh_dir), and without
+    # the suffix a second filter's stack would rmtree the first filter's
+    # already-completed result right off disk. Exposure-suffixed the same
+    # way (e.g. _merged_300s) when there's no filter but nights carry
+    # different OSC exposure lengths, for the identical reason. "" (no
+    # filter, no exposure tag - the original OSC path) keeps the original
+    # unsuffixed directory name for backward compatibility with projects
+    # stacked before either of these existed.
+    merge_filters = "+".join(sorted({n["filter"] for n in nights if n["filter"]}))
+    if merge_filters:
+        merge_dir_name = f"_merged_{merge_filters}"
+    else:
+        merge_exposures = "+".join(sorted(f"{n['exposure_s']:g}s" for n in nights if n["exposure_s"] is not None))
+        merge_dir_name = f"_merged_{merge_exposures}" if merge_exposures else "_merged"
+    merge_dir = process / "lights" / merge_dir_name if len(nights) > 1 else None
 
     exclude = frozenset(req.exclude_frames)
 

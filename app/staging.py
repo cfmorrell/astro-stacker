@@ -45,12 +45,19 @@ def _resolve_capture_dir(rel: str) -> Path:
     return candidate
 
 
-def _link_dir(source: Path, dest: Path, filter_code: str | None = None) -> int:
+def _link_dir(
+    source: Path,
+    dest: Path,
+    filter_code: str | None = None,
+    exposure_s: float | None = None,
+) -> int:
     """Symlink every FITS file from source into dest, or (when filter_code
-    is given) only those whose filename matches that filter — see
+    and/or exposure_s are given) only those whose filename matches — see
     NightSource's docstring. dest is wiped of stale FITS symlinks first
-    (not just added to) so re-staging with a different/no filter can't
-    leave a previous filter's files behind mixed in with the new ones.
+    (not just added to) so re-staging with a different/no filter/exposure
+    can't leave a previous selection's files behind mixed in with the new
+    ones. exposure_s matches within the same tolerance used elsewhere
+    (rounded to 3 decimal places — see frameinfo.detect_exposure_seconds()).
     """
     dest.mkdir(parents=True, exist_ok=True)
     for existing in dest.iterdir():
@@ -62,22 +69,26 @@ def _link_dir(source: Path, dest: Path, filter_code: str | None = None) -> int:
             continue
         if filter_code is not None and frameinfo.parse_filter(src.name) != filter_code.upper():
             continue
+        if exposure_s is not None:
+            src_exposure = frameinfo.parse_exposure_seconds(src.name)
+            if src_exposure is None or round(src_exposure, 3) != round(exposure_s, 3):
+                continue
         link = dest / src.name
         link.unlink(missing_ok=True)
         link.symlink_to(src.resolve())
         count += 1
-    if filter_code is not None and count == 0:
+    if count == 0 and (filter_code is not None or exposure_s is not None):
         raise ValueError(
-            f"no files in {str(source)!r} matched filter {filter_code!r} — "
-            "check the filter code against what's actually in this folder"
+            f"no files in {str(source)!r} matched filter={filter_code!r} exposure_s={exposure_s!r} — "
+            "check those against what's actually in this folder"
         )
     return count
 
 
 def stage_project(project: Path, req: StageProjectRequest) -> dict:
-    """Symlink biases/darks/per-night lights+flats into project/raw/ per
-    req, creating the project directory if needed. Returns a summary of
-    how many files landed in each destination.
+    """Symlink biases (project-wide) and per-night lights+flats+darks into
+    project/raw/ per req, creating the project directory if needed.
+    Returns a summary of how many files landed in each destination.
     """
     project.mkdir(parents=True, exist_ok=True)
     summary: dict = {}
@@ -85,10 +96,6 @@ def stage_project(project: Path, req: StageProjectRequest) -> dict:
     if req.biases_dir is not None:
         source = _resolve_capture_dir(req.biases_dir)
         summary["biases"] = _link_dir(source, project / "raw" / "biases")
-
-    if req.darks_dir is not None:
-        source = _resolve_capture_dir(req.darks_dir)
-        summary["darks"] = _link_dir(source, project / "raw" / "darks")
 
     nights_summary: dict = {}
     meta = config.read_project_meta(project)
@@ -99,25 +106,51 @@ def stage_project(project: Path, req: StageProjectRequest) -> dict:
         lights_source = _resolve_capture_dir(night.lights_dir)
         flats_source = _resolve_capture_dir(night.flats_dir)
         night_root = project / "raw" / "nights" / night.name
-        nights_summary[night.name] = {
-            "lights": _link_dir(lights_source, night_root / "lights", night.filter),
+        night_summary = {
+            "lights": _link_dir(lights_source, night_root / "lights", night.filter, night.exposure_s),
             "flats": _link_dir(flats_source, night_root / "flats", night.filter),
         }
+        if night.darks_dir is not None:
+            # No filter/exposure culling here (unlike lights/flats): a
+            # dark frame's filename never encodes a filter position (it's
+            # shot with the shutter closed, independent of any filter -
+            # confirmed the hard way, real dark filenames have no filter
+            # code to match at all) and a picked darks_dir is presumed to
+            # already BE the correct, self-contained set of dark frames
+            # for this session - unlike a mixed lights/flats folder that
+            # legitimately needs splitting.
+            darks_source = _resolve_capture_dir(night.darks_dir)
+            night_summary["darks"] = _link_dir(darks_source, night_root / "darks")
+        nights_summary[night.name] = night_summary
         # The frontend never asks for a night name (auto-numbered night1,
         # night2, ...) but Chris wants the checkboxes elsewhere in the UI
         # to show whatever the SOURCE folder was actually called (e.g. his
-        # real capture folders are literally "Night 1"/"Night 2") — so
+        # real capture folders are literally "date-target-camera-
+        # telescope", like "2025-10-04-HeartNebula-2600MM-WO61") — so
         # remember that original folder name here, keyed by our internal
-        # name, purely for display. A filter gets appended so three
-        # sessions built from the same physical folder (one per filter)
-        # don't all show up with the identical label.
+        # name, purely for display. A filter or (for OSC) an exposure
+        # length gets appended (hyphen-joined, matching that same naming
+        # convention - "...-WO61-H"/"...-WO61-300s", not "...-WO61 (H)")
+        # so several sessions built from the same physical folder (one per
+        # filter, or one per exposure length) don't all show up with an
+        # identical label, and so every place this label appears (Review,
+        # the per-step checklists, job history, ...) shows the full
+        # date-target-camera-telescope-filter/exposure name Chris asked
+        # for instead of the bare internal "night1"/"night2" key.
         base_label = Path(night.lights_dir).parent.name or night.name
-        night_labels[night.name] = f"{base_label} ({night.filter})" if night.filter else base_label
+        if night.filter:
+            night_labels[night.name] = f"{base_label}-{night.filter}"
+        elif night.exposure_s is not None:
+            night_labels[night.name] = f"{base_label}-{night.exposure_s:g}s"
+        else:
+            night_labels[night.name] = base_label
         # Tracked separately (structured, not just baked into the display
         # label) so the frontend can warn if nights with DIFFERENT filters
-        # ever get selected together for a merge+stack - combining two
-        # different filters' lights into one stack is never correct.
+        # (or, for OSC, different exposure lengths) ever get selected
+        # together for a merge+stack - combining either across one stack
+        # is never correct.
         meta.setdefault("night_filters", {})[night.name] = night.filter
+        meta.setdefault("night_exposures", {})[night.name] = night.exposure_s
     if nights_summary:
         summary["nights"] = nights_summary
 

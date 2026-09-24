@@ -16,16 +16,17 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import config, fitsinfo, frameinfo, framestats, imaging, jobs, ssf, staging, status
+from . import autostage, config, fitsinfo, frameinfo, framestats, imaging, jobs, ssf, staging, status
 from .models import (
     AnalyzeLightsRequest,
     BuildMastersRequest,
     CalibrationOverridesRequest,
+    ReviewStateUpdate,
     StackLightsRequest,
     StageProjectRequest,
 )
 
-app = FastAPI(title="astro-stacker")
+app = FastAPI(title="astro-stacker", version=config.VERSION)
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -46,7 +47,12 @@ def _project_or_404(name: str) -> Path:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "siril_bin": config.SIRIL_BIN, "projects_dir": str(config.PROJECTS_DIR)}
+    return {
+        "status": "ok",
+        "version": config.VERSION,
+        "siril_bin": config.SIRIL_BIN,
+        "projects_dir": str(config.PROJECTS_DIR),
+    }
 
 
 @app.get("/projects")
@@ -162,9 +168,41 @@ def browse_captures(path: str = ""):
         # data - lets the frontend offer a filter picker only when this
         # folder actually mixes more than one filter together.
         "detected_filters": frameinfo.detect_filters(fit_names),
+        # Per-filter frame count for the same codes as detected_filters
+        # (e.g. {"H": 15, "O": 14, "S": 16}) - lets Stage's filter picker
+        # show how many subs are in each filter, not just which filters
+        # are present.
+        "filter_counts": frameinfo.count_filters(fit_names),
+        # Same idea as detected_filters/filter_counts, but for exposure
+        # length - lets Stage's picker split an OSC (no filter wheel)
+        # session into one row per exposure length when a lights folder
+        # mixes more than one, the same way a mixed-filter folder splits
+        # into one row per filter.
+        "detected_exposures": frameinfo.detect_exposures(fit_names),
+        "exposure_counts": frameinfo.count_exposures(fit_names),
         "sample_date_obs": sample["date_obs"],
         "sample_instrument": sample["instrument"],
     }
+
+
+@app.get("/captures/scan")
+def scan_captures(path: str = ""):
+    """Best-effort staging plan proposed from a root folder (see
+    app/autostage.py for the actual algorithm and, importantly, why it's
+    conservative about what it's willing to guess) - lets the frontend
+    pre-populate Stage's session rows and darks/biases fields the moment
+    a project's root_dir is chosen, instead of Chris clicking through the
+    folder picker once per field by hand. Every candidate this returns
+    still goes through the exact same Stage-time review/warning/removal
+    UI a manually-picked folder would.
+    """
+    base = config.CAPTURES_DIR.resolve()
+    target = (base / path).resolve() if path else base
+    if target != base and base not in target.parents:
+        raise HTTPException(status_code=400, detail="path escapes CAPTURES_DIR")
+    if not target.is_dir():
+        raise HTTPException(status_code=404, detail=f"not a directory under captures: {path!r}")
+    return autostage.scan_for_staging_plan(base, target)
 
 
 def _project_relative_file(project: Path, path: str) -> Path:
@@ -198,9 +236,13 @@ def project_preview(
     """Quick-look PNG for a FITS file inside this project (a raw light,
     during review, or a finished result.fit) — see app/imaging.py.
     `stretch` is one of "none"/"linked"/"unlinked" (only meaningfully
-    different for multi-channel calibrated/stacked data). `debayer` only
-    matters for a raw (single-plane) OSC sub — the frontend passes it
-    based on this project's own `is_osc` setting (see /status).
+    different for multi-channel calibrated/stacked data) for anything
+    Chris picks; "calibration" (master flat) and "noise" (master bias/
+    dark) are used internally by the Masters step's own previews, not a
+    choice exposed to him. `debayer` only matters for a raw (single-plane)
+    OSC sub — the frontend passes it based on this project's own `is_osc`
+    setting (see /status), except for master bias/dark previews, which
+    never debayer regardless (see app/imaging.py's docstring).
     """
     project = _project_or_404(name)
     candidate = _project_relative_file(project, path)
@@ -323,7 +365,7 @@ def _run_steps(steps: list[ssf.SirilStep], project: Path, name: str, kind: str) 
 def render_masters(name: str, req: BuildMastersRequest):
     project = _project_or_404(name)
     try:
-        steps = ssf.render_build_masters(project, req)
+        steps, _dark_merges = ssf.render_build_masters(project, req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _render_steps_text(steps)
@@ -334,9 +376,10 @@ def run_masters(name: str, req: BuildMastersRequest):
     project = _project_or_404(name)
     _reject_if_job_running(name)
     try:
-        steps = ssf.render_build_masters(project, req)
+        steps, dark_merges = ssf.render_build_masters(project, req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    ssf.apply_dark_merge_inputs(dark_merges)
     return _run_steps(steps, project, name, "masters")
 
 
@@ -365,7 +408,21 @@ def run_stack(name: str, req: StackLightsRequest):
     # harmless filename here until the next successful one overwrites it).
     meta = config.read_project_meta(project)
     if len(nights) > 1:
-        meta["merged_result_filename"] = f"{output_name}.fit"
+        # Keyed by filter (joined the same way output_basename() names the
+        # file itself), falling back to exposure length when there's no
+        # filter (OSC data split into multiple exposure-length sessions -
+        # see ssf.py's _resolve_nights()'s merge_dir_name, same fallback),
+        # "" only when neither applies (single-exposure OSC, the original
+        # case) - rather than one single slot, so a narrowband project's H
+        # merge and S merge, or an OSC project's 60s merge and 300s merge,
+        # can all exist at once, each its own independent result, not one
+        # overwriting another's meta record.
+        merge_filters = "+".join(sorted({n["filter"] for n in nights if n["filter"]}))
+        if merge_filters:
+            merge_key = merge_filters
+        else:
+            merge_key = "+".join(sorted(f"{n['exposure_s']:g}s" for n in nights if n["exposure_s"] is not None))
+        meta.setdefault("merged_result_filenames", {})[merge_key] = f"{output_name}.fit"
     else:
         meta.setdefault("night_result_filenames", {})[nights[0]["key"]] = f"{output_name}.fit"
     config.write_project_meta(project, meta)
@@ -433,10 +490,73 @@ def run_analyze(name: str, req: AnalyzeLightsRequest):
             # captures) sort last rather than crashing the comparison.
             night_stats.sort(key=lambda s: s.captured_at or "9999")
             result["nights"][target.key] = [s.__dict__ for s in night_stats]
+        # Persisted so this (real astropy/photutils compute time, not
+        # cheap) result survives a page reload or a new session, not
+        # just switching projects within one still-open browser tab -
+        # see config.read_review_state()'s docstring. exclude_frames
+        # here is whatever was ALREADY excluded going into this run (a
+        # fresh Analyze passes none; "Re-analyze survivors" passes the
+        # current set) - anything the user excludes AFTER seeing this
+        # result is saved separately, via POST .../review-state, since
+        # that's a decision made after the fact, not part of this run.
+        config.write_review_state(
+            project, {"result": result, "anomaly_sigma": req.anomaly_sigma, "exclude_frames": req.exclude_frames}
+        )
         return result
 
     job = jobs.create_python_job(work, project / "logs", workdir=project, project=name, kind="analyze")
     return {"job_id": job.id}
+
+
+@app.get("/projects/{name}/review-state")
+def get_review_state(name: str):
+    """The last persisted analyze result + exclude list for this project
+    (see config.read_review_state()), so a page reload or a brand new
+    session can restore a review in progress instead of forcing a full
+    re-analyze (real astropy/photutils compute time) just to see the
+    same stats again. 404 (not an empty/null 200) if this project has
+    never been analyzed, so the frontend can tell "nothing saved yet"
+    apart from "saved state is empty" without inspecting the body.
+    """
+    project = _project_or_404(name)
+    state = config.read_review_state(project)
+    if state is None:
+        raise HTTPException(status_code=404, detail="no review state saved for this project")
+    return state
+
+
+@app.post("/projects/{name}/review-state")
+def set_review_state(name: str, req: ReviewStateUpdate):
+    """Updates just the exclude list / outlier sensitivity on top of
+    whatever analyze result is already persisted (see
+    config.write_review_state()) - called whenever the frontend's review
+    session changes after the fact, not just right after an analyze run.
+    A project that's never been analyzed has nothing to attach this to
+    yet, so this is a no-op rather than inventing a result out of thin
+    air (the frontend never actually calls this before analyzing once).
+    """
+    project = _project_or_404(name)
+    state = config.read_review_state(project)
+    if state is None:
+        return {"ok": False, "reason": "not analyzed yet"}
+    state["exclude_frames"] = req.exclude_frames
+    state["anomaly_sigma"] = req.anomaly_sigma
+    config.write_review_state(project, state)
+    return {"ok": True}
+
+
+@app.delete("/projects/{name}/review-state")
+def clear_review_state(name: str):
+    """Called by Review's "Start over" - without this, the persisted
+    state from BEFORE the reset would still be sitting on disk, and the
+    very next page reload or fresh session (see GET .../review-state's
+    use in switchToProject()) would silently resurrect the pre-reset
+    analysis the user just explicitly discarded. Same reasoning "Start
+    over" already applies to the in-memory reviewCache in app.js.
+    """
+    project = _project_or_404(name)
+    config.delete_review_state(project)
+    return {"ok": True}
 
 
 @app.get("/projects/{name}/jobs")
