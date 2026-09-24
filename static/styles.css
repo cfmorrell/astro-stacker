@@ -58,6 +58,14 @@ header.topbar {
   margin-left: 8px;
 }
 
+.version-badge {
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  margin-left: 4px;
+  vertical-align: super;
+}
+
 main {
   max-width: 1200px;
   margin: 0 auto;
@@ -293,7 +301,16 @@ button.small {
 .night-row {
   display: flex;
   gap: 8px;
-  align-items: center;
+  /* flex-start (not center): a Stage draft row's Lights/Flats/Darks
+     columns vary in height once their frame-count/exposure/date summary
+     (or a darks "Matched from..." caption) appears - center-aligning
+     would vertically float a still-empty, shorter column to the middle
+     of the tallest one, breaking the "same height from the top" layout
+     Chris asked for. Top-aligning instead means every column's own
+     input+browse row starts at the identical offset regardless of what
+     grows underneath it, and the row's overall height just grows to fit
+     the tallest column. */
+  align-items: flex-start;
   margin-bottom: 8px;
   padding: 8px;
   background: var(--panel-2);
@@ -303,10 +320,20 @@ button.small {
 }
 
 .night-row .session-label {
+  /* Own full-width line above the Lights/Flats/Darks pickers - a label
+     that also carries a filter/exposure/night annotation (see
+     .group-annotation below) can run long, and keeping it out of the
+     flex-wrap row those pickers share is what makes their own row of
+     input+browse boxes line up evenly. */
+  flex-basis: 100%;
   font-size: 12px;
   font-weight: 600;
   color: var(--text-muted);
   min-width: 66px;
+}
+
+.night-row .group-annotation {
+  font-weight: 400;
 }
 
 .night-row .dirpick {
@@ -330,6 +357,15 @@ button.small {
   color: var(--text-dim);
 }
 
+.dirpick-summary {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.dirpick-summary:empty {
+  display: none;
+}
+
 .dirpick-row {
   display: flex;
   gap: 6px;
@@ -341,11 +377,44 @@ button.small {
   color: var(--warn);
 }
 
+/* Distinguishes a darks folder this app filled in for you (scan-proposed,
+   or matched from another session's same-exposure pick - see
+   autoFillMatchingDarks() in app.js) from one you picked yourself, so a
+   pre-filled value is never a mystery. Same muted/quiet treatment as
+   .dirpick-summary - a caption, not an alert. Empty (a manual pick) means
+   no line at all, same :empty collapse as .dirpick-summary above. */
+.dirpick-provenance {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.dirpick-provenance:empty {
+  display: none;
+}
+
 .checklist {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 12px;
+}
+
+/* flex-basis:100% forces a full-width break within the wrapping chip
+   row, grouping a multi-filter project's sessions under one heading per
+   filter instead of one long undifferentiated row of chips. */
+.checklist-group-heading {
+  flex-basis: 100%;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  margin: 8px 0 -2px;
+}
+
+.checklist-group-heading:first-child {
+  margin-top: 0;
 }
 
 .chip {
@@ -858,6 +927,19 @@ button.danger-outline:hover {
   margin-bottom: 22px;
 }
 
+.filter-group-heading {
+  margin: 26px 0 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.filter-group-heading:first-child {
+  margin-top: 0;
+}
+
 .night-block h4 {
   margin: 0 0 8px;
   font-size: 13px;
@@ -1062,6 +1144,33 @@ button.danger-outline:hover {
   gap: 10px;
   margin-top: 10px;
   flex-wrap: wrap;
+}
+
+/* A narrowband project's stack step can produce several independent
+   results at once (one per filter) - laid out as a wrapping gallery of
+   cards rather than the single full-width preview an OSC project (one
+   result) still gets naturally, since with only one entry this wraps to
+   full width anyway. */
+.stack-result-gallery {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-top: 6px;
+}
+
+.stack-result-item {
+  flex: 1 1 320px;
+  min-width: 280px;
+}
+
+.stack-result-item .preview-frame {
+  margin-top: 6px;
+}
+
+.stack-result-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
 }
 
 .stretch-toggle {

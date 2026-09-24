@@ -8,7 +8,7 @@
 </head>
 <body>
 <header class="topbar">
-  <div><a href="#" id="brand-link" class="brand">astro-stacker</a><span class="brand-sub">calibrate · review · stack</span></div>
+  <div><a href="#" id="brand-link" class="brand">astro-stacker</a><span id="app-version" class="version-badge"></span><span class="brand-sub">calibrate · review · stack</span></div>
   <div id="health-badge" class="badge">checking…</div>
 </header>
 
@@ -68,36 +68,35 @@
           <div id="stage-status-badge" class="badge">not staged</div>
         </div>
 
-        <div class="field">
-          <label><input type="checkbox" id="stage-is-osc" checked /> OSC / Bayer color camera (e.g. ASI2600MC) — used to debayer review thumbnails/previews</label>
+        <div id="stage-autopopulate-note" class="external-job-banner broken-links-banner" style="display:none;">
+          <span class="msg">✨ Groups and calibration frames below were auto-detected from your project's root folder — review them, remove anything that doesn't belong, and fill in anything missing before staging.</span>
         </div>
 
-        <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Currently staged sessions</label>
+        <div class="field">
+          <label><input type="checkbox" id="stage-is-osc" checked /> OSC / Bayer color camera (e.g. ASI2600MC) — used to debayer review thumbnails/previews</label>
+          <div id="stage-osc-mismatch-warning" class="session-mismatch-warning" style="display:none;"></div>
+        </div>
+
+        <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Currently staged groups</label>
         <div id="stage-existing-nights"></div>
 
-        <label style="display:block; font-size:12px; color:var(--text-muted); margin: 14px 0 6px;">Add a session (lights + matching flats)</label>
+        <label style="display:block; font-size:12px; color:var(--text-muted); margin: 14px 0 6px;">Add a group (lights, flats, and matching darks)</label>
         <div id="stage-nights"></div>
-        <button id="add-night-btn" class="small">+ Add session</button>
-        <p class="hint">Sessions are numbered automatically — you never need to name them; internally they're stored as night1, night2, etc. Checkboxes elsewhere show whatever your source folder was actually called.</p>
+        <button id="add-night-btn" class="small">+ Add group</button>
+        <p class="hint">Groups are numbered automatically — you never need to name them; internally they're stored as group1, group2, etc. Checklists elsewhere show whatever your source folder was actually called.</p>
 
         <div class="field-row" style="margin-top:14px;">
           <div class="field">
-            <label>Biases dir</label>
+            <label>Biases (shared across all groups)</label>
             <div style="display:flex; gap:6px;">
               <input type="text" id="biases-dir" placeholder="click … to browse" style="flex:1;" readonly />
               <button type="button" class="small" id="biases-browse">…</button>
             </div>
+            <div id="biases-summary" class="dirpick-summary"></div>
             <div id="biases-type-warning" class="session-mismatch-warning" style="display:none;"></div>
           </div>
-          <div class="field">
-            <label>Darks dir</label>
-            <div style="display:flex; gap:6px;">
-              <input type="text" id="darks-dir" placeholder="click … to browse" style="flex:1;" readonly />
-              <button type="button" class="small" id="darks-browse">…</button>
-            </div>
-            <div id="darks-type-warning" class="session-mismatch-warning" style="display:none;"></div>
-          </div>
         </div>
+        <p class="hint">Darks are picked per group above (different filters or exposure lengths often need different darks) — groups sharing the same exposure length automatically share one built master, so picking the same or a different dark folder per group never means extra work.</p>
 
         <div class="progress-wrap">
           <button id="stage-btn" class="primary">Stage files</button>
@@ -111,16 +110,16 @@
     <section class="step-panel" data-step="masters">
       <div class="card">
         <div class="card-header">
-          <div class="card-title">Build shared bias/dark + per-night flats</div>
+          <div class="card-title">Build shared bias + per-group dark &amp; flat</div>
           <div id="masters-status-badge" class="badge">not built</div>
         </div>
 
-        <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Nights to build flats for</label>
+        <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Groups to build darks/flats for</label>
         <div id="masters-nights" class="checklist"></div>
 
         <label style="display:block; font-size:12px; color:var(--text-muted); margin: 14px 0 6px;">Calibration alignment</label>
         <div id="calibration-alignment"></div>
-        <p class="hint">By default, every night shares the same dark and uses its own flat. Point a night at a different file if it needs its own dark (e.g. shot at a different temperature) or should reuse another night's flat (e.g. it doesn't have its own).</p>
+        <p class="hint">By default, every group uses its own dark (groups sharing the same exposure length automatically share one built master) and its own flat. Point a group at a different file if it should reuse a different dark (e.g. it doesn't have its own) or another group's flat.</p>
 
         <div class="field-row">
           <div class="field">
@@ -163,7 +162,7 @@
           <div id="review-status-badge" class="badge">not analyzed</div>
         </div>
 
-        <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Nights to analyze</label>
+        <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Groups to analyze</label>
         <div id="analyze-nights" class="checklist"></div>
 
         <div class="field">
@@ -217,7 +216,7 @@
           <div id="stack-status-badge" class="badge">not stacked</div>
         </div>
 
-        <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Nights to stack</label>
+        <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Groups to stack</label>
         <div id="stack-nights" class="checklist"></div>
         <div id="stack-filter-warning" class="session-mismatch-warning" style="display:none;"></div>
 
@@ -268,7 +267,7 @@
         <div class="field">
           <label>Excluded frames (<span id="exclude-count">0</span> selected in Review)</label>
           <div id="exclude-list" class="hint">none</div>
-          <p class="hint">Applies across every night selected above — excluding a frame in Review removes it from the stack no matter which night it belongs to.</p>
+          <p class="hint">Applies across every group selected above — excluding a frame in Review removes it from the stack no matter which group it belongs to.</p>
         </div>
 
         <button id="stack-render-btn" class="script-toggle-btn"><span class="arrow">▾</span> Preview script</button>

@@ -32,6 +32,22 @@ a CEM60/AM5 with a dedicated cooled camera, already knows Siril, and does
 post-processing elsewhere.
 
 ## Architecture decisions (settled, don't relitigate)
+- **Versioning started 2026-09-23**: `config.VERSION` (`app/config.py`,
+  a single hand-bumped string) is the one source of truth, surfaced via
+  `GET /health`'s `version` field, `FastAPI(version=...)` (shows in
+  `/docs`), and the UI header (`#app-version`, populated from `/health`
+  in `app.js`'s boot sequence). Versions correspond 1:1 with pushes that
+  actually trigger the CI build (`.github/workflows/docker-publish.yml`
+  — confirmed against GitHub's own Actions run history, not guessed at:
+  3 runs existed at the time this started, for commits `b9954ba`
+  (CI+Dockerfile), `91b2dc9` (Masters/Stack redesign + narrowband), and
+  `e75349d` (camera/date mismatch warnings) — Chris named that 3rd one
+  **v0.3** retroactively (tagged in git), making the next push **v0.4**.
+  **Stay under 1.0 deliberately** until Chris has run this in production
+  long enough to trust it — his call to make, not tied to any feature
+  list or date. Bump `VERSION` by hand as part of whatever commit is
+  about to be pushed next; tag the release (`git tag -a vX.Y <sha> -m
+  "..."`, `git push origin vX.Y`) once it's actually pushed.
 - **Option A**, not B: the tool builds masters from raw calibration subs
   itself, rather than only consuming pre-built masters. Chris explicitly
   chose this.
@@ -1658,6 +1674,748 @@ Siril ones, but the same "don't rediscover this" spirit applies.
   same-camera, realistic ~17-day calibration gap shows nothing; MC
   lights against MM darks (wrong camera only, no date issue) shows only
   the camera message.
+- ✅ **Versioning introduced (2026-09-23)** — see the new Architecture
+  decisions bullet for the full policy. `config.VERSION` bumped to
+  `"0.4"`; `v0.3` tagged and pushed on the already-deployed `e75349d`.
+  Verified the header shows `v0.4` and `/health` returns it, live.
+- ✅ **Narrowband/mono workflow redesigned around one-click multi-filter
+  staging and stacking (2026-09-23)**. Chris: "rather than requiring 4
+  separate stacking sessions... we allow the user to stage images for
+  each of the filters that they've used... [does this] require some kind
+  of branch... or can we subtly add it in more easily and use context
+  clues?" **Answer given and confirmed correct while building this**: no
+  branch needed. The (night × filter) model this asks for was already
+  how the backend worked, one filter-picker click at a time (last
+  round's work) — `is_osc` plus filename-based filter detection were
+  already sufficient context; the only real gap was staging-step UX,
+  since Masters (one flat per session) and Review (already listed/
+  labeled per session) already fan out correctly the moment sessions are
+  correctly split by filter, with zero code changes needed there.
+  Built:
+  - **Stage**: a mixed-filter folder pick (e.g. narrowband H/O/S all in
+    one "Light" folder) now shows a multi-select checklist (all filters
+    checked by default) instead of last round's single-select dropdown.
+    One "Stage files" click fans that ONE row out into one NightSource
+    PER CHECKED FILTER, all pointed at the same source folder pair —
+    replacing what used to require repeating "+Add session" once per
+    filter. Verified: one folder pick with 2 of 3 filters checked
+    produced exactly 2 correctly-filtered sessions server-side.
+  - **Stack**: Chris chose auto-fan-out (asked directly, since this was
+    a genuine design fork, not something to assume) — selecting nights
+    that span multiple filters and clicking "Run stack" once now groups
+    them by filter and runs one independent stack per group,
+    *sequentially* (the server already 409s a second job against the
+    same project while one runs — shared scratch dirs — so firing them
+    concurrently was never an option), with a live per-group status
+    trail ("✓ H complete", "Running S (2/2)…"). Verified for real: 2
+    filters staged and mastered, one "Run stack" click produced 2
+    separate, correctly-named result files
+    (`<project>_H_<time>.fit`/`<project>_S_<time>.fit`).
+  - **Found and fixed a real collision this surfaced**: the merge
+    scratch dir (`process/lights/_merged`) was a single project-wide
+    path, wiped fresh (`shutil.rmtree`) before every merge run — so
+    stacking a second filter after the first would have deleted the
+    first filter's completed result right off disk despite its
+    different filename, since the whole directory gets rebuilt, not
+    just the file in question. Fixed by suffixing the dir with the
+    filter set (`_merged_H`, `_merged_H+S` for an overridden mixed
+    selection, plain `_merged` when no night carries a filter — kept
+    unsuffixed specifically so existing OSC projects' paths don't
+    change). `status.py`'s single `merged_result_filename` similarly
+    became `merged_result_filenames` (dict keyed the same way,
+    `/status` now returns a `merged_results` list instead of one path)
+    so a project can have several live merged results at once instead
+    of the newest silently overwriting the meta record of the previous
+    one. Verified backward compatibility for real: re-ran an OSC 2-night
+    merge against `live-test-8` (no filter involved at all) end-to-end
+    and confirmed it still uses the original unsuffixed path and reports
+    correctly through the new list-shaped `merged_results`.
+  - **Stack's result preview became a gallery** (`allResultEntries()` /
+    `showStackPreview()`), showing every currently-existing result at
+    once (each merged group plus any standalone single-night results,
+    deduped by path) instead of assuming there's only ever one — each
+    card labeled by filter (or by night, for an unmerged single-filter
+    result), with its own download link, sharing one stretch-mode
+    toggle. Verified the gallery renders both filters' results with
+    correct labels and images after a real fan-out stack.
+  - **Also found and fixed a latent bug from the calibration-optional
+    round**, unrelated to filters but caught while reading this code:
+    `mastersComplete` (the gate that unlocks the Stack step) required
+    `master_bias_built`/`master_dark_built` unconditionally — meaning a
+    project with NO bias/dark staged at all (exactly the narrowband test
+    data, and any legitimately calibration-frame-free project) could
+    never satisfy it and would stay PERMANENTLY locked out of Stack
+    through the UI, even though the backend has handled this correctly
+    for two rounds now. Fixed: bias/dark only count as "required" when
+    any were actually staged (`biases_count`/`darks_count` > 0).
+- ✅ **Review/checklist labels fixed, and multi-night multi-filter
+  grouping designed and built (2026-09-23)**. Chris caught a real
+  regression from last round's narrowband work: Review's per-session
+  blocks were labeled with the raw internal key ("night1", "night2",
+  ...) instead of the descriptive label every other view already used —
+  `renderAnalyzeOutput()` was building its heading from the bare object
+  key straight out of `state.lastAnalyzeResult.nights`, bypassing
+  `nightDisplayLabel()` entirely. Also asked for the filter to be part
+  of the FULL name (`date-target-camera-telescope-filter`, e.g.
+  `2025-10-04-HeartNebula-2600MM-WO61-H`) rather than last round's
+  parenthetical suffix, and for "Nights to analyze"/"Nights to build
+  flats for"/"Nights to stack" to stop calling a (night, filter) session
+  a "night" — renamed to "Sessions..." throughout (matching Stage's own
+  existing "Add a session" terminology), including the Masters
+  calibration-alignment card title/hint and the exclude-frames hint.
+  Also fixed the Stack panel's filter-mismatch note, which was left over
+  from BEFORE last round's auto-fan-out and had gone stale in the same
+  round that built the fix: it still said "merging different filters
+  into one stack doesn't make sense," when the app now correctly handles
+  exactly that by running one stack per filter instead of merging them —
+  reworded from a warning to an informational heads-up about what the
+  fan-out is about to do.
+  **The harder ask**: Chris asked me to think through the case where a
+  project has SEVERAL nights, each with several filters, that don't
+  necessarily match (night 1 shot in S/H/O/L/R/G/B, night 2 just H/O,
+  etc.) — since each (night, filter) combo is its own independent
+  session, a project like that can easily have a dozen+ entries, and
+  listing them in raw staging order buries "all my H data" across
+  however many other filters/nights sit between them. **Decision**: group
+  by FILTER (not night), since filter is the unit Stack actually combines
+  nights INTO — this directly answers the question these views exist to
+  answer ("is my H data, across every night I have it, ready?") in a way
+  night-first grouping wouldn't. Built one shared `groupNightsByFilter()`
+  (`app.js`) used by all three per-session checklists (Masters/Review/
+  Stack) AND Review's own per-session output blocks — a plain OSC
+  project (no filters at all) gets zero group headings, completely
+  unchanged from before this existed; a project with any filter data
+  gets a "Filter: X" heading (chip-row full-width break for the compact
+  checklists, a bigger rule-line heading for Review's larger blocks)
+  ahead of every filter's sessions, sorted alphabetically with any
+  filterless sessions pushed last. Verified for real: staged 3 sessions
+  across 3 filters from the same physical night, confirmed all three
+  checklists AND Review's analyzed output group identically under
+  "Filter: H"/"Filter: O"/"Filter: S" with full descriptive labels, then
+  re-verified a plain OSC project (`live-test-8`) still shows a flat,
+  ungrouped list exactly as before.
+- ✅ **Review results now survive a page reload / brand new session, not
+  just switching projects within one open tab (2026-09-23)**. Chris:
+  "It looks like we've lost our light frame history when I exit and go
+  back into a project." Reproduced carefully before assuming where the
+  bug was: switching projects (or to "no project") and back WITHIN one
+  still-open tab worked fine — the existing `reviewCache` (client-side,
+  in-memory JS object) already handled that case correctly, confirmed by
+  testing it directly. The actual gap: `reviewCache` is pure browser
+  memory, so it was ALWAYS wiped by anything Chris would actually
+  describe as "exit and go back in" — a page reload, a new browser tab,
+  or the dev container restarting — since analyze results were never
+  persisted anywhere outside that one JS object, by original design
+  ("nothing is persisted server-side" — but that decision was about not
+  auto-excluding frames, not about storing the data at all; conflating
+  the two is what left this gap).
+  Fixed with real server-side persistence: `run_analyze()`'s job writes
+  `project/review_state.json` (`{result, anomaly_sigma,
+  exclude_frames}`) the moment it succeeds — the expensive part (real
+  astropy/photutils compute per frame) is now saved exactly once,
+  unconditionally, with no dependence on the client ever "switching
+  away" first. New `config.read_review_state()`/`write_review_state()`/
+  `delete_review_state()` (deliberately a separate file from meta.json,
+  which documents itself as being for a handful of small settings, not
+  potentially-large per-frame data) back three new endpoints: `GET`/
+  `POST`/`DELETE /projects/{name}/review-state`. The frontend's
+  `switchToProject()` now falls back to `GET .../review-state` whenever
+  there's no in-memory `reviewCache` hit (a fresh tab/reload), restoring
+  the same way either path arrived; exclude-list/sensitivity changes
+  made after the fact are pushed to `POST .../review-state`
+  fire-and-forget at the same point `reviewCache` already gets updated
+  (switching away). Also caught and fixed the same class of bug in
+  "Start over," which already knew to clear the in-memory cache
+  (specifically to prevent resurrecting pre-reset data on switch-away-
+  and-back) but had no way to know about the new server copy — without
+  clearing it too, "Start over" followed by a page reload would have
+  silently un-done the reset. Verified for real, not just re-reading the
+  code: analyzed a real project, excluded a frame, closed the tab
+  entirely (`Target.closeTarget`, not just navigating away) and opened a
+  completely fresh one — full result (30 frames, 3 sessions) and the
+  exclude count both came back correctly; separately verified "Start
+  over" followed by a fresh tab shows "not analyzed" with nothing
+  resurrected.
+- ✅ **Stage auto-populates a best-effort staging plan from the chosen
+  root folder (2026-09-24)**. Chris: pick a root folder, get lights (per
+  night/filter), matching flats, and darks/biases pre-populated where
+  findable, so there's a subset to review and prune instead of clicking
+  through the folder picker once per field. Also asked for real
+  protective logic — a max depth, and not guessing across folders that
+  "clearly apply to different projects."
+  **Design choice, made deliberately**: every candidate comes from
+  INSIDE the chosen root only (never searches the wider captures
+  library), and a flats folder is only ever paired with a lights folder
+  that's its own SIBLING (same parent directory) — never guessed across
+  folders that happen to both look like flats but belong to different
+  sessions. This is what actually delivers the "don't cross-match
+  unrelated projects" safety Chris asked for, without needing a separate
+  fuzzy name-similarity heuristic bolted on top: confining every
+  candidate to the explicitly-chosen root plus same-parent-only flats
+  pairing leaves no cross-project ambiguity to guard against in the
+  first place. `darks_dir`/`biases_dir` are only proposed when exactly
+  ONE candidate of that type was found anywhere in the scan — two or
+  more (e.g. a per-night darks folder) is genuinely ambiguous for a
+  single shared field, so it's left blank rather than guessing wrong.
+  New `app/autostage.py` walks the root up to `MAX_DEPTH=3` (chosen
+  from, and confirmed sufficient for, every real layout in the test
+  data — target→dated-session→[Night N]→lights/flats is at most 3
+  levels either way this app has actually seen it staged), capped at
+  200 folders checked as a defensive limit against a pathological tree.
+  New `GET /captures/scan` backs it, reusing the exact same
+  `frameinfo.detect_frame_type()` 90%-agreement rule already used for
+  every other filename-based check in this app, so a folder only counts
+  as a candidate if that same rule already trusts it. Frontend:
+  triggered automatically right after picking a root folder during
+  project creation (the one place root_dir already gets set) —
+  `addNightRow()` now takes an optional pre-filled `{lightsDir,
+  flatsDir}` and, for each, runs the picked path through the EXACT SAME
+  `/captures/browse` fetch + type/exposure/date/camera warning checks
+  and filter-detection a manual folder-browser pick would (refactored
+  the biases/darks pick handlers into named functions,
+  `onBiasesPicked`/`onDarksPicked`, so the scan path and the manual
+  picker path share one implementation instead of two copies that could
+  drift). An amber note appears when anything was auto-populated,
+  telling Chris to review before staging; every proposed field remains
+  fully editable/removable through the exact same UI a manual pick uses
+  — this only ever saves clicks, never bypasses review. Verified against
+  every real layout in the test data: a multi-night OSC root correctly
+  proposed both nights with matched flats and no false calibration
+  guesses; a mixed-filter narrowband root correctly proposed the one
+  session AND triggered the existing H/O/S filter checklist exactly as
+  a manual pick would; a target-level root (containing two completely
+  different camera sessions as siblings) correctly proposed both without
+  cross-contaminating them. Known, accepted limitation: the real
+  calibration-frame library's actual folder depth (`Dark/<camera>/
+  <exposure>/<date>/`) exceeds MAX_DEPTH from that library's OWN root —
+  not fixed, since root_dir is meant to point at a target, not the
+  shared calibration library, and every real target-rooted scan already
+  correctly finds nothing there (which is the honest, expected answer,
+  not a bug) rather than reaching across into unrelated territory.
+- ✅ **Auto-populate follow-up: real numbering bug fixed, folder-info
+  summary added, and a genuinely serious cross-project leak caught along
+  the way (2026-09-24)**. Chris hit a real bug testing the auto-populate
+  feature the same day it shipped: staging an OSC project (exactly one
+  session) put the real data in "Session 2" with an empty "Session 1"
+  ahead of it. Root cause: `switchToProject()` already seeds one blank
+  draft row for every project before Stage is ever shown, and
+  `autoPopulateFromScan()` was just APPENDING its own rows after that
+  one instead of accounting for it. Fixed: before adding auto-detected
+  sessions, remove any still-blank draft row(s) first, then renumber.
+  Also asked for a summary above each Lights/Flats/Biases/Darks picker
+  showing at minimum frame count, plus exposure and date "if it can fit
+  nicely" - added `formatFolderSummary()` (`app.js`), rendering e.g. "15
+  frames · 300s · 2026-09-16" from the exact same `/captures/browse`
+  response (`fit_count`/`detected_exposure_s`/`sample_date_obs`) every
+  picker already fetches - no new backend work needed, purely a display
+  addition. Wired into every path that can set one of these four fields:
+  the interactive folder browser, Stage's auto-populate, AND the
+  `addNightRow(initial)` pre-fill path added for auto-populate.
+  **Caught a real, more serious bug while wiring the biases/darks
+  summary in**: `biases-dir`/`darks-dir` (and now their new summary
+  lines) are plain static inputs, not recreated per project the way
+  session rows are - and `switchToProject()` never reset them. Confirmed
+  live: set a biases path on project A, switch to project B (nothing
+  staged), and project A's path was still sitting there. Not just
+  cosmetic - clicking "Stage files" without noticing would have
+  re-staged the WRONG project's calibration frames into the new one.
+  Fixed as part of the same edit (cleared on every switch, along with
+  their warnings and the module-level sample-date/instrument/exposure
+  variables that back the cross-field mismatch checks). Verified all
+  three fixes live: a real single-session OSC auto-populate now produces
+  exactly one correctly-numbered "Session 1" with both summaries shown;
+  the cross-project leak test (set biases on A, switch to B) now comes
+  back empty on both the field and its summary.
+- ✅ **Real bug: project names containing spaces broke every `.ssf` step
+  (2026-09-24)**. Chris hit "Failed: step 1/3 (master_bias) failed" on a
+  real project named "Test OSC Project 1". Root-caused via the actual job
+  log (`GET /jobs/{id}/log`): `Unknown parameter OSC, aborting.` /
+  `Error in line 8 ('convert'): invalid arguments.` Confirmed via
+  `POST /projects/{name}/masters/render` that the rendered script
+  contained `convert bias -out=/data/projects/Test OSC Project
+  1/process/_build/bias` - unquoted, and Siril's script parser
+  tokenizes `-out=`/`-dark=`/`-flat=`/`-bias=` style arguments on
+  whitespace with NO quoting escape hatch (unlike plain `cd "path"`,
+  which does honor quotes - this asymmetry was already noted in the
+  codebase's own prior comments, just not yet enforced at the point
+  where it actually matters: project naming). Every `.ssf` template
+  bakes the project's own directory path into one of these unquoted
+  options, so this wasn't master_bias-specific - it would have broken
+  every step for any project name containing a space; master_bias just
+  happens to run first. Fixed in `config.project_dir()`: names must now
+  match `^[A-Za-z0-9._-]+$` (letters, numbers, hyphens, underscores,
+  periods only), raising the same `ValueError` → HTTP 400 path that
+  already existed for `.`/`..`/path-separator rejection - no changes
+  needed in `main.py`. Mirrored client-side in the `create-project-btn`
+  handler (`app.js`) so an invalid name is caught before the folder
+  picker even opens. Verified live via the running container: `Test` and
+  `mono-project-1` (both space-free) still resolve and return 200 from
+  `/status`; `Test OSC Project 1` and a fresh `Bad Name Here` both now
+  get a clean 400 with a clear message instead of a cryptic Siril
+  failure three steps in. Chris's existing "Test OSC Project 1" project
+  is left as-is (no rename feature exists) - it's understood to be test
+  data, so the fix going forward is to delete it and recreate with a
+  dash/underscore name instead of spaces.
+- ✅ **Mono staging: per-filter frame counts, then redesigned into one row
+  per filter after Chris flagged the checkbox layout itself (2026-09-24)**.
+  First pass: Chris asked for the number of frames per filter on the
+  mono/narrowband staging path, not just the folder's total.
+  `detect_filters()` (`frameinfo.py`) previously only returned which
+  filter codes were present (e.g. `["H","O","S"]`) with no counts. Added
+  `count_filters()` alongside it (same filter-code parsing, tallies
+  instead of just collecting distinct codes), exposed as a new
+  `filter_counts` field on `/captures/browse` (e.g. `{"H":10,"O":10,
+  "S":10}`). Initially wired into the existing inline-checkbox picker so
+  each label read "H (10)" instead of just "H" - but Chris pushed back on
+  the design itself: (1) the "filters to stage from this folder"
+  wording/layout treats lights+flats as one folder when they're really
+  two, and (2) a wide row of checkboxes doesn't scale - a real project
+  can easily use all of L/R/G/B/H/S/O, and 7 checkboxes crammed onto one
+  line isn't usable. Redesigned: lights and flats now track their own
+  detected filters/counts separately (`lightsDetectedFilters`/
+  `flatsDetectedFilters`/`lightsFilterCounts`/`flatsFilterCounts`),
+  merged by `refreshFilterRows()` (replaces the old
+  `applyDetectedFilters()`) into ONE FULL-WIDTH ROW PER FILTER (new
+  `.filter-group`/`.filter-picker`/`.filter-picker-row` CSS - each row
+  breaks onto its own line via `flex-basis:100%`, same trick already used
+  for `.checklist-group-heading`), each showing that filter's own counts
+  from BOTH folders side by side (e.g. "10 lights · 10 flats") so it's
+  visually obvious two real folders back every filter, not one. Group
+  label changed from "Filters to stage from this folder" to "Filters in
+  this session". Verified live via CDP against the real HeartNebula
+  2600MM mono session data (30 Light + 30 Flat frames, H/O/S mixed in
+  each): after picking both folders, three separate filter rows render,
+  each correctly reading "10 lights · 10 flats", checked by default, full
+  width rather than cramped side-by-side.
+- ✅ **Clear/unselect button for Biases dir and Darks dir (2026-09-24)**.
+  Chris hit an inadvertent bias pick with no way back to "nothing
+  selected" - picking a DIFFERENT real folder works, but there was no
+  clean way to fully unselect (both are optional - staging with neither
+  is a normal, supported case per the stage-btn handler's `|| null`).
+  Added a small "✕" clear button next to each Browse button
+  (`biases-clear`/`darks-clear` in `index.html`). Wired to two new
+  functions in `app.js`, `clearBiases()`/`clearDarks()`, which reset the
+  input value, the frame-count summary, the type-mismatch warning, and
+  the sample-date/instrument/exposure tracking variables that back the
+  cross-field mismatch checks - the exact same reset `switchToProject()`
+  already needed when leaving a project (that block now just calls these
+  two functions instead of duplicating the reset inline). Verified live
+  via CDP: picking the real 10-frame bias folder ("10 frames · 1ms ·
+  2026-08-29") then clicking clear empties both the field and summary;
+  same for a real 10-frame 300s darks folder; clicking clear with nothing
+  selected is a harmless no-op (no exceptions).
+- ✅ **Major redesign: darks moved from one project-wide picker to
+  per-session, deduplicated by exposure length; OSC gained the same
+  filter-style splitting mono already had; the mixed-filter checkbox
+  picker was removed entirely (2026-09-24)**. Chris realized real
+  narrowband/mono projects commonly use different LIGHT exposure lengths
+  per filter, meaning each filter needs its own matching master dark, not
+  one shared dark for the whole project (the previous architecture) - and
+  that OSC projects can hit the identical problem (differing exposures
+  within one night or across nights). He also flagged that the
+  immediately-prior round's "one row per filter" checkbox UI (see the
+  "Redesigned into one row per filter" bullet above) still implied one
+  shared folder when there are really two or three, and doesn't scale
+  past a handful of filters. Two explicit design decisions locked in
+  before implementing: (1) unify OSC and mono under ONE model - every
+  light-frame group, whether a mono filter or a plain OSC session, gets
+  its own dark picker; (2) darks sharing the same exposure length must
+  share ONE built master, never rebuild redundantly per row/session -
+  "these modifications don't automatically mean that every row requires a
+  separate dark stack."
+
+  **Data model** (`app/models.py`): `NightSource` gains `darks_dir`
+  (mirrors `flats_dir`) and `exposure_s` (mirrors `filter`, but for OSC -
+  tags which exposure length this session's lights should be culled to
+  when a lights folder mixes more than one). `StageProjectRequest.darks_dir`
+  (the old project-wide field) is gone; `biases_dir` is completely
+  untouched (there's still no scenario needing different bias frames
+  within one project).
+
+  **Staging** (`app/staging.py`): darks now link into
+  `raw/nights/<name>/darks` per session (same `_link_dir()` mechanism
+  already used for lights/flats). Caught a real bug while first testing
+  this: darks were initially filter-culled the same way lights/flats are
+  - but real dark frames carry NO filter code in their filename at all
+  (shot with the shutter closed, independent of any filter), so every
+  darks stage attempt immediately 0-matched and hard-errored. Fixed:
+  darks are staged unculled - a picked darks_dir is presumed to already
+  BE the correct, self-contained set for that session, unlike a
+  legitimately-mixed lights/flats folder. `exposure_s` DOES cull lights
+  (not flats - a flat's own exposure is unrelated to the light sub length
+  it calibrates).
+
+  **Dark master dedup** (`app/ssf.py`, the actual mechanism satisfying
+  Chris's second requirement): new `dark_exposure_key()` reads a night's
+  own staged `raw/nights/<name>/darks` filenames and returns
+  `frameinfo.detect_exposure_seconds()`'s result as a grouping key (e.g.
+  `"300s"`), or `None` if undeterminable (that night becomes its own
+  singleton group - safer than risking a bad merge). `render_build_masters()`
+  groups every night by this key and builds exactly ONE master dark per
+  distinct group - when 2+ nights share a key, ALL of their raw dark
+  frames get symlinked into one shared scratch input
+  (`process/_build/darks/<key>_input/`, a SIBLING of the actual output
+  scratch dir, not nested under it - nesting it under the `fresh_dir`
+  that `prepare_fresh_dirs()` wipes right before the job runs would have
+  deleted the merged input out from under itself) before building, so a
+  shared master also benefits from MORE combined frames rather than
+  arbitrarily using just one contributing night's subset. Output:
+  `process/darks/<key>/master_dark.fit`. `_resolve_nights()`'s dark
+  default fallback now resolves to this same per-night, per-key path
+  (mirrors flat's already-existing per-night default). `app/status.py`
+  drops the old project-wide `darks_count`/`master_dark_built` in favor
+  of per-night `dark_count`/`master_dark_built`/`dark_key` (the last one
+  lets the frontend build the correct shared preview path itself, the
+  same way it already derives a flat's path purely from the night name).
+  Also fixed a correctness gap this surfaced: `merged_result_filenames`
+  (multi-night stack result tracking) was keyed by filter only, empty
+  string for every OSC result - two DIFFERENT OSC exposure-group stacks
+  would have collided on that same empty key and overwritten each other's
+  record. Now falls back to an exposure-based key
+  (`ssf.py`'s `_resolve_nights()`'s `merge_dir_name`, and `main.py`'s
+  `run_stack()`'s `merge_key`) the same way filter already does, so an
+  OSC project's 60s merge and 300s merge can coexist.
+
+  **Frontend row redesign** (`static/app.js`/`index.html`/`styles.css`):
+  the global "Darks dir" field is gone entirely; the mixed-filter
+  checkbox picker (`refreshFilterRows()`/`.filter-group`/`.filter-picker`)
+  is also gone entirely, per Chris's explicit call ("get rid of the
+  checkbox UI and show a row per filter, whether they are in the same
+  folder or nested deeper"). Every session row (`addNightRow()`) now has
+  its own Lights/Flats/Darks pickers (three `.dirpick-group`s, same CSS,
+  no new picker styling needed) plus a clear button for darks. A folder
+  resolving to 2+ filters (mono) or - new - 2+ light exposure lengths (OSC,
+  via new `detected_exposures`/`exposure_counts` on `/captures/browse`,
+  mirroring `detected_filters`/`filter_counts`) auto-splits into that many
+  independent rows (`splitRowByFilters()`/`splitRowByExposure()`), each
+  tagged via `row.dataset.filter`/`.exposureS` (singular now - the old
+  plural comma-joined `dataset.filters` checkbox list is gone). A `splitDone`
+  flag guards a real race: lights and flats fire independent browse
+  callbacks, and without it, both resolving in quick succession (e.g. from
+  `autoPopulateFromScan()`'s concurrent fetches) could each trigger their
+  OWN split and double the resulting rows. **Cross-row darks auto-fill**
+  (`autoFillMatchingDarks()`, tracked via a new shared `nightRows` array):
+  once any row's darks resolve to an exposure length, every OTHER row
+  whose own lights share that exposure AND whose darks field is still
+  EMPTY gets filled in too - never overwrites an already-set field, and
+  does nothing if candidates disagree on which folder to use (same
+  "can't tell isn't wrong" rule used throughout this app). A new
+  `.dirpick-provenance` caption (small/muted/italic, same treatment as
+  `.dirpick-summary`) distinguishes a manual pick (blank) from a
+  scan-proposed one ("Found automatically at this path") from a cross-row
+  match ("Matched from Session N (Xs exposure)"), so a pre-filled value is
+  never a mystery about where it came from. The stage-btn handler's
+  positional `querySelectorAll("input")[0]`/`[1]` indexing (would have
+  silently broken the moment a third input existed) is replaced with
+  reading directly from `nightRows`' tracked refs. Caught and fixed a
+  second real pre-existing gap while wiring `nightRows` in:
+  `switchToProject()`'s project-switch reset wiped `#stage-nights`'
+  innerHTML directly without ever calling any row's own cleanup, so
+  `nightRows`/`sessionWarningUpdaters` silently accumulated stale entries
+  from every previous project - harmless for the warnings array (it only
+  recomputes on detached, invisible nodes) but a real correctness risk for
+  `nightRows` once it's used to auto-fill one row's darks from another
+  (a stale entry could bleed a previous project's exposure/darks match
+  into the new one's rows). Both arrays are now explicitly cleared there.
+
+  **Scanner enhancement** (`app/autostage.py`), applied to BOTH darks and
+  flats pairing per Chris's explicit "upgrade flats too" call: replaced
+  flats' old sibling-only pairing (and darks'/biases' old "propose only if
+  exactly one candidate exists anywhere" global rule) with a shared
+  4-rule cascade (`_pair_dir()`/`_apply_leftover_fallback()`) tried in
+  priority order per light folder: (1) nested subfolder (a Dark/Flat
+  folder living directly inside the Light folder), (2) sibling parent
+  (today's original flats rule - same parent directory), (3)
+  normalized-path match (`_normalize_parts()` strips frame-type keywords
+  from each path's parts before comparing - catches parallel branches
+  like `Project/Light/H` vs `Project/Dark/H`, the exact case Chris
+  described, where the parents differ so rule 2 can't reach it), (4) a
+  single leftover candidate project-wide, fanned out to every session
+  still missing one (generalizes the old global rule per-session instead
+  of filling one shared field). Two or more leftover candidates stays
+  genuinely ambiguous - left blank, not guessed. `biases_dir` (top-level,
+  singular, unchanged) still uses the plain "exactly one anywhere" rule
+  directly, with no per-session fan-out, since biases are never
+  per-session.
+
+  **Verified thoroughly** (existing test projects deleted/recreated, not
+  migrated, since the raw/ layout changed shape - matches this session's
+  established pre-1.0 practice for breaking changes): curl-verified the
+  dark-dedup mechanism directly (two nights sharing a picked 300s darks
+  source correctly produced exactly ONE `process/darks/300s/master_dark.fit`,
+  both nights' `/status` reporting `master_dark_built: true` against it;
+  a third night with no darks at all cleanly reports `false`, no error).
+  CDP-verified the full real UI flow end to end: picking a real mixed H/O/S
+  narrowband Light folder correctly split into 3 independent rows, each
+  with its own working Lights/Flats/Darks pickers; picking darks on just
+  one of the three correctly auto-filled the other two with the
+  "Matched from Session N (300s exposure)" caption; staging all three
+  through the actual Stage button and building masters through the actual
+  Masters step correctly showed exactly ONE "Master Dark" preview tile
+  labeling all three sharing sessions, alongside three separate "Master
+  Flat" tiles. Unit-tested the new scanner cascade directly against
+  synthetic trees (bypassing the read-only `/captures` mount): the
+  `Project/Light/H`+`Project/Dark/H` parallel-branch case correctly
+  paired via rule 3; a single shared unstructured darks folder correctly
+  fell back (rule 4) to both of two sibling-paired sessions; two
+  structurally-unrelated darks candidates correctly stayed unassigned
+  (genuinely ambiguous, not guessed).
+- ✅ **Stage UI polish pass after the per-group darks redesign, plus a
+  real bug fix (2026-09-24)**. Chris reviewed the redesign and asked for
+  nine cleanups, top to bottom:
+  1. "Add a session" copy now mentions darks too ("Add a group (lights,
+     flats, and matching darks)").
+  2. Renamed "session" → "group" everywhere in the Stage/Masters/Review/
+     Stack UI text ("Group N", "+ Add group", "Groups to build darks/
+     flats for", etc.) - internal function/variable names left alone
+     (`updateSessionWarnings()`, `sessionWarningUpdaters`, plain-English
+     "session" in warning messages) since they're invisible to Chris and
+     renaming them had no visible benefit. Each group's label is now also
+     **annotated** with whatever actually makes it distinct - "Group 1 —
+     Filter H", "Group 2 — 300s", or (a plain single-group OSC project
+     with nothing to disambiguate) the picked lights folder's own parent
+     name - via a new `updateGroupAnnotation()`, called after every lights
+     pick and right when a split assigns a filter/exposure tag.
+  3. Picker layout evened up: `lightsGroup`/`flatsGroup`/`darksGroup` (and
+     the biases field in `index.html`) now put the input+browse row
+     directly under the label, with the frame-count/exposure/date summary
+     and the darks provenance caption moved BELOW it - so all three (four,
+     counting biases) pickers' actual input boxes line up at the same
+     height regardless of how many detail lines happen to be showing.
+     Verified via CDP bounding-rect check: all three `.dirpick-row`s in a
+     group sit at the identical `top` pixel position.
+  4. Dropped "(optional)" from the Darks label - it's just "Darks" now,
+     matching "Flats"' plain label (the `placeholder="optional"` text
+     inside the empty input stays, per Chris - that's fine, it's the
+     label itself that shouldn't call it out specially).
+  5. **Removed the standalone per-row darks "✕" clear button** (Chris:
+     "the multiple X buttons at the right is confusing" - it sat right
+     next to the group's own remove "✕"). `attachFolderBrowser()` gained
+     an optional `{ onUnselect }` param that adds a third "Unselect"
+     button alongside "Use this folder"/"Cancel" in the SAME browse popup;
+     darks' picker passes `clearDarksForRow` as `onUnselect`, so a row now
+     has exactly one button (the browse "…") and all three choices live
+     inside the one popup Chris asked for.
+  6. **Fixed a real bug this surfaced**: "the unselect darks function is
+     broken when another session auto matches to it." Root cause: the old
+     darks-clear handler called `autoFillMatchingDarks()` right after
+     clearing (reasoning at the time: "this row is empty again - maybe
+     another row can now fill it") - but if another row still had the
+     SAME matching-exposure darks value set, that immediately refilled
+     the just-cleared row right back, making Unselect look like a no-op.
+     Fixed by never calling `autoFillMatchingDarks()` after a clear/
+     unselect - Unselect is now the user's own final word on that row,
+     never immediately re-triggered. Verified live via CDP: 3 split rows,
+     manually pick darks on row 1 (auto-fills rows 2 and 3 with the same
+     value, as designed), then Unselect row 1 - row 1 goes back to empty
+     and STAYS empty, rows 2/3 keep their own values untouched.
+  7. Biases label changed to "Biases (shared across all groups)" (was
+     "Biases dir (shared across every session)").
+  8. **Internal naming**: the auto-generated group name prefix changed
+     from `night1`/`night2` to `group1`/`group2` - purely a frontend
+     change (`nextGroupNumber()`/the stage-btn handler's
+     `` `group${nextNum++}` ``), since the backend already treats a
+     group's `name` as an opaque string throughout (staging.py, ssf.py,
+     status.py just enumerate whatever's on disk) - no backend code
+     needed to change at all. `nextGroupNumber()`'s existing-name regex
+     now matches BOTH `group` and the old `night` prefix, so a project
+     with groups staged before this rename still numbers new ones
+     correctly instead of restarting at 1. Verified end-to-end via CDP: a
+     freshly staged 3-group project reports `name` as `group1`/`group2`/
+     `group3` from `/status`.
+  9. **New OSC/mono mismatch warning**: real filter-code evidence in ANY
+     group's lights (mono/filter-wheel proof - see
+     `frameinfo.parse_filter()`) while the OSC checkbox is still checked
+     now shows a warning right under it. Deliberately ONE-DIRECTIONAL -
+     no warning for "no filter evidence + OSC unchecked," since plenty of
+     legitimate mono setups never encode a filter code in their filenames
+     at all (the same already-accepted limitation behind the "no manual
+     filter-override UI" decision from the redesign) - warning there would
+     just be noisy false positives on ordinary, correctly-configured mono
+     projects. Checks both the current draft rows AND already-staged
+     groups (in case OSC gets toggled after the fact), re-evaluated on
+     every filter-detection change, group add/remove, and OSC checkbox
+     toggle. Verified via CDP: warning appears exactly when mono/filtered
+     data is staged with OSC checked, and clears the instant OSC is
+     unchecked.
+- ✅ **Follow-up polish round: frame-count accuracy, picker alignment, and
+  Unselect consistency (2026-09-24)**. Chris caught three more issues
+  right after the previous polish pass shipped:
+  1. **Frame counter was inaccurate after a split**: a mixed H/O/S folder
+     (30 frames total, 10 each) correctly split into 3 groups, but each
+     group's Lights/Flats summary still showed "30 frames" instead of
+     that group's own locked-filter subset (10). Root cause:
+     `formatFolderSummary()` just echoed `data.fit_count` - the raw,
+     whole-folder count from `/captures/browse` - with no awareness of
+     the row's OWN filter/exposure lock, which only gets decided
+     (`row.dataset.filter`/`.exposureS`) by `maybeSplitRow()` running
+     AFTER the summary was already written. Fixed: `formatFolderSummary()`
+     takes an optional `{count, exposureS}` override; new
+     `refreshLightsSummary()`/`refreshFlatsSummary()` (in `addNightRow()`)
+     recompute the summary from the row's CURRENT filter/exposure lock
+     against `lightsFilterCounts`/`flatsFilterCounts`/
+     `lightsExposureCounts` (looked up by value with the usual 0.01
+     tolerance, not exact key string match, since a Python float dict key
+     round-trips through JSON as text - `"300.0"` - and doesn't line up
+     with `String(300)`), called AFTER `maybeSplitRow()` decides the
+     row's fate rather than before. A locked filter/exposure with
+     literally zero matching frames now shows "0 frames" (matching the
+     warning already shown) rather than silently falling back to the
+     misleading whole-folder total. Verified live via CDP: a split
+     H/O/S row now shows "10 frames · 300s · ..." on both its Lights and
+     Flats summaries, not 30.
+  2. **Picker alignment broke the moment summaries appeared**: Chris:
+     "when lights and flats are selected and the info pops up beneath the
+     picker, the dark picker no longer aligns... those boxes should all
+     be the same height from the top." Root cause: `.night-row`'s
+     `align-items: center` vertically CENTERS each Lights/Flats/Darks
+     column against the tallest one in that flex-wrap line - so once
+     Lights+Flats grew taller (their summaries now showing) than Darks
+     (still empty), Darks' shorter column got centered against theirs,
+     shifting its own input+browse row down out of alignment. One-line
+     fix: `align-items: flex-start` - every column's content now starts
+     at the identical top offset regardless of height, and the row simply
+     grows downward to fit the tallest column, exactly as Chris described.
+     Checked every other place `.night-row` gets reused (the folder-
+     browser popup's list items, `renderExistingStagedNights()`,
+     `renderCalibrationAlignment()`) - all single-line-height content,
+     unaffected by the change. Verified via CDP bounding-rect check: all
+     three `.dirpick-row`s sit at the identical `top` pixel even with
+     Lights+Flats summaries showing and Darks still empty.
+  3. **Unselect consistency**: `attachFolderBrowser()`'s `{onUnselect}`
+     option (added for darks in the previous round) is now also wired
+     into Flats (new `clearFlatsForRow()` - clears flats' own tracked
+     state but deliberately leaves the row's filter/exposure lock alone,
+     since that's decided by lights, not flats) and Biases (the existing
+     `clearBiases()` passed straight through as `onUnselect` - no new
+     function needed). The standalone `#biases-clear` "✕" button is
+     removed from `index.html`, matching darks. Every picker in a group
+     row (Lights/Flats/Darks) and the Biases field now have exactly ONE
+     button each (the browse "…"), with "Use this folder"/"Cancel"/
+     "Unselect" all living inside that one popup - confirmed via CDP that
+     a group row has exactly one row-level "✕" left (the group's own
+     remove button), nothing else.
+- ✅ **Two real bugs: stale Review cache surviving a delete+recreate, and
+  a wrong stretch algorithm for OSC bias/dark previews (2026-09-24)**.
+
+  **Bug 1 — delete a project, create a new one with the SAME name, and
+  Review already had the OLD project's images.** Root cause: the
+  delete-project-btn handler correctly did `delete reviewCache[name]`
+  right after a successful delete, but then set `sel.value = ""` and
+  dispatched a `change` event to deselect — which calls
+  `switchToProject()`. That function's OWN first block ("save the
+  OUTGOING project's review session") runs unconditionally whenever
+  `state.project && state.lastAnalyzeResult`, with NO awareness that the
+  project it's about to save FOR was just deleted a moment ago -
+  `state.lastAnalyzeResult` was still holding the just-deleted project's
+  analyze result (Chris was actively looking at Review when he deleted
+  it), so this immediately re-wrote `reviewCache[name]` right back,
+  undoing the clear that had just happened. Creating a new project with
+  the same name later then restored this resurrected entry via the
+  ordinary (and otherwise entirely correct) name-keyed cache-restore path
+  in `switchToProject()`. Fixed by clearing `state.lastAnalyzeResult`/
+  `state.excludeFrames`/`state.lastAnomalySigma` immediately after a
+  successful delete, before the subsequent `dispatchEvent` - the outgoing
+  -save block then correctly sees nothing to save and skips it entirely.
+  Verified via CDP (simulating an active analyze result rather than
+  running a real one, since the bug is purely about the
+  state/reviewCache interaction, not the analyze pipeline itself): delete
+  a project with a faked `state.lastAnalyzeResult` set, confirm
+  `reviewCache[name]` is `null` immediately after, confirm it's STILL
+  `null` after creating a new project with the identical name.
+
+  **Bug 2 — OSC calibration frame previews looked wrong**: "the zoomed
+  version looks right, but the thumbnail is way too bright," and for
+  bias/dark specifically, neither thumbnail nor zoom matched what Siril's
+  own unlinked autostretch shows (a mostly solid dark field with a small
+  handful of hot/cold pixels). Two separate, real, previously-
+  undiscovered bugs in `app/imaging.py`:
+  1. **Thumbnail-vs-zoom inconsistency (affected all "calibration"-mode
+     previews, most visible on flats)**: `ZScaleInterval`'s computed
+     black/white points are an outlier-rejection statistic - they depend
+     on a small handful of extreme pixels (dust motes, hot/cold pixels)
+     surviving in the sample they're given. The old code computed these
+     limits AFTER downsampling for the requested preview size - a
+     thumbnail's heavy block-averaging stride smears each outlier's
+     extreme value into its neighbors, diluting/erasing the very outliers
+     ZScale needs, so a thumbnail and a full-res zoom of the exact SAME
+     frame computed genuinely different stretches. Fixed: `render_preview_png()`
+     now computes these limits ONCE on the full-resolution data, before
+     any downsampling, and reuses them unchanged for whatever size
+     actually gets rendered (`_apply_stretch()` gained an optional
+     `limits` param for this). Verified against real master flat data:
+     thumbnail and zoom now report identical mean/median brightness
+     (157.3/159.0 both), where they previously would have differed.
+  2. **Wrong stretch algorithm entirely for bias/dark**: `ZScaleInterval`
+     (the existing "calibration" mode, correctly tuned for a FLAT's smooth
+     vignetting gradient) targets the DS9/IRAF "sky background at a
+     comfortable ~50% gray" display convention - confirmed by hand against
+     real master bias/dark pixel data, this mapped the frame's own median
+     to ~50% gray (washed out), not a dark field. A bias/dark frame is the
+     opposite case from a flat: no gradient at all, just a near-uniform
+     noise floor plus sparse hot/cold outliers - there's no "sky
+     background" to show at a comfortable midtone. Added a NEW stretch
+     mode, "noise" (`_mtf()`/`_autostretch_params()` in `app/imaging.py`),
+     implementing the same midtones-transfer-function (MTF) autostretch
+     PixInsight's ScreenTransferFunction and Siril's own "Auto Stretch"
+     use - same documented defaults (0.25 target background, -2.8 MAD-
+     based shadow clip) - which pushes the frame's own median down to a
+     dark 0.25 via a nonlinear curve instead of ZScale's ~0.5. Master
+     bias/dark previews (`renderMastersPreviews()` in `app.js`) now
+     request `stretch=noise`; master flat keeps `stretch=calibration`
+     (ZScale), unchanged. Also caught and fixed a THIRD contributing bug
+     in the same investigation: bias/dark previews were being debayered
+     whenever `is_osc`, exactly like flats - but a bias/dark frame is pure
+     sensor noise, not light through a color filter array, so there's no
+     real per-channel color to reconstruct, and bilinear debayering
+     actively SPREADS each single hot/cold outlier pixel's extreme value
+     across several of its neighbors (the interpolation kernel's own
+     nature), further confusing any outlier-sensitive stretch. Master
+     bias/dark previews now always render as the plain grayscale mosaic
+     they actually are, regardless of `is_osc` (flats are unaffected -
+     they still get debayered for a real color look). Verified against
+     real master bias/dark data with the fix applied: median now lands at
+     64/255 (≈0.25, matching the intended target) instead of ~127/255
+     (≈0.5), consistent between thumbnail and zoom, with a small fraction
+     of pixels (dark's real hot pixels) rendering distinctly bright -
+     matching Chris's own description exactly. Confirmed live via CDP
+     that the actual Masters step UI loads all three preview images
+     successfully with the correct stretch/debayer parameters.
+- ✅ **Debayer border color fringe fixed; version bumped to 0.5
+  (2026-09-24)**. Chris caught one more issue right after the stretch
+  fixes: zoomed-in debayered previews (unstacked lights and master flats)
+  showed "a red/orange left/top border and a blue right/bottom border."
+  Root cause, confirmed with a synthetic test before touching anything:
+  `_convolve3x3()` (used by `_debayer_bilinear()`'s bilinear interpolation)
+  padded its input with `mode="edge"` — but it's called on a SPARSE
+  per-channel array (real R/B/G samples on a period-2 checkerboard, zeros
+  everywhere else), and edge-replication duplicates whatever value (real
+  sample or zero) happens to sit at the border with no regard for the
+  checkerboard's phase. A synthetic uniform test image (R=100/G=150/B=200
+  at every real sample, RGGB pattern) proved it exactly: the top-left
+  corner came out with R spiking to 225 while B dropped to 50, and the
+  bottom-right corner did the reverse (R down to 25, B up to 450) — an
+  exact match for the reported symptom. Fixed by switching to
+  `mode="reflect"` (mirrors WITHOUT repeating the edge value - pad[-1] =
+  arr[1], not arr[0]), which always preserves a period-2 pattern's phase
+  at any border or corner, so the padding is a plausible continuation of
+  the real Bayer pattern instead of a phase-blind copy. Re-ran the exact
+  same synthetic test after the fix: every single pixel, borders and
+  corners included, now correctly comes out at the true uniform value
+  (R=100, G=150, B=200 everywhere) with zero fringing. Also spot-checked
+  against a real master flat preview post-fix to confirm no regressions
+  (renders fine; real vignetting still visibly darkens the corners, which
+  is correct/expected and unrelated to this bug).
+
+  Version bumped `0.4` → `0.5` (`app/config.py`) - `0.4` was already set
+  but never pushed/tagged (only `v0.3` exists in git so far - see
+  `.github/workflows/docker-publish.yml`'s bump-by-hand convention), and
+  this entire session's work (the full per-group darks redesign, three
+  rounds of UI polish, the delete/review-cache bug, both stretch bugs, and
+  this debayer fix) had all accumulated on top of that same unpushed `0.4`
+  - bumping to `0.5` gives this whole batch its own version for whenever
+  Chris pushes it. Still deliberately under 1.0, per the existing
+  standing call (his own, not a checklist).
 - ❌ **Crop is permanently out of scope**, not deferred — see Architecture
   decisions. Don't reopen this.
 - ❌ Archive/cleanup (the Endstate's last bullet) is explicitly deferred

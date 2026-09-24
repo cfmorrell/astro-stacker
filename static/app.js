@@ -72,6 +72,50 @@ function nightDisplayLabel(n) {
   return (n && (n.label || n.name)) || "";
 }
 
+// Shared by every per-session checklist/list in this app (Masters,
+// Review's checklist AND its own per-session output blocks, Stack) - a
+// project can span several nights, each with several filters (e.g.
+// night 1 shot in S/H/O/L/R/G/B, night 2 just H/O), and each (night,
+// filter) combo is its own independent session entry (see the
+// Stage-time fan-out), so a project like that can easily have a dozen+
+// entries. Listing them in raw staging order buries "all my H data"
+// across however many other filters/nights sit between them - grouping
+// by filter instead (the unit Stack eventually combines nights INTO)
+// answers the question these views actually exist to answer: "is my H
+// data, across every night I have it, ready?" A plain OSC project (no
+// filters at all - the common case) gets no group headings at all,
+// falling back to one implicit group so every caller can treat the
+// return value uniformly either way. An OSC project split by exposure
+// length instead of filter (see splitRowByExposure()) groups by
+// `exposure_s` the same way, for the same reason - "is my 300s data
+// ready?" is just as real a question once one project has more than one
+// exposure length in play.
+function groupNightsByFilter(nights) {
+  if (nights.some((n) => n.filter)) {
+    const byFilter = new Map();
+    for (const n of nights) {
+      const key = n.filter || "(no filter)";
+      if (!byFilter.has(key)) byFilter.set(key, []);
+      byFilter.get(key).push(n);
+    }
+    return Array.from(byFilter.entries())
+      .sort(([a], [b]) => (a === "(no filter)" ? 1 : b === "(no filter)" ? -1 : a.localeCompare(b)))
+      .map(([key, groupNights]) => ({ heading: `Filter: ${key}`, nights: groupNights }));
+  }
+  if (nights.some((n) => n.exposure_s != null) && new Set(nights.map((n) => n.exposure_s)).size > 1) {
+    const byExposure = new Map();
+    for (const n of nights) {
+      const key = n.exposure_s != null ? formatExposure(n.exposure_s) : "(no exposure)";
+      if (!byExposure.has(key)) byExposure.set(key, []);
+      byExposure.get(key).push(n);
+    }
+    return Array.from(byExposure.entries())
+      .sort(([a], [b]) => (a === "(no exposure)" ? 1 : b === "(no exposure)" ? -1 : a.localeCompare(b)))
+      .map(([key, groupNights]) => ({ heading: `${key} exposure`, nights: groupNights }));
+  }
+  return [{ heading: null, nights }];
+}
+
 function isFrameFlagged(f) {
   // Computed client-side from the raw per-metric z-scores the server
   // already returned, rather than trusting the server's own `flagged`
@@ -232,7 +276,14 @@ function renderBreadcrumb(rootLabel, path, onNavigate) {
   return wrap;
 }
 
-function attachFolderBrowser(inputEl, browseBtn, onSelect) {
+function attachFolderBrowser(inputEl, browseBtn, onSelect, options) {
+  // `options.onUnselect`, when given, adds a third "Unselect" action
+  // alongside "Use this folder"/"Cancel" - lets an OPTIONAL field (e.g.
+  // per-group darks) be cleared from the exact same picker that sets it,
+  // rather than a separate standalone "✕" button sitting next to other
+  // buttons in the row (confusing once a row already has its own remove
+  // button - Chris: "the multiple X buttons at the right is confusing").
+  const onUnselect = options && options.onUnselect;
   async function open() {
     closeAnyBrowser();
     // Start browsing from this project's own root_dir (set at creation -
@@ -268,10 +319,14 @@ function attachFolderBrowser(inputEl, browseBtn, onSelect) {
         }, [d]));
       }
       panel.appendChild(list);
-      const actions = el("div", { style: "margin-top:8px; display:flex; gap:8px;" }, [
+      const actionButtons = [
         el("button", { class: "primary small", onclick: () => { inputEl.value = path; closeAnyBrowser(); if (onSelect) onSelect(data); } }, ["Use this folder"]),
         el("button", { class: "small ghost", onclick: () => closeAnyBrowser() }, ["Cancel"]),
-      ]);
+      ];
+      if (onUnselect) {
+        actionButtons.push(el("button", { class: "small ghost", onclick: () => { closeAnyBrowser(); onUnselect(); } }, ["Unselect"]));
+      }
+      const actions = el("div", { style: "margin-top:8px; display:flex; gap:8px;" }, actionButtons);
       panel.appendChild(actions);
     }
     render();
@@ -391,13 +446,16 @@ function attachFileBrowser(inputEl, browseBtn, startPath, onSelect) {
 
 // ---------- Stage section ----------
 
-function nextNightNumber() {
+function nextGroupNumber() {
   // Continue after whatever's already staged rather than always starting
-  // from 1, so adding a session after removing one can't collide with a
-  // night that's still there (e.g. night1 stays, night2 gets removed,
-  // a new session becomes night3, not a second "night2").
+  // from 1, so adding a group after removing one can't collide with a
+  // group that's still there (e.g. group1 stays, group2 gets removed,
+  // a new group becomes group3, not a second "group2"). Matches the old
+  // "night" prefix too, so a project with groups staged before this
+  // rename (still on disk as night1/night2/...) still numbers new ones
+  // correctly instead of restarting at 1.
   const existing = (state.status ? state.status.nights : [])
-    .map((n) => parseInt(n.name.replace(/^night/, ""), 10))
+    .map((n) => parseInt(n.name.replace(/^(group|night)/, ""), 10))
     .filter((x) => !isNaN(x));
   return (existing.length ? Math.max(...existing) : 0) + 1;
 }
@@ -429,10 +487,11 @@ function renderExistingStagedNights() {
   }
 }
 
-// Lets each night use a different dark/flat than its normal default (a
-// shared dark, its own flat) - e.g. a project spanning months where one
-// night was shot at a different temperature, or a night that's missing
-// its own flats and should borrow another night's. Saves immediately on
+// Lets each night use a different dark/flat than its normal default (its
+// own dark, shared with any other night whose darks resolved to the same
+// exposure length; its own flat) - e.g. a project spanning months where
+// one night was shot at a different temperature, or a night that's
+// missing its own flats and should borrow another night's. Saves immediately on
 // each change (POSTing the complete current picture, not just what
 // changed - see CalibrationOverridesRequest) rather than needing a
 // separate save step.
@@ -462,7 +521,7 @@ function renderCalibrationAlignment(nights) {
 
   for (const night of nights) {
     const darkInput = el("input", {
-      type: "text", class: "dirpick calib-dark-input", placeholder: "default: shared dark",
+      type: "text", class: "dirpick calib-dark-input", placeholder: "default: this session's own dark",
       readonly: "readonly", value: night.dark_override || "",
     }, []);
     const flatInput = el("input", {
@@ -487,19 +546,146 @@ function renderCalibrationAlignment(nights) {
   }
 }
 
-function addNightRow() {
+// Every draft session row currently in #stage-nights, tracked outside any
+// one row's own closure so cross-row logic (auto-filling a row's darks
+// from another row that already picked a matching-exposure one) can see
+// every row at once. Only ever holds DRAFT rows (mirrors
+// sessionWarningUpdaters' own scope) - already-staged nights shown in
+// #stage-existing-nights are a separate, read-only display.
+const nightRows = [];
+
+// Cross-row darks auto-fill: once one row's darks resolve to an exposure
+// length, every OTHER row whose own lights share that exposure and whose
+// darks field is still EMPTY gets filled in too - Chris: "once the user
+// has selected a dark at some exposure length, we could automatically
+// fill the darks for all other exposures of that same length." Never
+// overwrites a row that already has something in its darks field
+// (manually picked or already auto-filled) - only ever fills a currently
+// empty one. If more than one distinct darks folder would match (two
+// different real folders both at this exposure), that's genuinely
+// ambiguous - do nothing rather than guess, same "can't tell isn't wrong"
+// rule already used throughout this app's own filter/exposure detection.
+function autoFillMatchingDarks() {
+  for (const target of nightRows) {
+    if (target.darksInput.value.trim()) continue;
+    const targetExposure = target.getLightsExposure();
+    if (targetExposure == null) continue;
+    const candidates = nightRows.filter((r) => {
+      if (r === target) return false;
+      const dir = r.darksInput.value.trim();
+      if (!dir) return false;
+      const exp = r.getDarksExposure();
+      return exp != null && Math.abs(exp - targetExposure) <= 0.01;
+    });
+    const distinctDirs = new Set(candidates.map((r) => r.darksInput.value.trim()));
+    if (distinctDirs.size !== 1) continue;
+    const source = candidates[0];
+    target.fillDarksFrom(
+      source.darksInput.value.trim(),
+      `Matched from ${source.getLabel()} (${formatExposure(targetExposure)} exposure)`
+    );
+  }
+}
+
+// A filter code in ANY group's lights filenames is hard evidence of a
+// filter wheel - i.e. mono, not OSC (see app/frameinfo.py's parse_filter()
+// docstring: an OSC camera's filenames have nothing there at all, by
+// construction). Only checked in this one direction - real evidence of a
+// filter wheel contradicting a checked OSC box - not the reverse (no
+// filter evidence detected + OSC unchecked), since plenty of legitimate
+// mono setups never encode a filter code in their filenames at all
+// (already an accepted limitation of the filter-detection feature
+// itself); warning there would just be noisy false positives on ordinary,
+// correctly-configured mono projects. Re-run on every filter-detection
+// change, group add/remove, and OSC checkbox toggle.
+function updateOscMismatchWarning() {
+  const warningEl = document.getElementById("stage-osc-mismatch-warning");
+  const oscCheckbox = document.getElementById("stage-is-osc");
+  if (!warningEl || !oscCheckbox) return;
+  // Checks both the CURRENT draft rows (about to be staged) and already-
+  // staged groups (in case OSC got toggled after the fact) - either one
+  // showing real filter evidence while OSC is checked is worth flagging.
+  const draftHasFilter = nightRows.some((r) => r.row.dataset.filter);
+  const stagedHasFilter = state.status && state.status.nights && state.status.nights.some((n) => n.filter);
+  if (oscCheckbox.checked && (draftHasFilter || stagedHasFilter)) {
+    warningEl.textContent = "⚠ These light frames look like mono (filter-wheel) data, not OSC — double check the checkbox above.";
+    warningEl.style.display = "block";
+  } else {
+    warningEl.style.display = "none";
+  }
+}
+document.getElementById("stage-is-osc").addEventListener("change", updateOscMismatchWarning);
+
+// Replaces the old inline filter-checkbox picker: rather than one row
+// fanning out into several filters/exposures via checkboxes (doesn't
+// scale past 2-3 - a real project can use all of L/R/G/B/H/S/O), a
+// folder that resolves to more than one filter or exposure length splits
+// into that many independent rows immediately, each with its own
+// lights/flats/darks pickers - "for consistency's sake ... show a row
+// per filter, whether they are in the same folder or nested deeper."
+// Reuses the exact same addNightRow(initial) mechanism autoPopulateFromScan()
+// already uses to generate rows programmatically.
+function splitRowByFilters(sourceRow, { lightsDir, flatsDir }, filters) {
+  for (const filter of filters) {
+    addNightRow({ lightsDir, flatsDir, filter });
+  }
+  sourceRow.remove();
+  sourceRow._cleanup();
+  renumberGroups();
+  updateOscMismatchWarning();
+}
+
+// The OSC counterpart: a lights folder with no filter-wheel evidence at
+// all but more than one detected exposure length (e.g. 60s and 300s subs
+// of the same target mixed together) splits by exposure instead of
+// filter, for the identical reason - each exposure length needs its own
+// dark, so each gets its own session.
+function splitRowByExposure(sourceRow, { lightsDir, flatsDir }, exposures) {
+  for (const exposureS of exposures) {
+    addNightRow({ lightsDir, flatsDir, exposureS });
+  }
+  sourceRow.remove();
+  sourceRow._cleanup();
+  renumberGroups();
+  updateOscMismatchWarning();
+}
+
+function addNightRow(initial) {
   const container = document.getElementById("stage-nights");
   // Continue after whatever's already staged, not just count draft rows
-  // in this form: opening a project that already has night1/night2
-  // staged should offer "Session 3" for a new one, not restart at 1.
-  const sessionNum = nextNightNumber() + container.children.length;
+  // in this form: opening a project that already has group1/group2
+  // staged should offer "Group 3" for a new one, not restart at 1.
+  const sessionNum = nextGroupNumber() + container.children.length;
+  const groupNumberEl = el("span", { class: "group-number" }, [`Group ${sessionNum}`]);
+  // Whichever of filter/exposure/night actually makes this group distinct
+  // from any other - Chris: "each session that points to a particular
+  // exposure, night, or filter, should be clearly annotated." Filled in
+  // by updateGroupAnnotation() below once there's something to show;
+  // blank (no dash, nothing extra) for a plain single-group OSC project
+  // with nothing to disambiguate.
+  const groupAnnotationEl = el("span", { class: "group-annotation" }, []);
+  const label = el("span", { class: "session-label" }, [groupNumberEl, groupAnnotationEl]);
+  function updateGroupAnnotation() {
+    let text = "";
+    if (row.dataset.filter) {
+      text = `Filter ${row.dataset.filter}`;
+    } else if (row.dataset.exposureS) {
+      text = formatExposure(parseFloat(row.dataset.exposureS));
+    } else if (lightsInput.value) {
+      // Falls back to the picked lights folder's own parent name (e.g.
+      // "2025-10-04-HeartNebula-2600MM-WO61") as the "which night is
+      // this" identifier once there's no filter/exposure tag to show.
+      const parts = lightsInput.value.split("/");
+      text = parts.length > 1 ? parts[parts.length - 2] : "";
+    }
+    groupAnnotationEl.textContent = text ? ` — ${text}` : "";
+  }
   const row = el("div", { class: "night-row" }, []);
-  const label = el("span", { class: "session-label" }, [`Session ${sessionNum}`]);
-  // A persistent "Lights"/"Flats" label above each field, not just
-  // placeholder text: placeholder text disappears the moment a folder is
-  // picked (readonly inputs show the selected path, not a hint anymore),
-  // which was the whole problem - nothing left on screen said which side
-  // was which once both were filled in.
+  // A persistent "Lights"/"Flats"/"Darks" label above each field, not
+  // just placeholder text: placeholder text disappears the moment a
+  // folder is picked (readonly inputs show the selected path, not a hint
+  // anymore), which was the whole problem - nothing left on screen said
+  // which side was which once all three were filled in.
   const lightsInput = el("input", { type: "text", class: "dirpick", placeholder: "e.g. Night 1/lights", readonly: "readonly" }, []);
   const flatsInput = el("input", { type: "text", class: "dirpick", placeholder: "e.g. Night 1/flats", readonly: "readonly" }, []);
   const lightsBrowse = el("button", { type: "button", class: "small" }, ["…"]);
@@ -514,41 +700,91 @@ function addNightRow() {
   let flatsSampleInstrument = null;
   // A filter-wheel camera's lights/flats folders can mix several filters
   // together (e.g. narrowband H/O/S all in one "Light" folder) - see
-  // app/frameinfo.py's detect_filters(). One filter picked here applies
-  // to BOTH lights and flats when staging (see the stage-btn handler
-  // below, which reads it off row.dataset.filter), since a session's
-  // flats only make sense matched to that same session's filter.
-  const filterSelect = el("select", { class: "dirpick" }, []);
-  const filterGroup = el("div", { class: "dirpick-group", style: "display:none;" }, [
-    el("span", { class: "dirpick-label" }, ["Filter"]),
-    filterSelect,
-  ]);
-  filterSelect.addEventListener("change", () => { row.dataset.filter = filterSelect.value; });
-  function applyDetectedFilters(detectedFilters) {
-    if (!detectedFilters || !detectedFilters.length) return; // OSC/no filter wheel - leave as-is
-    if (detectedFilters.length === 1) {
-      row.dataset.filter = detectedFilters[0];
-      delete row.dataset.filterRequired;
-      filterGroup.style.display = "none";
-      return;
+  // app/frameinfo.py's detect_filters()/count_filters(). An OSC camera
+  // has no filter wheel at all, but can still mix multiple LIGHT exposure
+  // lengths together the same way (e.g. 60s and 300s subs of the same
+  // target) - see detect_exposures()/count_exposures(). Lights and flats
+  // are two SEPARATE folder picks, each with their own detected filter
+  // set/counts, tracked independently since there's no guarantee they
+  // agree; exposures are tracked from LIGHTS only (a flat's own exposure
+  // is unrelated to the light sub length it calibrates).
+  let lightsDetectedFilters = [];
+  let flatsDetectedFilters = [];
+  let lightsFilterCounts = {};
+  let flatsFilterCounts = {};
+  let lightsDetectedExposures = [];
+  let lightsExposureCounts = {};
+  // The raw /captures/browse response for whichever folder is currently
+  // picked, kept around so the summary line can be RECOMPUTED once this
+  // row's filter/exposure lock is actually known - fixes a real bug: a
+  // mixed H/O/S folder's own fit_count (e.g. 30) was being shown
+  // verbatim even after this row split into a single-filter group that
+  // only actually stages that filter's own subset (e.g. 10) - see
+  // refreshLightsSummary()/refreshFlatsSummary() below.
+  let lastLightsData = null;
+  let lastFlatsData = null;
+  function refreshLightsSummary() {
+    if (!lastLightsData) { lightsSummary.textContent = ""; return; }
+    let overrides;
+    if (row.dataset.filter) {
+      overrides = { count: lightsFilterCounts[row.dataset.filter] || 0 };
+    } else if (row.dataset.exposureS) {
+      const exposureS = parseFloat(row.dataset.exposureS);
+      overrides = { count: findCountForExposure(lightsExposureCounts, exposureS) || 0, exposureS };
     }
-    // Genuinely ambiguous - require an explicit pick rather than
-    // guessing or silently staging every filter mixed together. Keep
-    // whatever was already picked if it's still a valid choice for this
-    // new set (e.g. lights resolved to "S", then flats - ALSO mixed -
-    // gets picked next: don't throw away the S choice just because
-    // flats's own folder is ambiguous too).
-    row.dataset.filterRequired = "1";
-    const current = row.dataset.filter;
-    filterSelect.innerHTML = "";
-    filterSelect.appendChild(el("option", { value: "" }, ["— choose filter —"]));
-    for (const f of detectedFilters) filterSelect.appendChild(el("option", { value: f }, [f]));
-    if (current && detectedFilters.includes(current)) {
-      filterSelect.value = current;
-    } else {
-      delete row.dataset.filter;
+    lightsSummary.textContent = formatFolderSummary(lastLightsData, overrides);
+  }
+  function refreshFlatsSummary() {
+    if (!lastFlatsData) { flatsSummary.textContent = ""; return; }
+    const overrides = row.dataset.filter ? { count: flatsFilterCounts[row.dataset.filter] || 0 } : undefined;
+    flatsSummary.textContent = formatFolderSummary(lastFlatsData, overrides);
+  }
+  // This row's own picked darks - genuinely per-session now (unlike
+  // biases, which stay one global picker below), since different
+  // filters/exposure lengths commonly need different master darks. Same
+  // detected-type/exposure/date/camera tracking as lights/flats, feeding
+  // the same combined warning box.
+  let darksDetectedType = null;
+  let darksDetectedExposureS = null;
+  let darksSampleDateObs = null;
+  let darksSampleInstrument = null;
+  // Set once this row is locked to a single filter or (OSC) a single
+  // exposure length - either directly (only one detected) or as the
+  // result of a split (see maybeSplitRow()/splitRowByFilters()/
+  // splitRowByExposure() below). row.dataset.filter/.exposureS (NOT the
+  // old plural "filters" checkbox list - that picker is gone) are what
+  // the stage-btn handler reads to build this row's NightSource.
+  // splitDone guards against a genuine race: lights and flats each fire
+  // their own independent folder-browse callback, and either one alone
+  // could decide this row needs to split - without this flag, both firing
+  // in quick succession (e.g. from autoPopulateFromScan()'s concurrent
+  // lights+flats fetches) could each trigger their OWN split, doubling
+  // the resulting rows.
+  let splitDone = false;
+  function maybeSplitRow() {
+    if (splitDone || row.dataset.filter || row.dataset.exposureS) return false;
+    const filters = Array.from(new Set([...lightsDetectedFilters, ...flatsDetectedFilters])).sort();
+    if (filters.length > 1) {
+      splitDone = true;
+      splitRowByFilters(row, { lightsDir: lightsInput.value, flatsDir: flatsInput.value }, filters);
+      return true;
     }
-    filterGroup.style.display = "flex";
+    if (filters.length === 1) {
+      row.dataset.filter = filters[0];
+      return false;
+    }
+    // No filter-wheel evidence at all - OSC path. Only lights' own
+    // exposures matter here (flats are never exposure-split - see above).
+    if (lightsDetectedExposures.length > 1) {
+      splitDone = true;
+      splitRowByExposure(row, { lightsDir: lightsInput.value, flatsDir: flatsInput.value }, lightsDetectedExposures);
+      return true;
+    }
+    if (lightsDetectedExposures.length === 1) {
+      row.dataset.exposureS = String(lightsDetectedExposures[0]);
+      return false;
+    }
+    return false;
   }
   // Not a hard block - Chris explicitly wants these catchable but still
   // possible (e.g. deliberately reusing one night's flats for another, or
@@ -561,7 +797,7 @@ function addNightRow() {
   // 2) the folder's filenames actually look like the type being picked
   //    for (most capture software puts "Light"/"Flat"/etc. right in the
   //    name - see _detect_frame_type() in app/main.py);
-  // 3) this night's lights exposure matches the project's darks exposure
+  // 3) this session's lights exposure matches ITS OWN darks exposure
   //    (darks calibrate out sensor noise at a SPECIFIC exposure length -
   //    a mismatch here silently produces a badly-calibrated stack, not
   //    an error, so it's worth flagging same as the others);
@@ -576,7 +812,12 @@ function addNightRow() {
   //    as these lights (FITS INSTRUME, e.g. "ZWO ASI2600MC Duo") - the
   //    one thing no filename convention encodes, and the most serious
   //    mistake to catch (pointing at a completely different camera's
-  //    calibration library, not just an out-of-date one).
+  //    calibration library, not just an out-of-date one);
+  // 7) this row is locked to a specific filter or exposure length (from a
+  //    previous split) but a LATER re-pick of lights/flats/darks no
+  //    longer actually contains any matching frames - warn rather than
+  //    silently letting a later real stage-time error (zero matches) be
+  //    the only signal.
   function updateSessionWarnings() {
     const messages = [];
     const lightsParent = lightsInput.value ? lightsInput.value.split("/").slice(0, -1).join("/") : "";
@@ -591,7 +832,7 @@ function addNightRow() {
       messages.push(`The flats folder looks like it contains ${flatsDetectedType === "mixed" ? "a mix of frame types" : `${flatsDetectedType} frames`}, not flats.`);
     }
     if (lightsDetectedExposureS != null && darksDetectedExposureS != null && Math.abs(lightsDetectedExposureS - darksDetectedExposureS) > 0.01) {
-      messages.push(`These lights are ${formatExposure(lightsDetectedExposureS)} exposures, but the darks are ${formatExposure(darksDetectedExposureS)} — they won't calibrate correctly.`);
+      messages.push(`These lights are ${formatExposure(lightsDetectedExposureS)} exposures, but this session's darks are ${formatExposure(darksDetectedExposureS)} — they won't calibrate correctly.`);
     }
     const lightsDate = parseFitsDate(lightsSampleDateObs);
     const flatsDate = parseFitsDate(flatsSampleDateObs);
@@ -603,11 +844,11 @@ function addNightRow() {
     }
     const darksDate = parseFitsDate(darksSampleDateObs);
     if (lightsDate && darksDate) {
-      if (daysBetween(darksDate, lightsDate) > 365) messages.push("These darks are over a year older than the lights they'd calibrate.");
-      else if (daysBetween(lightsDate, darksDate) > 30) messages.push("These darks are more than a month newer than the lights they'd calibrate.");
+      if (daysBetween(darksDate, lightsDate) > 365) messages.push("This session's darks are over a year older than the lights they'd calibrate.");
+      else if (daysBetween(lightsDate, darksDate) > 30) messages.push("This session's darks are more than a month newer than the lights they'd calibrate.");
     }
     if (lightsSampleInstrument && darksSampleInstrument && lightsSampleInstrument !== darksSampleInstrument) {
-      messages.push(`The darks look like they're from a different camera (${darksSampleInstrument}) than the lights (${lightsSampleInstrument}).`);
+      messages.push(`This session's darks look like they're from a different camera (${darksSampleInstrument}) than the lights (${lightsSampleInstrument}).`);
     }
     const biasDate = parseFitsDate(biasesSampleDateObs);
     if (lightsDate && biasDate) {
@@ -617,6 +858,15 @@ function addNightRow() {
     if (lightsSampleInstrument && biasesSampleInstrument && lightsSampleInstrument !== biasesSampleInstrument) {
       messages.push(`The bias frames look like they're from a different camera (${biasesSampleInstrument}) than the lights (${lightsSampleInstrument}).`);
     }
+    if (row.dataset.filter && lightsDetectedFilters.length && !lightsFilterCounts[row.dataset.filter]) {
+      messages.push(`This session is locked to filter ${row.dataset.filter}, but the lights folder you picked has no ${row.dataset.filter} frames.`);
+    }
+    if (row.dataset.filter && flatsDetectedFilters.length && !flatsFilterCounts[row.dataset.filter]) {
+      messages.push(`This session is locked to filter ${row.dataset.filter}, but the flats folder you picked has no ${row.dataset.filter} frames.`);
+    }
+    if (row.dataset.exposureS && lightsDetectedExposures.length && !lightsDetectedExposures.some((e) => Math.abs(e - parseFloat(row.dataset.exposureS)) <= 0.01)) {
+      messages.push(`This session is locked to a ${formatExposure(parseFloat(row.dataset.exposureS))} exposure, but the lights folder you picked has no frames at that exposure.`);
+    }
     if (messages.length) {
       mismatchWarning.textContent = "⚠ " + messages.join(" ") + " Double check you picked the right folders.";
       mismatchWarning.style.display = "block";
@@ -624,54 +874,279 @@ function addNightRow() {
       mismatchWarning.style.display = "none";
     }
   }
+  const lightsSummary = el("div", { class: "dirpick-summary" }, []);
+  const flatsSummary = el("div", { class: "dirpick-summary" }, []);
   sessionWarningUpdaters.push(updateSessionWarnings);
   attachFolderBrowser(lightsInput, lightsBrowse, (data) => {
+    if (splitDone) return;
     lightsDetectedType = data.detected_type;
     lightsDetectedExposureS = data.detected_exposure_s;
     lightsSampleDateObs = data.sample_date_obs;
     lightsSampleInstrument = data.sample_instrument;
-    applyDetectedFilters(data.detected_filters);
+    lightsDetectedFilters = data.detected_filters || [];
+    lightsFilterCounts = data.filter_counts || {};
+    lightsDetectedExposures = data.detected_exposures || [];
+    lightsExposureCounts = data.exposure_counts || {};
+    lastLightsData = data;
+    if (maybeSplitRow()) return;
+    refreshLightsSummary();
+    updateGroupAnnotation();
     updateSessionWarnings();
+    autoFillMatchingDarks();
+    updateOscMismatchWarning();
   });
-  attachFolderBrowser(flatsInput, flatsBrowse, (data) => {
-    flatsDetectedType = data.detected_type;
-    flatsSampleDateObs = data.sample_date_obs;
-    flatsSampleInstrument = data.sample_instrument;
-    applyDetectedFilters(data.detected_filters);
+  // Clearing flats leaves this row's filter/exposure lock exactly as it
+  // is (that's decided by lights, not flats) - it just reverts flats to
+  // "not yet picked," same incomplete state as a fresh row, until picked
+  // again (staging already skips a row missing either lights or flats).
+  function clearFlatsForRow() {
+    flatsInput.value = "";
+    flatsDetectedType = null;
+    flatsSampleDateObs = null;
+    flatsSampleInstrument = null;
+    flatsDetectedFilters = [];
+    flatsFilterCounts = {};
+    lastFlatsData = null;
+    refreshFlatsSummary();
     updateSessionWarnings();
-  });
+  }
+  attachFolderBrowser(
+    flatsInput, flatsBrowse,
+    (data) => {
+      if (splitDone) return;
+      flatsDetectedType = data.detected_type;
+      flatsSampleDateObs = data.sample_date_obs;
+      flatsSampleInstrument = data.sample_instrument;
+      flatsDetectedFilters = data.detected_filters || [];
+      flatsFilterCounts = data.filter_counts || {};
+      lastFlatsData = data;
+      if (maybeSplitRow()) return;
+      refreshFlatsSummary();
+      updateGroupAnnotation();
+      updateSessionWarnings();
+    },
+    { onUnselect: clearFlatsForRow }
+  );
+  // Input row directly under the label, summary/details BELOW the picker -
+  // Chris: "the row of pickers should be even... move the extra details
+  // (frame count, exposure, date...) under the picker box." Keeps every
+  // picker's own input+browse button lined up at the same height instead
+  // of being pushed down by however many detail lines happen to be
+  // showing above it.
   const lightsGroup = el("div", { class: "dirpick-group" }, [
     el("span", { class: "dirpick-label" }, ["Lights"]),
     el("div", { class: "dirpick-row" }, [lightsInput, lightsBrowse]),
+    lightsSummary,
   ]);
   const flatsGroup = el("div", { class: "dirpick-group" }, [
     el("span", { class: "dirpick-label" }, ["Flats"]),
     el("div", { class: "dirpick-row" }, [flatsInput, flatsBrowse]),
+    flatsSummary,
   ]);
+
+  // Per-group darks picker (replaces the old project-wide #darks-dir
+  // field) - optional (staging with none is a normal, supported case,
+  // same as flats - the placeholder text says so, the label doesn't need
+  // to). "Unselect" lives INSIDE this picker's own browse popup (alongside
+  // "Use this folder"/"Cancel") rather than a separate standalone "✕" next
+  // to the input - Chris: "the multiple X buttons at the right is
+  // confusing." A provenance caption distinguishes a manual pick from one
+  // this app filled in for you (scan-proposed, or cross-row
+  // exposure-matched - see autoFillMatchingDarks()) so it's never a
+  // mystery where a pre-filled path came from.
+  const darksInput = el("input", { type: "text", class: "dirpick", placeholder: "optional", readonly: "readonly" }, []);
+  const darksBrowse = el("button", { type: "button", class: "small" }, ["…"]);
+  const darksSummary = el("div", { class: "dirpick-summary" }, []);
+  const darksProvenance = el("div", { class: "dirpick-provenance" }, []);
+  const darksTypeWarning = el("div", { class: "session-mismatch-warning", style: "display:none;" }, []);
+
+  function processDarksData(data, provenanceText) {
+    darksDetectedType = data.detected_type;
+    darksDetectedExposureS = data.detected_exposure_s;
+    darksSampleDateObs = data.sample_date_obs;
+    darksSampleInstrument = data.sample_instrument;
+    darksSummary.textContent = formatFolderSummary(data);
+    warnIfWrongType("dark", data.detected_type, darksTypeWarning);
+    darksProvenance.textContent = provenanceText || "";
+    updateSessionWarnings();
+  }
+  // Shared by a scan-proposed prefill, autoFillMatchingDarks(), AND the
+  // manual browse callback below - one path in, always the same
+  // processing, so nothing gets a free pass depending on how it got set.
+  function fillDarksFrom(path, provenanceText) {
+    darksInput.value = path;
+    api("GET", `/captures/browse?path=${encodeURIComponent(path)}`).then((data) => {
+      processDarksData(data, provenanceText);
+    }).catch(() => {});
+  }
+  // NOT followed by autoFillMatchingDarks() - a REAL bug Chris hit
+  // ("unselect darks is broken when another session auto matches to
+  // it"): if another row still has a matching-exposure darks value set,
+  // re-running auto-fill right after a manual clear would immediately
+  // refill this row from that other row, making Unselect look like it
+  // does nothing at all. Unselect must be the user's own clean, final
+  // word on this row's darks - it never triggers a fresh auto-fill pass.
+  function clearDarksForRow() {
+    darksInput.value = "";
+    darksSummary.textContent = "";
+    darksProvenance.textContent = "";
+    darksTypeWarning.style.display = "none";
+    darksDetectedType = null;
+    darksDetectedExposureS = null;
+    darksSampleDateObs = null;
+    darksSampleInstrument = null;
+    updateSessionWarnings();
+  }
+  attachFolderBrowser(
+    darksInput, darksBrowse,
+    (data) => {
+      processDarksData(data, ""); // a manual pick is never "found for you" - no caption
+      autoFillMatchingDarks();
+    },
+    { onUnselect: clearDarksForRow }
+  );
+  const darksGroup = el("div", { class: "dirpick-group" }, [
+    el("span", { class: "dirpick-label" }, ["Darks"]),
+    el("div", { class: "dirpick-row" }, [darksInput, darksBrowse]),
+    darksSummary,
+    darksProvenance,
+  ]);
+
   const removeBtn = el("button", {
     type: "button", class: "small ghost",
     onclick: () => {
       row.remove();
-      renumberSessions();
-      const idx = sessionWarningUpdaters.indexOf(updateSessionWarnings);
-      if (idx !== -1) sessionWarningUpdaters.splice(idx, 1);
+      row._cleanup();
+      renumberGroups();
+      updateOscMismatchWarning();
     },
   }, ["✕"]);
-  row.append(label, lightsGroup, flatsGroup, filterGroup, removeBtn, mismatchWarning);
+  row.append(label, lightsGroup, flatsGroup, darksGroup, removeBtn, mismatchWarning, darksTypeWarning);
   container.appendChild(row);
+
+  // Exposed so splitRowByFilters()/splitRowByExposure() (which only have
+  // the `row` DOM element, not this closure) and the remove button above
+  // can both tear down this row's entries in the shared module-level
+  // arrays without duplicating the bookkeeping in three places.
+  row._cleanup = () => {
+    const idx = sessionWarningUpdaters.indexOf(updateSessionWarnings);
+    if (idx !== -1) sessionWarningUpdaters.splice(idx, 1);
+    const rIdx = nightRows.indexOf(rowState);
+    if (rIdx !== -1) nightRows.splice(rIdx, 1);
+  };
+  const rowState = {
+    row,
+    lightsInput,
+    flatsInput,
+    darksInput,
+    fillDarksFrom,
+    getLightsExposure: () => lightsDetectedExposureS,
+    getDarksExposure: () => darksDetectedExposureS,
+    getLabel: () => row.querySelector(".session-label")?.textContent.trim() || "this group",
+  };
+  nightRows.push(rowState);
+
+  // Pre-filled by Stage's auto-detect scan (see autoPopulateFromScan())
+  // rather than a manual folder-browser pick, OR by splitRowByFilters()/
+  // splitRowByExposure() when a mixed folder just got split into one row
+  // per filter/exposure - runs the EXACT SAME metadata fetch + warning
+  // checks a manual pick would, so a pre-filled row gets no free pass on
+  // the type/exposure/date/camera checks everything else here already
+  // goes through. A split-generated row's filter/exposure tag is applied
+  // up front (before either async fetch resolves) so maybeSplitRow()
+  // never mistakes an already-decided row for one still needing a split.
+  if (initial) {
+    if (initial.filter) row.dataset.filter = initial.filter;
+    if (initial.exposureS != null) row.dataset.exposureS = String(initial.exposureS);
+    updateGroupAnnotation();
+    if (initial.lightsDir) {
+      lightsInput.value = initial.lightsDir;
+      api("GET", `/captures/browse?path=${encodeURIComponent(initial.lightsDir)}`).then((data) => {
+        if (splitDone) return;
+        lightsDetectedType = data.detected_type;
+        lightsDetectedExposureS = data.detected_exposure_s;
+        lightsSampleDateObs = data.sample_date_obs;
+        lightsSampleInstrument = data.sample_instrument;
+        lightsDetectedFilters = data.detected_filters || [];
+        lightsFilterCounts = data.filter_counts || {};
+        lightsDetectedExposures = data.detected_exposures || [];
+        lightsExposureCounts = data.exposure_counts || {};
+        lastLightsData = data;
+        if (maybeSplitRow()) return;
+        refreshLightsSummary();
+        updateGroupAnnotation();
+        updateSessionWarnings();
+        autoFillMatchingDarks();
+        updateOscMismatchWarning();
+      }).catch(() => {});
+    }
+    if (initial.flatsDir) {
+      flatsInput.value = initial.flatsDir;
+      api("GET", `/captures/browse?path=${encodeURIComponent(initial.flatsDir)}`).then((data) => {
+        if (splitDone) return;
+        flatsDetectedType = data.detected_type;
+        flatsSampleDateObs = data.sample_date_obs;
+        flatsSampleInstrument = data.sample_instrument;
+        flatsDetectedFilters = data.detected_filters || [];
+        flatsFilterCounts = data.filter_counts || {};
+        lastFlatsData = data;
+        if (maybeSplitRow()) return;
+        refreshFlatsSummary();
+        updateSessionWarnings();
+      }).catch(() => {});
+    }
+    if (initial.darksDir) {
+      fillDarksFrom(initial.darksDir, "Found automatically at this path");
+    }
+  }
 }
 
-function renumberSessions() {
-  const base = nextNightNumber();
+function renumberGroups() {
+  const base = nextGroupNumber();
   const rows = document.getElementById("stage-nights").children;
   Array.from(rows).forEach((row, i) => {
-    row.querySelector(".session-label").textContent = `Session ${base + i}`;
+    const numberEl = row.querySelector(".group-number");
+    if (numberEl) numberEl.textContent = `Group ${base + i}`;
   });
 }
 
 document.getElementById("add-night-btn").addEventListener("click", () => addNightRow());
 function formatExposure(seconds) {
   return seconds < 1 ? `${Math.round(seconds * 1000)}ms` : `${seconds}s`;
+}
+
+// One line of "what did we actually find in this folder" - shown above
+// each Lights/Flats/Biases/Darks picker the moment a folder's been
+// picked (manually or via Stage's auto-detect), so Chris doesn't have to
+// open a folder browser again just to remember what's in there. Frame
+// count always shows if there's anything to show at all; exposure/date
+// only show when they could actually be determined (see
+// app/frameinfo.py/app/fitsinfo.py's own "can't tell isn't wrong" rule -
+// same thing applies to just not showing a line for it here).
+function formatFolderSummary(data, overrides) {
+  if (!data || !data.fit_count) return "";
+  // `overrides` lets a caller show the count/exposure that actually
+  // apply to a specific filter/exposure-locked group rather than the raw
+  // whole-folder totals - see addNightRow()'s refreshLightsSummary()/
+  // refreshFlatsSummary(), which is the only caller that ever passes this.
+  const count = overrides && overrides.count != null ? overrides.count : data.fit_count;
+  const exposureS = overrides && overrides.exposureS !== undefined ? overrides.exposureS : data.detected_exposure_s;
+  const parts = [`${count} frame${count === 1 ? "" : "s"}`];
+  if (exposureS != null) parts.push(formatExposure(exposureS));
+  if (data.sample_date_obs) parts.push(data.sample_date_obs.slice(0, 10));
+  return parts.join(" · ");
+}
+
+// Matches an exposure-length key from /captures/browse's exposure_counts
+// (JSON round-trips a Python float dict key as a STRING, e.g. "300.0")
+// against a target float value within the same tolerance used everywhere
+// else in this app, rather than relying on exact string formatting to
+// happen to line up.
+function findCountForExposure(exposureCounts, exposureS) {
+  for (const [key, count] of Object.entries(exposureCounts || {})) {
+    if (Math.abs(parseFloat(key) - exposureS) <= 0.01) return count;
+  }
+  return undefined;
 }
 
 // FITS DATE-OBS has no trailing "Z" but IS UTC per the FITS standard -
@@ -697,59 +1172,133 @@ function warnIfWrongType(expected, detectedType, warningEl) {
   }
 }
 
-// Darks'/bias' own detected exposure/date/camera, remembered so each
-// session's lights picker (added below) can warn if any doesn't match -
-// biases/darks are staged once per project, lights per night, so this
-// has to live above any one session row. Re-checked against every
-// already-rendered row's lights whenever biases/darks change, via
-// sessionWarningUpdaters (not just forward, in case they get (re)picked
-// after sessions already exist).
-let darksDetectedExposureS = null;
-let darksSampleDateObs = null;
-let darksSampleInstrument = null;
+// Bias's own detected exposure/date/camera, remembered so each session's
+// lights picker (added below) can warn if it doesn't match - bias stays
+// staged once per project (unlike darks, now per-session - see
+// addNightRow()), so this has to live above any one session row.
+// Re-checked against every already-rendered row's lights whenever bias
+// changes, via sessionWarningUpdaters (not just forward, in case it gets
+// (re)picked after sessions already exist).
 let biasesSampleDateObs = null;
 let biasesSampleInstrument = null;
 const sessionWarningUpdaters = [];
 
-attachFolderBrowser(document.getElementById("biases-dir"), document.getElementById("biases-browse"), (data) => {
+// Named (not inline) so autoPopulateFromScan() below can run the exact
+// same processing for a scan-proposed path as a manual folder-browser
+// pick would - an auto-populated field gets no free pass on these checks.
+function onBiasesPicked(data) {
   warnIfWrongType("bias", data.detected_type, document.getElementById("biases-type-warning"));
   biasesSampleDateObs = data.sample_date_obs;
   biasesSampleInstrument = data.sample_instrument;
+  document.getElementById("biases-summary").textContent = formatFolderSummary(data);
   sessionWarningUpdaters.forEach((fn) => fn());
-});
-attachFolderBrowser(document.getElementById("darks-dir"), document.getElementById("darks-browse"), (data) => {
-  warnIfWrongType("dark", data.detected_type, document.getElementById("darks-type-warning"));
-  darksDetectedExposureS = data.detected_exposure_s;
-  darksSampleDateObs = data.sample_date_obs;
-  darksSampleInstrument = data.sample_instrument;
+}
+// Optional (staging with none is a normal, supported case - see the
+// stage-btn handler's `|| null`), but until this there was no way back to
+// "nothing selected" short of re-picking a different real folder - an
+// inadvertent pick had nowhere to go. Same reset switchToProject() already
+// does when leaving a project, just triggerable on demand here too. Lives
+// inside the browse popup's own "Unselect" button now (mirrors darks/
+// flats - Chris: "for consistency's sake, remove the X from biases and go
+// to the unselect button inside the picker"), not a separate standalone
+// "✕" next to the field.
+function clearBiases() {
+  document.getElementById("biases-dir").value = "";
+  document.getElementById("biases-summary").textContent = "";
+  document.getElementById("biases-type-warning").style.display = "none";
+  biasesSampleDateObs = null;
+  biasesSampleInstrument = null;
   sessionWarningUpdaters.forEach((fn) => fn());
-});
+}
+attachFolderBrowser(
+  document.getElementById("biases-dir"), document.getElementById("biases-browse"),
+  onBiasesPicked,
+  { onUnselect: clearBiases }
+);
+
+// Stage's "best effort" auto-detect: given the root folder chosen at
+// project creation, ask the backend to propose a staging plan (see
+// app/autostage.py for the actual algorithm and its deliberately
+// conservative rules) and pre-populate Stage's fields from it - one
+// picked root folder instead of clicking through the folder picker once
+// per lights/flats/darks/biases field. Every candidate still goes
+// through the SAME detection + warning checks a manual pick would (see
+// addNightRow()'s `initial` handling and onBiasesPicked above), and every
+// candidate can be edited or removed exactly like a manually-added one -
+// this only ever saves clicks, it never bypasses review.
+async function autoPopulateFromScan(rootDir) {
+  let scan;
+  try {
+    scan = await api("GET", `/captures/scan?path=${encodeURIComponent(rootDir)}`);
+  } catch (e) {
+    return; // a failed scan just leaves Stage empty, same as skipping root_dir entirely
+  }
+  if (!scan.sessions.length && !scan.biases_dir) return;
+
+  if (scan.biases_dir) {
+    document.getElementById("biases-dir").value = scan.biases_dir;
+    api("GET", `/captures/browse?path=${encodeURIComponent(scan.biases_dir)}`).then(onBiasesPicked).catch(() => {});
+  }
+  if (scan.sessions.length) {
+    // switchToProject() already seeded one blank draft "Group 1" row
+    // before this ever runs - without clearing it first, real
+    // auto-detected data would land as "Group 2" behind an empty
+    // "Group 1" (confirmed as a real bug on an OSC project with
+    // exactly one group, not just a multi-group cosmetic issue).
+    const container = document.getElementById("stage-nights");
+    Array.from(container.children).forEach((row) => {
+      const inputs = row.querySelectorAll("input");
+      if (!inputs[0].value && !inputs[1].value) {
+        row.remove();
+        row._cleanup();
+      }
+    });
+    // darks_dir is per-session now (see app/autostage.py's per-session
+    // pairing cascade) - undefined/null just leaves that row's darks
+    // picker empty, same as a session with no darks candidate found.
+    for (const session of scan.sessions) {
+      addNightRow({ lightsDir: session.lights_dir, flatsDir: session.flats_dir, darksDir: session.darks_dir || null });
+    }
+    renumberGroups();
+  }
+  // Give the per-field async /captures/browse fetches above a moment to
+  // land before re-checking the cross-field warnings (darks exposure/
+  // date/camera vs each session's lights) - a short fixed delay rather
+  // than tracking every individual promise, since this is a best-effort
+  // UX nicety on top of an already-async scan, not something that needs
+  // to be perfectly synchronized.
+  setTimeout(() => sessionWarningUpdaters.forEach((fn) => fn()), 800);
+
+  const note = document.getElementById("stage-autopopulate-note");
+  if (note) note.style.display = "block";
+}
 
 document.getElementById("stage-btn").addEventListener("click", async () => {
   if (!state.project) return;
-  const rows = Array.from(document.getElementById("stage-nights").children);
-  // A folder mixing several filters together (narrowband H/O/S etc. all
-  // in one "Light"/"Flat" folder - see app/frameinfo.py's
-  // detect_filters()) needs an explicit filter choice before staging;
-  // silently stacking every filter together would be a real, hard-to-
-  // notice mistake, not just a cosmetic one.
-  const pendingRow = rows.find((row) => row.dataset.filterRequired && !row.dataset.filter);
-  if (pendingRow) {
-    alert("One of your sessions has lights/flats mixing more than one filter — pick which filter that session is for before staging.");
-    return;
-  }
-  let nextNum = nextNightNumber();
-  const nights = rows
-    .map((row) => {
-      const inputs = row.querySelectorAll("input");
-      return { lights_dir: inputs[0].value.trim(), flats_dir: inputs[1].value.trim(), filter: row.dataset.filter || null };
+  // Each row is already locked to at most one filter or one exposure
+  // length by the time it reaches here (see addNightRow()'s
+  // maybeSplitRow() - a mixed folder splits into one row per filter/
+  // exposure the moment it's detected, so there's no ambiguous "pending"
+  // state left to block on the way the old checkbox picker needed to).
+  let nextNum = nextGroupNumber();
+  const nights = nightRows
+    .map((r) => {
+      const lights_dir = r.lightsInput.value.trim();
+      const flats_dir = r.flatsInput.value.trim();
+      if (!lights_dir || !flats_dir) return null;
+      return {
+        lights_dir,
+        flats_dir,
+        darks_dir: r.darksInput.value.trim() || null,
+        filter: r.row.dataset.filter || null,
+        exposure_s: r.row.dataset.exposureS ? parseFloat(r.row.dataset.exposureS) : null,
+      };
     })
-    .filter((n) => n.lights_dir && n.flats_dir)
-    .map((n) => ({ ...n, name: `night${nextNum++}` }));
+    .filter((n) => n !== null)
+    .map((n) => ({ ...n, name: `group${nextNum++}` }));
 
   const body = {
     biases_dir: document.getElementById("biases-dir").value.trim() || null,
-    darks_dir: document.getElementById("darks-dir").value.trim() || null,
     nights,
     is_osc: document.getElementById("stage-is-osc").checked,
   };
@@ -770,10 +1319,10 @@ function renderStageSummary(staged) {
   summaryEl.innerHTML = "";
   const rows = [];
   if (staged.biases !== undefined) rows.push(`Biases — ${staged.biases} frames`);
-  if (staged.darks !== undefined) rows.push(`Darks — ${staged.darks} frames`);
   if (staged.nights) {
     Object.entries(staged.nights).forEach(([name, counts], i) => {
-      rows.push(`Session ${i + 1} (${name}) — ${counts.lights} lights, ${counts.flats} flats`);
+      const darksPart = counts.darks !== undefined ? `, ${counts.darks} darks` : "";
+      rows.push(`Group ${i + 1} (${name}) — ${counts.lights} lights, ${counts.flats} flats${darksPart}`);
     });
   }
   const wrap = el("div", { class: "stage-summary" }, []);
@@ -789,24 +1338,27 @@ function renderChecklist(containerId, nights, selected, countFn, onChange) {
   const container = document.getElementById(containerId);
   container.innerHTML = "";
   if (!nights.length) {
-    container.appendChild(el("span", { class: "empty-hint" }, ["No nights staged yet — use Stage above."]));
+    container.appendChild(el("span", { class: "empty-hint" }, ["No groups staged yet — use Stage above."]));
     return;
   }
   const count = countFn || ((n) => n.light_count);
-  for (const n of nights) {
-    const checked = selected.has(n.name);
-    const chip = el("label", { class: `chip${checked ? " checked" : ""}` }, [
-      el("input", {
-        type: "checkbox", checked: checked ? "checked" : null,
-        onchange: (e) => {
-          if (e.target.checked) selected.add(n.name); else selected.delete(n.name);
-          chip.classList.toggle("checked", e.target.checked);
-          if (onChange) onChange();
-        },
-      }, []),
-      document.createTextNode(`${nightDisplayLabel(n)} (${count(n)})`),
-    ]);
-    container.appendChild(chip);
+  for (const group of groupNightsByFilter(nights)) {
+    if (group.heading) container.appendChild(el("div", { class: "checklist-group-heading" }, [group.heading]));
+    for (const n of group.nights) {
+      const checked = selected.has(n.name);
+      const chip = el("label", { class: `chip${checked ? " checked" : ""}` }, [
+        el("input", {
+          type: "checkbox", checked: checked ? "checked" : null,
+          onchange: (e) => {
+            if (e.target.checked) selected.add(n.name); else selected.delete(n.name);
+            chip.classList.toggle("checked", e.target.checked);
+            if (onChange) onChange();
+          },
+        }, []),
+        document.createTextNode(`${nightDisplayLabel(n)} (${count(n)})`),
+      ]);
+      container.appendChild(chip);
+    }
   }
   if (onChange) onChange();
 }
@@ -818,11 +1370,14 @@ function survivorCountForNight(n) {
   return analyzed.length - excluded;
 }
 
-// Selecting nights with DIFFERENT filters together would merge two
-// different wavelengths' data into one nonsensical stack (Siril has no
-// concept of "filter" - it'll happily merge anything) - not a hard
-// block, matching this app's other mismatch warnings, but worth a clear
-// heads-up before that mistake ships an hour-long stack job.
+// Sessions with different filters selected together used to be a silent
+// trap (Siril has no concept of "filter" - a merge would have happily
+// combined two different wavelengths into one nonsensical stack). Now
+// that Stack fans a multi-filter selection out into one independent run
+// per filter instead (see the stack-run-btn handler), this is no longer
+// a mistake to warn against - but it's still worth being upfront that
+// one "Run stack" click is about to kick off several sequential jobs
+// and produce several separate results, not one.
 function checkStackFilterMismatch() {
   const warningEl = document.getElementById("stack-filter-warning");
   if (!warningEl || !state.status) return;
@@ -830,7 +1385,7 @@ function checkStackFilterMismatch() {
     state.status.nights.filter((n) => stackSelected.has(n.name) && n.filter).map((n) => n.filter)
   );
   if (filters.size > 1) {
-    warningEl.textContent = `⚠ Selected nights use different filters (${Array.from(filters).join(", ")}) — merging different filters into one stack doesn't make sense. Double check your selection.`;
+    warningEl.textContent = `ℹ Selected groups span ${filters.size} filters (${Array.from(filters).sort().join(", ")}) — "Run stack" will run them one at a time and produce ${filters.size} separate results, one per filter.`;
     warningEl.style.display = "block";
   } else {
     warningEl.style.display = "none";
@@ -853,30 +1408,64 @@ function renderMastersPreviews() {
   container.innerHTML = "";
   if (!state.status) return;
   const items = [];
-  if (state.status.master_bias_built) items.push({ label: "Master Bias", path: "process/master_bias.fit" });
-  if (state.status.master_dark_built) items.push({ label: "Master Dark", path: "process/master_dark.fit" });
+  if (state.status.master_bias_built) items.push({ label: "Master Bias", path: "process/master_bias.fit", debayer: false, stretch: "noise" });
+  // Multiple nights can share one master dark (same detected exposure
+  // length - see app/ssf.py's dark_exposure_key()) - dedupe by the actual
+  // built path so a shared master shows exactly ONE tile, labeled with
+  // every session that uses it, not one identical-looking tile per night.
+  const darkGroups = new Map();
+  for (const n of state.status.nights) {
+    if (!n.master_dark_built) continue;
+    const path = `process/darks/${n.dark_key}/master_dark.fit`;
+    if (!darkGroups.has(path)) darkGroups.set(path, []);
+    darkGroups.get(path).push(n);
+  }
+  for (const [path, sharingNights] of darkGroups) {
+    const label = `Master Dark — ${sharingNights.map(nightDisplayLabel).join(", ")}`;
+    items.push({ label, path, debayer: false, stretch: "noise" });
+  }
   for (const n of state.status.nights) {
     if (n.master_flat_built) {
-      items.push({ label: `Master Flat — ${nightDisplayLabel(n)}`, path: `process/nights/${n.name}/master_flat.fit` });
+      items.push({ label: `Master Flat — ${nightDisplayLabel(n)}`, path: `process/nights/${n.name}/master_flat.fit`, debayer: state.status.is_osc, stretch: "calibration" });
     }
   }
   if (!items.length) return;
   // Master bias/dark/flat are never debayered by Siril (only light
   // calibration gets -cfa/-debayer - see Handoff.md), so they're still a
-  // raw Bayer mosaic same as an unstaged raw light; debayer them here the
-  // same way for a real look rather than grainy grayscale. "calibration"
-  // (per-channel ZScale, no asinh curve) rather than "unlinked" - a
-  // flat's real signal (vignetting) is a subtle, smooth few-percent
-  // gradient next to sharp, outlier dust-mote pixels, and the
-  // percentile+asinh curve "unlinked" uses (tuned for the opposite
-  // problem: huge-dynamic-range light frames) clips its black point
-  // right at the motes, crushing the whole vignetting gradient toward
-  // white - confirmed on real master flat data before choosing this fix
-  // (see app/imaging.py's docstring for the pixel-level before/after).
-  const debayer = state.status.is_osc ? "&debayer=1" : "";
+  // raw Bayer mosaic same as an unstaged raw light. Flats still get
+  // debayered here for a real color look ("calibration" = per-channel
+  // ZScale, no asinh curve - a flat's real signal (vignetting) is a
+  // subtle, smooth few-percent gradient next to sharp, outlier dust-mote
+  // pixels, and the percentile+asinh curve "unlinked" uses, tuned for the
+  // opposite problem, crushes the gradient toward white - confirmed on
+  // real master flat data before choosing this fix, see
+  // app/imaging.py's docstring).
+  //
+  // Bias/dark deliberately do NOT get debayered (per-item `debayer: false`
+  // above), even on an OSC project - a REAL bug Chris caught: these
+  // frames are pure sensor noise/hot-pixel data, not light through a
+  // color filter array, so there's no real per-channel color signal to
+  // reconstruct. Worse, bilinear debayering SPREADS each single hot/cold
+  // outlier pixel's extreme value across several of its neighbors (the
+  // interpolation kernel's own nature), which confuses an outlier-
+  // sensitive stretch into computing a too-narrow, over-bright range for
+  // the (should stay near-black) background - "it shouldn't look like our
+  // current stretch" for bias/dark specifically. Previewing them as the
+  // plain grayscale mosaic they actually are fixes that.
+  //
+  // Bias/dark also use "noise" stretch, not "calibration" - a SEPARATE
+  // real bug Chris caught: ZScaleInterval (calibration mode) targets the
+  // DS9/IRAF "sky background at a comfortable ~50% gray" convention,
+  // right for a flat's smooth vignetting gradient but wrong for a bias/
+  // dark's noise floor (confirmed against real pixel data: it mapped the
+  // median to ~50% gray, not the "mostly solid dark field with a small
+  // handful of hot/cold pixels" Chris gets from Siril's own unlinked
+  // autostretch on the same frames). "noise" mode's MTF autostretch (see
+  // app/imaging.py) targets that same dark-background look directly.
   for (const item of items) {
-    const thumbUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(item.path)}&max_size=220&stretch=calibration${debayer}`;
-    const largeUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(item.path)}&max_size=1600&stretch=calibration${debayer}`;
+    const debayer = item.debayer ? "&debayer=1" : "";
+    const thumbUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(item.path)}&max_size=220&stretch=${item.stretch}${debayer}`;
+    const largeUrl = `/projects/${encodeURIComponent(state.project)}/preview?path=${encodeURIComponent(item.path)}&max_size=1600&stretch=${item.stretch}${debayer}`;
     container.appendChild(el("div", { class: "master-preview-card" }, [
       el("img", { src: thumbUrl, onclick: () => openPlainLightbox(largeUrl, item.label) }, []),
       el("div", { class: "master-preview-label" }, [item.label]),
@@ -1232,6 +1821,23 @@ function computeVisibleItems(night, frames) {
   return items;
 }
 
+// Review-specific wrapper around groupNightsByFilter() - the frame data
+// itself is keyed by night in state.lastAnalyzeResult, not present on
+// the status.nights objects that carry .filter, so this joins the two
+// before handing off to the shared grouping logic.
+function groupAnalyzeEntriesByFilter() {
+  const entries = Object.entries(state.lastAnalyzeResult.nights).map(([nightKey, frames]) => {
+    const statusNight = state.status ? state.status.nights.find((n) => n.name === nightKey) : null;
+    return {
+      nightKey,
+      frames,
+      filter: statusNight ? statusNight.filter : null,
+      label: statusNight ? nightDisplayLabel(statusNight) : nightKey,
+    };
+  });
+  return groupNightsByFilter(entries).map((g) => ({ heading: g.heading, entries: g.nights }));
+}
+
 function renderAnalyzeOutput() {
   const outputEl = document.getElementById("analyze-output");
   // Every re-render (e.g. toggling one exclude checkbox) throws away and
@@ -1249,45 +1855,48 @@ function renderAnalyzeOutput() {
   outputEl.innerHTML = "";
   if (!state.lastAnalyzeResult) return;
 
-  for (const [night, allFrames] of Object.entries(state.lastAnalyzeResult.nights)) {
-    const frames = state.showSurvivorsOnly ? allFrames.filter((f) => !state.excludeFrames.has(f.filename)) : allFrames;
-    const flaggedCount = allFrames.filter((f) => isFrameFlagged(f)).length;
-    const excludedCount = allFrames.filter((f) => state.excludeFrames.has(f.filename)).length;
+  for (const group of groupAnalyzeEntriesByFilter()) {
+    if (group.heading) outputEl.appendChild(el("h3", { class: "filter-group-heading" }, [group.heading]));
+    for (const { nightKey: night, frames: allFrames, label } of group.entries) {
+      const frames = state.showSurvivorsOnly ? allFrames.filter((f) => !state.excludeFrames.has(f.filename)) : allFrames;
+      const flaggedCount = allFrames.filter((f) => isFrameFlagged(f)).length;
+      const excludedCount = allFrames.filter((f) => state.excludeFrames.has(f.filename)).length;
 
-    const block = el("div", { class: "night-block", "data-night": night }, []);
-    block.appendChild(el("h4", {}, [
-      `${night} — ${allFrames.length} frames, ${flaggedCount} flagged` + (excludedCount ? `, ${excludedCount} excluded` : ""),
-    ]));
-    const grid = el("div", { class: "metric-grid" }, [
-      metricStrip("star count", frames, "star_count", "star_count", state.lastAnomalySigma),
-      metricStrip("FWHM", frames, "fwhm", "fwhm", state.lastAnomalySigma),
-      metricStrip("eccentricity", frames, "roundness", "roundness", state.lastAnomalySigma),
-      metricStrip("SNR", frames, "snr", "snr", state.lastAnomalySigma),
-    ]);
-    block.appendChild(grid);
+      const block = el("div", { class: "night-block", "data-night": night }, []);
+      block.appendChild(el("h4", {}, [
+        `${label} — ${allFrames.length} frames, ${flaggedCount} flagged` + (excludedCount ? `, ${excludedCount} excluded` : ""),
+      ]));
+      const grid = el("div", { class: "metric-grid" }, [
+        metricStrip("star count", frames, "star_count", "star_count", state.lastAnomalySigma),
+        metricStrip("FWHM", frames, "fwhm", "fwhm", state.lastAnomalySigma),
+        metricStrip("eccentricity", frames, "roundness", "roundness", state.lastAnomalySigma),
+        metricStrip("SNR", frames, "snr", "snr", state.lastAnomalySigma),
+      ]);
+      block.appendChild(grid);
 
-    const strip = el("div", { class: "frame-strip" }, []);
-    if (frames.length > LARGE_NIGHT_THRESHOLD && !state.showSurvivorsOnly) {
-      for (const item of computeVisibleItems(night, frames)) {
-        if (item.type === "frame") {
-          strip.appendChild(frameCard(night, item.frame, frames, item.index));
-        } else {
-          strip.appendChild(el("div", {
-            class: "frame-ellipsis",
-            onclick: () => {
-              if (!state.expandedGroups[night]) state.expandedGroups[night] = new Set();
-              state.expandedGroups[night].add(item.key);
-              renderAnalyzeOutput();
-            },
-          }, [`⋯ ${item.count} more\n(not flagged)`]));
+      const strip = el("div", { class: "frame-strip" }, []);
+      if (frames.length > LARGE_NIGHT_THRESHOLD && !state.showSurvivorsOnly) {
+        for (const item of computeVisibleItems(night, frames)) {
+          if (item.type === "frame") {
+            strip.appendChild(frameCard(night, item.frame, frames, item.index));
+          } else {
+            strip.appendChild(el("div", {
+              class: "frame-ellipsis",
+              onclick: () => {
+                if (!state.expandedGroups[night]) state.expandedGroups[night] = new Set();
+                state.expandedGroups[night].add(item.key);
+                renderAnalyzeOutput();
+              },
+            }, [`⋯ ${item.count} more\n(not flagged)`]));
+          }
         }
+      } else {
+        frames.forEach((f, i) => strip.appendChild(frameCard(night, f, frames, i)));
       }
-    } else {
-      frames.forEach((f, i) => strip.appendChild(frameCard(night, f, frames, i)));
+      block.appendChild(strip);
+      outputEl.appendChild(block);
+      if (prevScrollLeft[night] !== undefined) strip.scrollLeft = prevScrollLeft[night];
     }
-    block.appendChild(strip);
-    outputEl.appendChild(block);
-    if (prevScrollLeft[night] !== undefined) strip.scrollLeft = prevScrollLeft[night];
   }
 
   if (state.excludeFrames.size > 0) {
@@ -1397,7 +2006,14 @@ document.getElementById("analyze-reset-btn").addEventListener("click", () => {
   // only gets refreshed when switching away with a *non-null* analyze
   // result, so without this a switch-away-and-back after starting over
   // would silently resurrect the pre-reset data instead of respecting it.
-  if (state.project) delete reviewCache[state.project];
+  // Same reasoning applies server-side now too (see review-state's
+  // persistence, added so a page reload doesn't lose review progress) -
+  // fire-and-forget, since the in-memory reset above already takes
+  // effect immediately regardless of whether this network call lands.
+  if (state.project) {
+    delete reviewCache[state.project];
+    api("DELETE", `/projects/${encodeURIComponent(state.project)}/review-state`).catch(() => {});
+  }
   state.excludeFrames.clear();
   state.lastAnalyzeResult = null;
   state.analyzed = false;
@@ -1485,49 +2101,109 @@ wireToggleButton("stack-render-btn", "stack", () =>
   api("POST", `/projects/${encodeURIComponent(state.project)}/stack/render`, stackBody())
 );
 
+// Selected nights grouped by filter (""  for OSC/no-filter data) - a
+// narrowband project's selection can span several filters at once, and
+// each filter's nights become their own independent stack run (mixing
+// filters into one merge never makes sense - see
+// checkStackFilterMismatch(), which already warns about exactly this).
+function groupStackSelectionByFilter() {
+  const groups = new Map();
+  for (const name of stackSelected) {
+    const night = state.status.nights.find((n) => n.name === name);
+    const key = (night && night.filter) || "";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(name);
+  }
+  return Array.from(groups.entries());
+}
+
 document.getElementById("stack-run-btn").addEventListener("click", async () => {
   const runBtn = document.getElementById("stack-run-btn");
   const resultEl = document.getElementById("stack-result");
   const previewEl = document.getElementById("stack-preview");
   resultEl.innerHTML = "";
-  resultEl.appendChild(el("div", { class: "status-line" }, ["starting…"]));
   // Also clear builtFor, not just the DOM: showStackPreview() skips
-  // rebuilding whenever the result path matches what it already built -
+  // rebuilding whenever the result set matches what it already built -
   // a correct optimization for the stretch-mode buttons, but back-to-back
   // stack runs (e.g. rejection, then max, then median) all write to the
   // SAME path, so without this reset showStackPreview() would see "same
-  // path, nothing to do" after the job finishes and leave this now-empty
-  // element blank forever - confirmed this is exactly what happened
-  // testing successive runs with different stack methods.
+  // results, nothing to do" after the job finishes and leave this now-
+  // empty element blank forever - confirmed this is exactly what
+  // happened testing successive runs with different stack methods.
   previewEl.innerHTML = "";
   previewEl.dataset.builtFor = "";
   runBtn.disabled = true;
   const ownerProject = state.project;
-  try {
-    const { job_id } = await api("POST", `/projects/${encodeURIComponent(ownerProject)}/stack/run`, stackBody());
-    await pollJob(job_id, {
-      progressEl: document.getElementById("stack-progress"),
-      logViewEl: document.querySelector('[data-log-view="stack"]'),
-      pipelineEl: document.getElementById("stack-pipeline"),
-      lockButtons: [runBtn],
-      ownerProject,
-      onDone: async (snap) => {
-        if (snap.status === "succeeded") setOutcome(resultEl, true, "Stack complete");
-        else setOutcome(resultEl, false, `Failed: ${snap.error || ""}`);
-        await loadProjectStatus();
-        showStackPreview();
-        renderStepper();
-      },
-    });
-  } catch (e) {
-    runBtn.disabled = false;
-    setOutcome(resultEl, false, String(e));
+  const baseBody = stackBody();
+  // Run groups one at a time, not concurrently - the server already
+  // rejects a second job against the same project while one is running
+  // (shared scratch dirs), so firing them all at once would just 409 on
+  // everything after the first.
+  const groups = groupStackSelectionByFilter();
+  for (let i = 0; i < groups.length; i++) {
+    const [filterKey, nightsForGroup] = groups[i];
+    const label = filterKey || (groups.length > 1 ? "(no filter)" : "stack");
+    const line = el("div", { class: "status-line" }, [
+      groups.length > 1 ? `Running ${label} (${i + 1}/${groups.length})…` : "starting…",
+    ]);
+    resultEl.appendChild(line);
+    let snap;
+    try {
+      const body = { ...baseBody, nights: nightsForGroup };
+      const { job_id } = await api("POST", `/projects/${encodeURIComponent(ownerProject)}/stack/run`, body);
+      snap = await new Promise((resolve) => {
+        pollJob(job_id, {
+          progressEl: document.getElementById("stack-progress"),
+          logViewEl: document.querySelector('[data-log-view="stack"]'),
+          pipelineEl: document.getElementById("stack-pipeline"),
+          ownerProject,
+          onDone: resolve,
+        });
+      });
+    } catch (e) {
+      snap = { status: "failed", error: String(e) };
+    }
+    line.innerHTML = "";
+    if (snap.status === "succeeded") {
+      // Quiet on success when there's only one group (matches every
+      // other run button's "the badge is the signal" convention) - but
+      // a multi-group fan-out is worth a visible per-group trail, since
+      // several sequential outcomes are real detail, not noise.
+      if (groups.length > 1) line.appendChild(el("div", { class: "status-line ok" }, [`✓ ${label} complete`]));
+    } else {
+      line.appendChild(el("div", { class: "error-banner" }, [`✕ ${groups.length > 1 ? `${label}: ` : ""}Failed: ${snap.error || ""}`]));
+    }
+    if (ownerProject === state.project) await loadProjectStatus();
+  }
+  runBtn.disabled = false;
+  if (ownerProject === state.project) {
+    showStackPreview();
+    renderStepper();
   }
 });
 
-function currentResultPath() {
-  if (!state.status) return null;
-  return state.status.merged_result_path || (state.status.nights.find((n) => n.result_path) || {}).result_path || null;
+// Every currently-existing result at once, not just one - a narrowband
+// project can have several independent results (one per filter) live
+// simultaneously, each from its own stack run (see the fan-out in the
+// stack-run-btn handler below). Deduped by path since a night that's
+// since been folded into a merge could still have an older single-night
+// result file sitting around from before that.
+function allResultEntries() {
+  if (!state.status) return [];
+  const entries = [];
+  const seen = new Set();
+  for (const m of state.status.merged_results || []) {
+    if (seen.has(m.path)) continue;
+    seen.add(m.path);
+    entries.push({ label: m.filter ? `Merged — ${m.filter}` : "Merged", path: m.path });
+  }
+  for (const n of state.status.nights) {
+    if (n.result_path && !seen.has(n.result_path)) {
+      seen.add(n.result_path);
+      entries.push({ label: nightDisplayLabel(n), path: n.result_path });
+    }
+  }
+  return entries;
 }
 
 function stackPreviewUrl(path, maxSize) {
@@ -1537,48 +2213,61 @@ function stackPreviewUrl(path, maxSize) {
 
 function showStackPreview() {
   const previewEl = document.getElementById("stack-preview");
-  const path = currentResultPath();
-  if (!path) {
+  const entries = allResultEntries();
+  if (!entries.length) {
     previewEl.innerHTML = "";
     previewEl.dataset.builtFor = "";
     return;
   }
 
-  // Only rebuild the whole block (controls + frame) the first time, or
-  // when the result path itself changes (a fresh stack ran). Switching
-  // stretch mode just swaps the existing <img>'s src - rebuilding the
-  // whole subtree each time briefly collapsed the frame to 0 height
-  // (nothing to reserve space until the new PNG decoded), which yanked
-  // the page up and buried the image below the fold until it reloaded.
-  // The CSS aspect-ratio on .preview-frame is a second safety net for
-  // this same problem; keeping the DOM node in place avoids it outright.
-  if (previewEl.dataset.builtFor !== path) {
-    previewEl.innerHTML = "";
-    const controls = el("div", { class: "preview-controls" }, []);
-    const toggle = el("div", { class: "stretch-toggle" }, []);
-    for (const mode of ["none", "linked", "unlinked"]) {
-      toggle.appendChild(el("button", {
-        class: mode === state.stretchMode ? "active" : "",
-        type: "button",
-        onclick: () => {
-          state.stretchMode = mode;
-          toggle.querySelectorAll("button").forEach((b) => b.classList.toggle("active", b.textContent === mode));
-          previewEl.querySelector("img").src = stackPreviewUrl(path);
-        },
-      }, [mode]));
-    }
-    controls.appendChild(toggle);
-    controls.appendChild(el("a", {
-      href: `/projects/${encodeURIComponent(state.project)}/download?path=${encodeURIComponent(path)}`,
-      class: "mono",
-    }, [el("button", { type: "button" }, ["⬇ Download full-resolution .fit"])]));
-    previewEl.appendChild(controls);
-    previewEl.appendChild(el("div", { class: "preview-frame" }, [el("img", {
-      src: stackPreviewUrl(path),
-      onclick: () => openPlainLightbox(stackPreviewUrl(path, 2400), path.split("/").pop()),
-    }, [])]));
-    previewEl.dataset.builtFor = path;
+  // Only rebuild the whole block (controls + gallery) the first time, or
+  // when the actual SET of results changes (a fresh stack ran, or a new
+  // filter's result appeared). Switching stretch mode just swaps each
+  // existing <img>'s src - rebuilding the whole subtree each time
+  // briefly collapsed every frame to 0 height (nothing to reserve space
+  // until the new PNG decoded), which yanked the page up and buried the
+  // gallery below the fold until it reloaded. The CSS aspect-ratio on
+  // .preview-frame is a second safety net for this same problem; keeping
+  // the DOM nodes in place avoids it outright.
+  const builtForKey = entries.map((e) => e.path).sort().join("|");
+  if (previewEl.dataset.builtFor === builtForKey) return;
+  previewEl.innerHTML = "";
+  previewEl.dataset.builtFor = builtForKey;
+
+  const controls = el("div", { class: "preview-controls" }, []);
+  const toggle = el("div", { class: "stretch-toggle" }, []);
+  for (const mode of ["none", "linked", "unlinked"]) {
+    toggle.appendChild(el("button", {
+      class: mode === state.stretchMode ? "active" : "",
+      type: "button",
+      onclick: () => {
+        state.stretchMode = mode;
+        toggle.querySelectorAll("button").forEach((b) => b.classList.toggle("active", b.textContent === mode));
+        previewEl.querySelectorAll("img[data-result-path]").forEach((img) => {
+          img.src = stackPreviewUrl(img.dataset.resultPath);
+        });
+      },
+    }, [mode]));
   }
+  controls.appendChild(toggle);
+  previewEl.appendChild(controls);
+
+  const gallery = el("div", { class: "stack-result-gallery" }, []);
+  for (const entry of entries) {
+    gallery.appendChild(el("div", { class: "stack-result-item" }, [
+      el("div", { class: "stack-result-label" }, [entry.label]),
+      el("div", { class: "preview-frame" }, [el("img", {
+        "data-result-path": entry.path,
+        src: stackPreviewUrl(entry.path),
+        onclick: () => openPlainLightbox(stackPreviewUrl(entry.path, 2400), entry.path.split("/").pop()),
+      }, [])]),
+      el("a", {
+        href: `/projects/${encodeURIComponent(state.project)}/download?path=${encodeURIComponent(entry.path)}`,
+        class: "mono",
+      }, [el("button", { type: "button", class: "small" }, ["⬇ Download full-resolution .fit"])]),
+    ]));
+  }
+  previewEl.appendChild(gallery);
 }
 
 // ---------- stepper ----------
@@ -1587,8 +2276,18 @@ function stepStatus(step) {
   const s = state.status;
   if (!s) return { available: step === "stage", complete: false };
   const staged = s.nights.length > 0;
-  const mastersComplete = s.master_bias_built && s.master_dark_built && staged && s.nights.every((n) => n.master_flat_built);
-  const stackComplete = !!s.merged_result_path || s.nights.some((n) => n.result_path);
+  // Bias/dark only count as "required" if any were actually staged -
+  // calibration frames are genuinely optional now (see app/ssf.py's
+  // _resolve_master()), so a project with none staged at all (nothing
+  // to build) must still be able to reach "masters complete" and unlock
+  // Stack, not stay permanently gated on a build that will never happen.
+  // Dark is checked per-night (darks_count is no longer a single
+  // project-wide figure - see app/status.py's per-night dark_count).
+  const mastersComplete = staged
+    && (s.biases_count === 0 || s.master_bias_built)
+    && s.nights.every((n) => n.dark_count === 0 || n.master_dark_built)
+    && s.nights.every((n) => n.master_flat_built);
+  const stackComplete = (s.merged_results && s.merged_results.length > 0) || s.nights.some((n) => n.result_path);
   switch (step) {
     case "stage": return { available: true, complete: staged };
     case "masters": return { available: staged, complete: mastersComplete };
@@ -1653,7 +2352,7 @@ async function loadProjectStatus() {
     state.status = null;
     document.getElementById("delete-project-btn").disabled = true;
     document.getElementById("delete-project-btn").title = "This project hasn't been staged yet — nothing to delete";
-    renumberSessions();
+    renumberGroups();
     renderStepper();
     return;
   }
@@ -1661,7 +2360,7 @@ async function loadProjectStatus() {
   document.getElementById("delete-project-btn").title = "";
   const nights = state.status.nights;
 
-  setStepBadge("stage-status-badge", nights.length ? "ok" : null, nights.length ? `${nights.length} night(s) staged` : "not staged");
+  setStepBadge("stage-status-badge", nights.length ? "ok" : null, nights.length ? `${nights.length} group(s) staged` : "not staged");
   document.getElementById("stage-next-btn").style.display = nights.length ? "inline-block" : "none";
 
   const mastersDone = stepStatus("masters").complete;
@@ -1676,15 +2375,16 @@ async function loadProjectStatus() {
   refreshStackNightsChecklist();
   renderExistingStagedNights();
   renderCalibrationAlignment(nights);
-  // The draft "Session N" row(s) in the Stage form are created by
+  // The draft "Group N" row(s) in the Stage form are created by
   // addNightRow() at project-switch time, BEFORE this function's fetch
   // resolves - at that point state.status is still null (just reset),
-  // so the label always came out "Session 1" regardless of how many
-  // nights this project actually already has staged. Relabel now that
+  // so the label always came out "Group 1" regardless of how many
+  // groups this project actually already has staged. Relabel now that
   // the real count is known.
-  renumberSessions();
+  renumberGroups();
 
   document.getElementById("stage-is-osc").checked = state.status.is_osc !== false;
+  updateOscMismatchWarning();
 
   renderMastersPreviews();
   showStackPreview();
@@ -1738,13 +2438,26 @@ const reviewCache = {};
 async function switchToProject(name, initialStep) {
   // Save the OUTGOING project's review session before resetting
   // anything below - keyed by whatever state.project still is at this
-  // point (the project being switched away FROM).
+  // point (the project being switched away FROM). reviewCache alone only
+  // covers switching projects within one still-open tab - a page reload
+  // or a brand new session loses it entirely, which is exactly what
+  // Chris hit ("we've lost our light frame history when I exit and go
+  // back into a project"). The exclude list / sensitivity are cheap
+  // enough to just re-save here (fire-and-forget - losing this one write
+  // to a network hiccup isn't worth blocking the switch over); the
+  // actual analyze RESULT is real compute time, so that's persisted
+  // separately, once, right when /lights/analyze/run itself succeeds
+  // (see app/main.py's run_analyze()).
   if (state.project && state.lastAnalyzeResult) {
     reviewCache[state.project] = {
       lastAnalyzeResult: state.lastAnalyzeResult,
       excludeFrames: new Set(state.excludeFrames),
       lastAnomalySigma: state.lastAnomalySigma,
     };
+    api("POST", `/projects/${encodeURIComponent(state.project)}/review-state`, {
+      exclude_frames: Array.from(state.excludeFrames),
+      anomaly_sigma: state.lastAnomalySigma,
+    }).catch(() => {});
   }
   state.project = name || null;
   // Reset immediately, not just inside loadProjectStatus(): there's an
@@ -1759,6 +2472,15 @@ async function switchToProject(name, initialStep) {
   document.getElementById("job-history-btn").style.display = state.project ? "inline-block" : "none";
   document.getElementById("job-history-panel").style.display = "none";
   document.getElementById("broken-links-banner").style.display = "none";
+  document.getElementById("stage-autopopulate-note").style.display = "none";
+  // A REAL pre-existing gap, caught while adding the summary line below:
+  // #biases-dir is a plain static input (not re-created per project like
+  // the session rows are), so without an explicit reset here a PREVIOUS
+  // project's biases path - and now its frame-count summary too - stayed
+  // visible after switching to a different project that hadn't staged
+  // any yet. Not just cosmetic: clicking "Stage files" without noticing
+  // would have re-staged the WRONG project's calibration frames.
+  clearBiases();
   // pollActiveJobs() runs globally regardless of project selection (see
   // init()) - just reset this so a stale job id from the PREVIOUS
   // project can't be mistaken for one belonging to the new selection.
@@ -1779,8 +2501,21 @@ async function switchToProject(name, initialStep) {
   state.expandedGroups = {};
   state.activeStep = initialStep || "stage";
   refreshExcludeDisplay();
+  // A REAL pre-existing gap, caught while adding cross-row darks auto-fill
+  // (autoFillMatchingDarks() - see addNightRow()): wiping the container's
+  // innerHTML directly discards the DOM nodes but never called any row's
+  // own _cleanup(), so nightRows/sessionWarningUpdaters kept stale entries
+  // from the PREVIOUS project's rows around indefinitely. Harmless for
+  // sessionWarningUpdaters (it only ever recomputes warnings on detached,
+  // invisible nodes) but a real correctness risk for nightRows once it's
+  // used to auto-fill one row's darks from another - a stale entry could
+  // otherwise bleed a previous project's exposure/darks match into this
+  // one's rows.
+  nightRows.length = 0;
+  sessionWarningUpdaters.length = 0;
   document.getElementById("stage-nights").innerHTML = "";
   addNightRow();
+  updateOscMismatchWarning();
   document.getElementById("stage-summary").innerHTML = "";
   document.getElementById("analyze-output").innerHTML = "";
   document.getElementById("analyze-result").innerHTML = "";
@@ -1831,24 +2566,47 @@ async function switchToProject(name, initialStep) {
   document.querySelectorAll("[data-log-view]").forEach((el) => { el.textContent = ""; el.classList.remove("open"); });
   showActiveStep();
   if (state.project) await loadProjectStatus();
-  // Restore a cached review session for the INCOMING project, if this
-  // browser tab analyzed it before switching away at some point - after
-  // loadProjectStatus(), not before, since frame thumbnails need
-  // state.status.is_osc (for debayering) to already be populated.
+  // Restore a review session for the INCOMING project - first check this
+  // tab's own in-memory cache (covers switching projects without ever
+  // leaving the page), then fall back to whatever was last persisted
+  // server-side (covers a page reload or a brand new session entirely -
+  // see the save side of this above, and app/main.py's run_analyze()/
+  // review-state endpoints). After loadProjectStatus(), not before,
+  // since frame thumbnails need state.status.is_osc (for debayering) to
+  // already be populated.
   const cached = state.project ? reviewCache[state.project] : null;
-  if (cached) {
-    state.lastAnalyzeResult = cached.lastAnalyzeResult;
-    state.excludeFrames = new Set(cached.excludeFrames);
-    state.lastAnomalySigma = cached.lastAnomalySigma;
+  let restored = cached
+    ? { lastAnalyzeResult: cached.lastAnalyzeResult, excludeFrames: cached.excludeFrames, lastAnomalySigma: cached.lastAnomalySigma }
+    : null;
+  if (!restored && state.project) {
+    try {
+      const saved = await api("GET", `/projects/${encodeURIComponent(state.project)}/review-state`);
+      restored = { lastAnalyzeResult: saved.result, excludeFrames: new Set(saved.exclude_frames), lastAnomalySigma: saved.anomaly_sigma };
+    } catch (e) {
+      // 404 (never analyzed) or a genuine network hiccup - either way,
+      // nothing to restore, same as no in-memory cache entry.
+    }
+  }
+  if (restored) {
+    state.lastAnalyzeResult = restored.lastAnalyzeResult;
+    state.excludeFrames = new Set(restored.excludeFrames);
+    state.lastAnomalySigma = restored.lastAnomalySigma;
     state.analyzed = true;
-    document.getElementById("analyze-anomaly-sigma").value = cached.lastAnomalySigma;
-    document.getElementById("anomaly-sigma-value").textContent = cached.lastAnomalySigma.toFixed(1);
+    document.getElementById("analyze-anomaly-sigma").value = restored.lastAnomalySigma;
+    document.getElementById("anomaly-sigma-value").textContent = restored.lastAnomalySigma.toFixed(1);
     setStepBadge("review-status-badge", "ok", "analyzed");
     document.getElementById("analyze-reset-btn").style.display = "inline-block";
     document.getElementById("review-next-btn").style.display = "inline-block";
     refreshExcludeDisplay();
     renderAnalyzeOutput();
     renderStepper();
+    if (!cached) {
+      reviewCache[state.project] = {
+        lastAnalyzeResult: restored.lastAnalyzeResult,
+        excludeFrames: new Set(restored.excludeFrames),
+        lastAnomalySigma: restored.lastAnomalySigma,
+      };
+    }
   }
 }
 
@@ -1863,6 +2621,18 @@ document.getElementById("brand-link").addEventListener("click", (e) => {
 document.getElementById("create-project-btn").addEventListener("click", async () => {
   const name = (prompt("New project name:") || "").trim();
   if (!name) return;
+  // Mirrors config.py's project_dir() validation - a project's directory
+  // path gets baked unquoted into every .ssf script's -out=/-dark=/
+  // -flat=/-bias= arguments, and Siril's script parser tokenizes those
+  // specific options on whitespace with no quoting escape hatch. Caught
+  // here so the folder picker doesn't even open for a name that's
+  // already doomed to fail.
+  if (!/^[A-Za-z0-9._-]+$/.test(name)) {
+    alert(
+      `Create failed: project names can only contain letters, numbers, hyphens, underscores, and periods (no spaces or other punctuation) - "${name}" isn't valid.`
+    );
+    return;
+  }
   // root_dir is optional (Skip leaves it unset - pickers just fall back
   // to browsing from the full captures root, same as before this
   // existed) but asked for up front since it's meant to seed every
@@ -1879,6 +2649,7 @@ document.getElementById("create-project-btn").addEventListener("click", async ()
   await loadProjects();
   document.getElementById("project-select").value = name;
   await switchToProject(name, "stage");
+  if (rootDir) await autoPopulateFromScan(rootDir);
 });
 
 document.getElementById("refresh-status-btn").addEventListener("click", loadProjectStatus);
@@ -1903,6 +2674,20 @@ document.getElementById("delete-project-btn").addEventListener("click", async ()
     return;
   }
   delete reviewCache[name];
+  // A REAL bug Chris hit: delete a project, create a NEW one with the
+  // SAME name, and Review already had the OLD project's images. Root
+  // cause - state.lastAnalyzeResult (this in-memory tab's current
+  // analyze result) was still holding the just-deleted project's data,
+  // and the very next line's dispatchEvent triggers switchToProject(),
+  // whose OWN "save the outgoing project's review session" logic runs
+  // unconditionally whenever state.lastAnalyzeResult is set - it doesn't
+  // know or care that the project it's about to save FOR was just
+  // deleted, so it immediately re-wrote reviewCache[name] right back,
+  // undoing the delete above. Clearing this first means that save block
+  // sees nothing to save and skips it entirely.
+  state.lastAnalyzeResult = null;
+  state.excludeFrames.clear();
+  state.lastAnomalySigma = null;
   await loadProjects();
   const sel = document.getElementById("project-select");
   sel.value = "";
@@ -2086,6 +2871,7 @@ document.addEventListener("click", (e) => {
     const badge = document.getElementById("health-badge");
     badge.textContent = health.status === "ok" ? "online" : "error";
     badge.className = `badge ${health.status === "ok" ? "ok" : "danger"}`;
+    if (health.version) document.getElementById("app-version").textContent = `v${health.version}`;
   } catch (e) {
     document.getElementById("health-badge").textContent = "offline";
     document.getElementById("health-badge").className = "badge danger";
