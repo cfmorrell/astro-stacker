@@ -32,6 +32,10 @@
     </div>
     <div class="field" style="margin-bottom:0;">
       <label>&nbsp;</label>
+      <button id="project-logs-btn" class="ghost" style="display:none;">📄 Project logs</button>
+    </div>
+    <div class="field" style="margin-bottom:0;">
+      <label>&nbsp;</label>
       <button id="delete-project-btn" class="danger-outline" style="display:none;" disabled>🗑 Delete project</button>
     </div>
   </div>
@@ -56,6 +60,16 @@
       </div>
       <p class="hint">Only jobs run since the server last restarted — this isn't persisted to disk.</p>
       <div id="job-history-list"></div>
+    </div>
+
+    <div id="project-logs-panel" class="card" style="display:none;">
+      <div class="card-header">
+        <div class="card-title">Project logs</div>
+        <button type="button" class="small ghost" id="project-logs-close">✕ Close</button>
+      </div>
+      <p class="hint">Every job's full log, kept on disk for this project (survives a server restart, unlike Job history above). Each one starts with a header naming what it was — send the whole zip along for troubleshooting.</p>
+      <button type="button" class="small" id="project-logs-download-all-btn">⬇ Download all as .zip</button>
+      <div id="project-logs-list" style="margin-top:10px;"></div>
     </div>
 
     <div class="stepper" id="stepper"></div>
@@ -114,7 +128,13 @@
           <div id="masters-status-badge" class="badge">not built</div>
         </div>
 
-        <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Groups to build darks/flats for</label>
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+          <label style="font-size:12px; color:var(--text-muted);">Groups to build darks/flats for</label>
+          <div style="display:flex; gap:6px;">
+            <button type="button" class="small ghost" id="masters-select-all-btn">Select all</button>
+            <button type="button" class="small ghost" id="masters-select-none-btn">Select none</button>
+          </div>
+        </div>
         <div id="masters-nights" class="checklist"></div>
 
         <label style="display:block; font-size:12px; color:var(--text-muted); margin: 14px 0 6px;">Calibration alignment</label>
@@ -162,7 +182,13 @@
           <div id="review-status-badge" class="badge">not analyzed</div>
         </div>
 
-        <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Groups to analyze</label>
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+          <label style="font-size:12px; color:var(--text-muted);">Groups to analyze</label>
+          <div style="display:flex; gap:6px;">
+            <button type="button" class="small ghost" id="analyze-select-all-btn">Select all</button>
+            <button type="button" class="small ghost" id="analyze-select-none-btn">Select none</button>
+          </div>
+        </div>
         <div id="analyze-nights" class="checklist"></div>
 
         <div class="field">
@@ -200,9 +226,6 @@
         </div>
         <div id="analyze-result"></div>
 
-        <div id="analyze-actions" style="display:none; margin:10px 0;">
-          <button id="analyze-accept-recommended-btn" class="small">✓ Accept recommended exclusions</button>
-        </div>
         <div id="analyze-output"></div>
         <p class="hint">Flags are recommendations only — nothing is excluded unless you check it below. Roundness here is 0 for a round star and grows as it gets more elongated — the opposite direction from Siril's own eccentricity number, so don't expect these values to match what you're used to seeing there.</p>
       </div>
@@ -216,7 +239,13 @@
           <div id="stack-status-badge" class="badge">not stacked</div>
         </div>
 
-        <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Groups to stack</label>
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+          <label style="font-size:12px; color:var(--text-muted);">Groups to stack</label>
+          <div style="display:flex; gap:6px;">
+            <button type="button" class="small ghost" id="stack-select-all-btn">Select all</button>
+            <button type="button" class="small ghost" id="stack-select-none-btn">Select none</button>
+          </div>
+        </div>
         <div id="stack-nights" class="checklist"></div>
         <div id="stack-filter-warning" class="session-mismatch-warning" style="display:none;"></div>
 
@@ -281,6 +310,19 @@
         <div id="stack-result"></div>
         <div class="log-view" data-log-view="stack"></div>
         <div id="stack-preview"></div>
+
+        <div id="register-finals-section" style="display:none; margin-top:18px; padding-top:14px; border-top:1px solid var(--border);">
+          <div class="card-title" style="font-size:14px;">Align final results across filters</div>
+          <p class="hint">Registers every filter's (or exposure group's) own final stacked result against every other one, so they come out pixel-aligned for combining as channels in external post-processing (e.g. PixInsight) — the last step of a multi-filter project.</p>
+          <button id="register-finals-run-btn" class="primary small">Align final results</button>
+          <div id="register-finals-progress" class="progress-wrap" style="display:none;">
+            <div class="progress-bar"><div class="progress-fill"></div></div>
+            <div class="progress-label"><span class="pct">0%</span><span class="msg"></span></div>
+          </div>
+          <div id="register-finals-result"></div>
+          <div class="log-view" data-log-view="register-finals"></div>
+          <div id="register-finals-list" style="margin-top:10px;"></div>
+        </div>
       </div>
     </section>
 

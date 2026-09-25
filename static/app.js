@@ -123,6 +123,22 @@ function isFrameFlagged(f) {
   // used). z-scores themselves don't change with the threshold, so the
   // outlier-sensitivity slider can move live with no re-analyze round
   // trip - matches the server's own "flag if ANY metric crosses it" rule.
+  //
+  // A REAL bug lived here: this only ever checked z-scores against the
+  // slider, silently dropping the server's OTHER, unconditional rule
+  // (app/framestats.py's flag_anomalies(): "f.star_count == 0 or any(z >=
+  // threshold ...)" - zero detections is its own unambiguous anomaly,
+  // deliberately NOT gated on how extreme its z-score happens to be).
+  // Confirmed on a real session: 4 tail frames with star_count=0 (a
+  // corrupt/saturated capture) had a star_count z-score of only ~0.68 -
+  // not statistically extreme relative to the rest of a night that
+  // already had generally few detected stars - so they silently rendered
+  // as NOT flagged even though the server's own `f.flagged` said
+  // otherwise, and even though every OTHER metric for those frames was
+  // `null` (excluded from anomaly_z entirely) and thus couldn't trigger
+  // this check either. Checking star_count === 0 directly, unconditionally,
+  // closes the gap regardless of what any metric's z-score comes out to.
+  if (f.star_count === 0) return true;
   if (!f.anomaly_z) return false;
   return Object.values(f.anomaly_z).some((z) => z >= state.lastAnomalySigma);
 }
@@ -464,9 +480,32 @@ function renderExistingStagedNights() {
   const container = document.getElementById("stage-existing-nights");
   container.innerHTML = "";
   const nights = state.status ? state.status.nights : [];
-  if (!nights.length) {
+  const biasesCount = state.status ? state.status.biases_count : 0;
+  if (!nights.length && !biasesCount) {
     container.appendChild(el("span", { class: "empty-hint" }, ["None staged yet."]));
     return;
+  }
+  // Biases shown here too, not just groups - a REAL gap Chris caught:
+  // this panel previously only ever listed nights/groups, so staged
+  // biases were invisible here and had no way back to "not staged" short
+  // of deleting the whole project (see the new DELETE /projects/{name}/
+  // biases endpoint this pairs with).
+  if (biasesCount) {
+    container.appendChild(el("div", { class: "night-row", style: "justify-content:space-between;" }, [
+      el("span", {}, [`Biases — ${biasesCount} frames`]),
+      el("button", {
+        type: "button", class: "small danger-outline",
+        onclick: async () => {
+          if (!confirm("Remove staged biases? This deletes the staged files and any built master bias. Cannot be undone.")) return;
+          try {
+            await api("DELETE", `/projects/${encodeURIComponent(state.project)}/biases`);
+            await loadProjectStatus();
+          } catch (e) {
+            alert(`Remove failed: ${e}`);
+          }
+        },
+      }, ["✕ Remove"]),
+    ]));
   }
   for (const n of nights) {
     container.appendChild(el("div", { class: "night-row", style: "justify-content:space-between;" }, [
@@ -584,6 +623,48 @@ function autoFillMatchingDarks() {
       source.darksInput.value.trim(),
       `Matched from ${source.getLabel()} (${formatExposure(targetExposure)} exposure)`
     );
+  }
+}
+
+// The flats counterpart of the above - a REAL gap Chris hit: "when
+// adding a second mono night, the lights get pulled from the folder into
+// their respective filters, but the flats do not." Splitting a mixed
+// lights folder into one row per filter only ever had LIGHTS info at
+// split time (flats usually hasn't been picked yet) - each of the new
+// rows then needed its OWN separate flats pick, once per filter, with no
+// propagation. Matched differently than darks (by filter membership, not
+// exposure): once ANY row's flats resolves to a folder that ALSO
+// contains frames for another EMPTY-flats row's own locked filter, fill
+// that row in too - each will independently cull to its own filter at
+// stage time, exactly like the folder they were split from already does.
+//
+// Deliberately scoped to rows sharing the EXACT SAME lights folder path
+// (i.e. genuinely split from the same physical night) - NOT just "any
+// row anywhere whose flats happen to cover this filter." Real mono data
+// confirms why this matters: each night has its own separate flats (dust/
+// vignetting - and even each filter's own auto-exposure - genuinely
+// changes night to night), so night 2's H group must never inherit night
+// 1's H flats just because both are filter "H" - only true siblings from
+// the same split should ever auto-fill each other.
+function autoFillMatchingFlats() {
+  for (const target of nightRows) {
+    if (target.flatsInput.value.trim()) continue;
+    const targetFilter = target.row.dataset.filter;
+    if (!targetFilter) continue;
+    const targetLightsDir = target.lightsInput.value.trim();
+    if (!targetLightsDir) continue;
+    const candidates = nightRows.filter((r) => {
+      if (r === target) return false;
+      if (r.lightsInput.value.trim() !== targetLightsDir) return false;
+      const dir = r.flatsInput.value.trim();
+      if (!dir) return false;
+      const counts = r.getFlatsFilterCounts();
+      return !!(counts && counts[targetFilter]);
+    });
+    const distinctDirs = new Set(candidates.map((r) => r.flatsInput.value.trim()));
+    if (distinctDirs.size !== 1) continue;
+    const source = candidates[0];
+    target.fillFlatsFrom(source.flatsInput.value.trim(), `Matched from ${source.getLabel()} (filter ${targetFilter})`);
   }
 }
 
@@ -714,6 +795,24 @@ function addNightRow(initial) {
   let flatsFilterCounts = {};
   let lightsDetectedExposures = [];
   let lightsExposureCounts = {};
+  // Each detected filter's OWN dominant exposure (e.g. {"H": 300, "L":
+  // 180} - see app/frameinfo.py's detect_exposure_by_filter()). A REAL
+  // bug this fixes: a folder mixing filters that use DIFFERENT exposures
+  // (real narrowband H/O/S at 300s + L at 180s in one "Light" folder) can
+  // have NO single dominant exposure across ALL files at once (confirmed
+  // on real data: 300s covered only 85.5% of files, just under the 90%
+  // threshold), leaving lightsDetectedExposureS null even though this
+  // filter-locked row's OWN true exposure is perfectly well-known.
+  // effectiveLightsExposure() below is what every consumer (the darks
+  // mismatch warning, cross-row darks auto-fill, and the summary display)
+  // should read instead of the raw lightsDetectedExposureS.
+  let lightsFilterExposures = {};
+  function effectiveLightsExposure() {
+    if (row.dataset.filter && lightsFilterExposures[row.dataset.filter] != null) {
+      return lightsFilterExposures[row.dataset.filter];
+    }
+    return lightsDetectedExposureS;
+  }
   // The raw /captures/browse response for whichever folder is currently
   // picked, kept around so the summary line can be RECOMPUTED once this
   // row's filter/exposure lock is actually known - fixes a real bug: a
@@ -727,7 +826,7 @@ function addNightRow(initial) {
     if (!lastLightsData) { lightsSummary.textContent = ""; return; }
     let overrides;
     if (row.dataset.filter) {
-      overrides = { count: lightsFilterCounts[row.dataset.filter] || 0 };
+      overrides = { count: lightsFilterCounts[row.dataset.filter] || 0, exposureS: effectiveLightsExposure() };
     } else if (row.dataset.exposureS) {
       const exposureS = parseFloat(row.dataset.exposureS);
       overrides = { count: findCountForExposure(lightsExposureCounts, exposureS) || 0, exposureS };
@@ -831,8 +930,9 @@ function addNightRow(initial) {
     if (flatsDetectedType && flatsDetectedType !== "flat") {
       messages.push(`The flats folder looks like it contains ${flatsDetectedType === "mixed" ? "a mix of frame types" : `${flatsDetectedType} frames`}, not flats.`);
     }
-    if (lightsDetectedExposureS != null && darksDetectedExposureS != null && Math.abs(lightsDetectedExposureS - darksDetectedExposureS) > 0.01) {
-      messages.push(`These lights are ${formatExposure(lightsDetectedExposureS)} exposures, but this session's darks are ${formatExposure(darksDetectedExposureS)} — they won't calibrate correctly.`);
+    const thisLightsExposure = effectiveLightsExposure();
+    if (thisLightsExposure != null && darksDetectedExposureS != null && Math.abs(thisLightsExposure - darksDetectedExposureS) > 0.01) {
+      messages.push(`These lights are ${formatExposure(thisLightsExposure)} exposures, but this session's darks are ${formatExposure(darksDetectedExposureS)} — they won't calibrate correctly.`);
     }
     const lightsDate = parseFitsDate(lightsSampleDateObs);
     const flatsDate = parseFitsDate(flatsSampleDateObs);
@@ -876,6 +976,7 @@ function addNightRow(initial) {
   }
   const lightsSummary = el("div", { class: "dirpick-summary" }, []);
   const flatsSummary = el("div", { class: "dirpick-summary" }, []);
+  const flatsProvenance = el("div", { class: "dirpick-provenance" }, []);
   sessionWarningUpdaters.push(updateSessionWarnings);
   attachFolderBrowser(lightsInput, lightsBrowse, (data) => {
     if (splitDone) return;
@@ -887,6 +988,7 @@ function addNightRow(initial) {
     lightsFilterCounts = data.filter_counts || {};
     lightsDetectedExposures = data.detected_exposures || [];
     lightsExposureCounts = data.exposure_counts || {};
+    lightsFilterExposures = data.filter_exposures || {};
     lastLightsData = data;
     if (maybeSplitRow()) return;
     refreshLightsSummary();
@@ -895,10 +997,34 @@ function addNightRow(initial) {
     autoFillMatchingDarks();
     updateOscMismatchWarning();
   });
+  function processFlatsData(data, provenanceText) {
+    flatsDetectedType = data.detected_type;
+    flatsSampleDateObs = data.sample_date_obs;
+    flatsSampleInstrument = data.sample_instrument;
+    flatsDetectedFilters = data.detected_filters || [];
+    flatsFilterCounts = data.filter_counts || {};
+    lastFlatsData = data;
+    flatsProvenance.textContent = provenanceText || "";
+    refreshFlatsSummary();
+    updateSessionWarnings();
+  }
+  // Shared by the manual pick, the scan-proposed prefill below, AND
+  // autoFillMatchingFlats() - one path in, always the same processing.
+  function fillFlatsFrom(path, provenanceText) {
+    flatsInput.value = path;
+    api("GET", `/captures/browse?path=${encodeURIComponent(path)}`).then((data) => {
+      processFlatsData(data, provenanceText);
+      autoFillMatchingFlats();
+    }).catch(() => {});
+  }
   // Clearing flats leaves this row's filter/exposure lock exactly as it
   // is (that's decided by lights, not flats) - it just reverts flats to
   // "not yet picked," same incomplete state as a fresh row, until picked
   // again (staging already skips a row missing either lights or flats).
+  // NOT followed by autoFillMatchingFlats() - same reasoning as darks'
+  // own clearDarksForRow(): re-running auto-fill right after a manual
+  // clear could immediately refill this row from a sibling that still has
+  // a matching flats folder, making Unselect look like it does nothing.
   function clearFlatsForRow() {
     flatsInput.value = "";
     flatsDetectedType = null;
@@ -907,6 +1033,7 @@ function addNightRow(initial) {
     flatsDetectedFilters = [];
     flatsFilterCounts = {};
     lastFlatsData = null;
+    flatsProvenance.textContent = "";
     refreshFlatsSummary();
     updateSessionWarnings();
   }
@@ -914,16 +1041,10 @@ function addNightRow(initial) {
     flatsInput, flatsBrowse,
     (data) => {
       if (splitDone) return;
-      flatsDetectedType = data.detected_type;
-      flatsSampleDateObs = data.sample_date_obs;
-      flatsSampleInstrument = data.sample_instrument;
-      flatsDetectedFilters = data.detected_filters || [];
-      flatsFilterCounts = data.filter_counts || {};
-      lastFlatsData = data;
+      processFlatsData(data, ""); // a manual pick is never "found for you" - no caption
       if (maybeSplitRow()) return;
-      refreshFlatsSummary();
       updateGroupAnnotation();
-      updateSessionWarnings();
+      autoFillMatchingFlats();
     },
     { onUnselect: clearFlatsForRow }
   );
@@ -942,6 +1063,7 @@ function addNightRow(initial) {
     el("span", { class: "dirpick-label" }, ["Flats"]),
     el("div", { class: "dirpick-row" }, [flatsInput, flatsBrowse]),
     flatsSummary,
+    flatsProvenance,
   ]);
 
   // Per-group darks picker (replaces the old project-wide #darks-dir
@@ -1040,8 +1162,10 @@ function addNightRow(initial) {
     flatsInput,
     darksInput,
     fillDarksFrom,
-    getLightsExposure: () => lightsDetectedExposureS,
+    fillFlatsFrom,
+    getLightsExposure: () => effectiveLightsExposure(),
     getDarksExposure: () => darksDetectedExposureS,
+    getFlatsFilterCounts: () => flatsFilterCounts,
     getLabel: () => row.querySelector(".session-label")?.textContent.trim() || "this group",
   };
   nightRows.push(rowState);
@@ -1071,6 +1195,7 @@ function addNightRow(initial) {
         lightsFilterCounts = data.filter_counts || {};
         lightsDetectedExposures = data.detected_exposures || [];
         lightsExposureCounts = data.exposure_counts || {};
+        lightsFilterExposures = data.filter_exposures || {};
         lastLightsData = data;
         if (maybeSplitRow()) return;
         refreshLightsSummary();
@@ -1084,16 +1209,22 @@ function addNightRow(initial) {
       flatsInput.value = initial.flatsDir;
       api("GET", `/captures/browse?path=${encodeURIComponent(initial.flatsDir)}`).then((data) => {
         if (splitDone) return;
-        flatsDetectedType = data.detected_type;
-        flatsSampleDateObs = data.sample_date_obs;
-        flatsSampleInstrument = data.sample_instrument;
-        flatsDetectedFilters = data.detected_filters || [];
-        flatsFilterCounts = data.filter_counts || {};
-        lastFlatsData = data;
+        processFlatsData(data, "");
         if (maybeSplitRow()) return;
-        refreshFlatsSummary();
-        updateSessionWarnings();
+        autoFillMatchingFlats();
       }).catch(() => {});
+    } else {
+      // No flats folder known yet for this freshly split/scanned row -
+      // check whether a SIBLING row (created in the same split, or
+      // already staged) already has a matching-filter flats folder
+      // picked, and borrow it - the cross-row counterpart of darks'
+      // auto-fill, closing the gap Chris hit: "when adding a second mono
+      // night, the lights get pulled into their respective filters, but
+      // the flats do not."
+      autoFillMatchingFlats();
+    }
+    if (initial.darksDir) {
+      fillDarksFrom(initial.darksDir, "Found automatically at this path");
     }
     if (initial.darksDir) {
       fillDarksFrom(initial.darksDir, "Found automatically at this path");
@@ -1401,6 +1532,40 @@ const mastersSelected = new Set();
 const analyzeSelected = new Set();
 const stackSelected = new Set();
 
+// "Select all"/"Select none" for each of the three per-group checklists -
+// Chris: "especially with a large 12+ group project," clicking every
+// checkbox by hand doesn't scale. Each just mutates the shared Set
+// directly then re-renders that one checklist the same way its own
+// normal refresh path already does, so onChange/survivor-count/filter-
+// mismatch side effects all still fire correctly.
+document.getElementById("masters-select-all-btn").addEventListener("click", () => {
+  if (!state.status) return;
+  for (const n of state.status.nights) mastersSelected.add(n.name);
+  renderChecklist("masters-nights", state.status.nights, mastersSelected);
+});
+document.getElementById("masters-select-none-btn").addEventListener("click", () => {
+  mastersSelected.clear();
+  renderChecklist("masters-nights", state.status ? state.status.nights : [], mastersSelected);
+});
+document.getElementById("analyze-select-all-btn").addEventListener("click", () => {
+  if (!state.status) return;
+  for (const n of state.status.nights) analyzeSelected.add(n.name);
+  renderChecklist("analyze-nights", state.status.nights, analyzeSelected);
+});
+document.getElementById("analyze-select-none-btn").addEventListener("click", () => {
+  analyzeSelected.clear();
+  renderChecklist("analyze-nights", state.status ? state.status.nights : [], analyzeSelected);
+});
+document.getElementById("stack-select-all-btn").addEventListener("click", () => {
+  if (!state.status) return;
+  for (const n of state.status.nights) stackSelected.add(n.name);
+  refreshStackNightsChecklist();
+});
+document.getElementById("stack-select-none-btn").addEventListener("click", () => {
+  stackSelected.clear();
+  refreshStackNightsChecklist();
+});
+
 // ---------- Masters section ----------
 
 function renderMastersPreviews() {
@@ -1658,6 +1823,15 @@ function openLightboxForFrame(night, frames, index) {
 
 document.getElementById("lightbox").addEventListener("click", () => {
   document.getElementById("lightbox").classList.remove("open");
+  // A REAL bug this fixes: lightboxNav stayed truthy after closing (only
+  // ever reassigned by openLightboxForFrame/openPlainLightbox, never
+  // cleared here), so later clicking "Show all frames"/"Accept
+  // exclusions - show survivors only" - which unconditionally does
+  // `if (lightboxNav) renderLightboxFrame()` - would call
+  // renderLightboxFrame() -> openLightbox() -> classList.add("open"),
+  // popping the lightbox back open even though the user only clicked a
+  // toggle, not a thumbnail.
+  lightboxNav = null;
 });
 document.getElementById("lightbox-prev").addEventListener("click", (e) => {
   e.stopPropagation();
@@ -1681,7 +1855,10 @@ document.addEventListener("keydown", (e) => {
   if (!document.getElementById("lightbox").classList.contains("open")) return;
   if (e.key === "ArrowLeft") document.getElementById("lightbox-prev").click();
   else if (e.key === "ArrowRight") document.getElementById("lightbox-next").click();
-  else if (e.key === "Escape") document.getElementById("lightbox").classList.remove("open");
+  else if (e.key === "Escape") {
+    document.getElementById("lightbox").classList.remove("open");
+    lightboxNav = null; // see the overlay-click handler's comment above
+  }
 });
 document.getElementById("lightbox-exclude-row").addEventListener("click", (e) => e.stopPropagation());
 document.getElementById("lightbox-exclude").addEventListener("change", (e) => {
@@ -1866,6 +2043,24 @@ function renderAnalyzeOutput() {
       block.appendChild(el("h4", {}, [
         `${label} — ${allFrames.length} frames, ${flaggedCount} flagged` + (excludedCount ? `, ${excludedCount} excluded` : ""),
       ]));
+      // Per-group, not one single button above the whole grid - Chris:
+      // "add an accept exclusions button per group and get rid of the
+      // main one at the top" (a 12+ group project made the one global
+      // button, which accepted EVERY group's recommendations at once,
+      // too coarse to use group by group). Only shown when THIS group
+      // actually has an unaccepted flagged frame.
+      if (allFrames.some((f) => isFrameFlagged(f) && !state.excludeFrames.has(f.filename))) {
+        block.appendChild(el("button", {
+          class: "small",
+          onclick: () => {
+            for (const f of allFrames) {
+              if (isFrameFlagged(f)) state.excludeFrames.add(f.filename);
+            }
+            refreshExcludeDisplay();
+            renderAnalyzeOutput();
+          },
+        }, ["✓ Accept recommended exclusions"]));
+      }
       const grid = el("div", { class: "metric-grid" }, [
         metricStrip("star count", frames, "star_count", "star_count", state.lastAnomalySigma),
         metricStrip("FWHM", frames, "fwhm", "fwhm", state.lastAnomalySigma),
@@ -1922,11 +2117,6 @@ function renderAnalyzeOutput() {
 
   document.getElementById("analyze-rerun-btn").style.display = state.excludeFrames.size > 0 ? "inline-block" : "none";
 
-  const anyUnacceptedFlags = Object.values(state.lastAnalyzeResult.nights)
-    .flat()
-    .some((f) => isFrameFlagged(f) && !state.excludeFrames.has(f.filename));
-  document.getElementById("analyze-actions").style.display = anyUnacceptedFlags ? "block" : "none";
-
   refreshStackNightsChecklist();
 }
 
@@ -1938,7 +2128,6 @@ async function runAnalyze() {
   resultEl.innerHTML = "";
   resultEl.appendChild(el("div", { class: "status-line" }, ["starting…"]));
   document.getElementById("analyze-output").innerHTML = "";
-  document.getElementById("analyze-actions").style.display = "none";
   document.getElementById("analyze-reset-btn").style.display = "none";
   document.getElementById("review-next-btn").style.display = "none";
   setStepBadge("review-status-badge", null, "not analyzed");
@@ -1989,16 +2178,6 @@ document.getElementById("analyze-anomaly-sigma").addEventListener("input", (e) =
   if (state.lastAnalyzeResult) renderAnalyzeOutput();
 });
 
-document.getElementById("analyze-accept-recommended-btn").addEventListener("click", () => {
-  if (!state.lastAnalyzeResult) return;
-  for (const frames of Object.values(state.lastAnalyzeResult.nights)) {
-    for (const f of frames) {
-      if (isFrameFlagged(f)) state.excludeFrames.add(f.filename);
-    }
-  }
-  refreshExcludeDisplay();
-  renderAnalyzeOutput();
-});
 
 document.getElementById("analyze-reset-btn").addEventListener("click", () => {
   if (!confirm("Start over? This clears all excluded frames and this session's analysis results.")) return;
@@ -2022,7 +2201,6 @@ document.getElementById("analyze-reset-btn").addEventListener("click", () => {
   refreshExcludeDisplay();
   document.getElementById("analyze-output").innerHTML = "";
   document.getElementById("analyze-result").innerHTML = "";
-  document.getElementById("analyze-actions").style.display = "none";
   document.getElementById("analyze-reset-btn").style.display = "none";
   document.getElementById("analyze-rerun-btn").style.display = "none";
   document.getElementById("review-next-btn").style.display = "none";
@@ -2180,6 +2358,63 @@ document.getElementById("stack-run-btn").addEventListener("click", async () => {
     showStackPreview();
     renderStepper();
   }
+});
+
+// The final step of a multi-filter (or multi-exposure-group) project:
+// once 2+ filters/groups each have their own final stacked result,
+// register them against each other so they're pixel-aligned for
+// combining as channels in external post-processing - Chris: "the last
+// step of a mono project should be a registration so that when they get
+// combined during post processing they're aligned." Section stays hidden
+// until there's genuinely something to align (see app/ssf.py's
+// final_stack_paths() / app/status.py's final_results_count).
+function renderRegisterFinalsSection() {
+  const section = document.getElementById("register-finals-section");
+  if (!state.status || state.status.final_results_count < 2) {
+    section.style.display = "none";
+    return;
+  }
+  section.style.display = "block";
+  const list = document.getElementById("register-finals-list");
+  list.innerHTML = "";
+  for (const item of state.status.aligned_finals || []) {
+    list.appendChild(el("div", { class: "night-row", style: "justify-content:space-between;" }, [
+      el("span", {}, [item.label]),
+      el("a", {
+        class: "small",
+        href: `/projects/${encodeURIComponent(state.project)}/download?path=${encodeURIComponent(item.path)}`,
+      }, ["⬇ Download"]),
+    ]));
+  }
+}
+
+document.getElementById("register-finals-run-btn").addEventListener("click", async () => {
+  const runBtn = document.getElementById("register-finals-run-btn");
+  const resultEl = document.getElementById("register-finals-result");
+  resultEl.innerHTML = "";
+  runBtn.disabled = true;
+  const ownerProject = state.project;
+  resultEl.appendChild(el("div", { class: "status-line" }, ["starting…"]));
+  let snap;
+  try {
+    const { job_id } = await api("POST", `/projects/${encodeURIComponent(ownerProject)}/register-finals/run`, {});
+    snap = await new Promise((resolve) => {
+      pollJob(job_id, {
+        progressEl: document.getElementById("register-finals-progress"),
+        logViewEl: document.querySelector('[data-log-view="register-finals"]'),
+        ownerProject,
+        onDone: resolve,
+      });
+    });
+  } catch (e) {
+    snap = { status: "failed", error: String(e) };
+  }
+  resultEl.innerHTML = "";
+  if (snap.status !== "succeeded") {
+    resultEl.appendChild(el("div", { class: "error-banner" }, [`✕ Failed: ${snap.error || ""}`]));
+  }
+  runBtn.disabled = false;
+  if (ownerProject === state.project) await loadProjectStatus();
 });
 
 // Every currently-existing result at once, not just one - a narrowband
@@ -2388,6 +2623,7 @@ async function loadProjectStatus() {
 
   renderMastersPreviews();
   showStackPreview();
+  renderRegisterFinalsSection();
   renderStepper();
   // Fire-and-forget, not awaited: a large project means one syscall per
   // staged file server-side, which could be noticeably slower than the
@@ -2471,6 +2707,8 @@ async function switchToProject(name, initialStep) {
   document.getElementById("delete-project-btn").style.display = state.project ? "inline-block" : "none";
   document.getElementById("job-history-btn").style.display = state.project ? "inline-block" : "none";
   document.getElementById("job-history-panel").style.display = "none";
+  document.getElementById("project-logs-btn").style.display = state.project ? "inline-block" : "none";
+  document.getElementById("project-logs-panel").style.display = "none";
   document.getElementById("broken-links-banner").style.display = "none";
   document.getElementById("stage-autopopulate-note").style.display = "none";
   // A REAL pre-existing gap, caught while adding the summary line below:
@@ -2522,7 +2760,9 @@ async function switchToProject(name, initialStep) {
   document.getElementById("masters-result").innerHTML = "";
   document.getElementById("masters-previews").innerHTML = "";
   document.getElementById("stack-result").innerHTML = "";
-  document.getElementById("analyze-actions").style.display = "none";
+  document.getElementById("register-finals-section").style.display = "none";
+  document.getElementById("register-finals-result").innerHTML = "";
+  document.getElementById("register-finals-list").innerHTML = "";
   document.getElementById("analyze-reset-btn").style.display = "none";
   document.getElementById("analyze-rerun-btn").style.display = "none";
   document.getElementById("stage-next-btn").style.display = "none";
@@ -2764,6 +3004,49 @@ document.getElementById("job-history-btn").addEventListener("click", () => {
 });
 document.getElementById("job-history-close").addEventListener("click", () => {
   document.getElementById("job-history-panel").style.display = "none";
+});
+
+// Every job's own log file on disk (project/logs/<job_id>.log - survives
+// a server restart, unlike Job history above's in-memory list) - Chris:
+// "we need a way to grab project logs through the webui. That way I can
+// give you troubleshooting data."
+async function renderProjectLogs() {
+  const list = document.getElementById("project-logs-list");
+  list.innerHTML = "";
+  if (!state.project) return;
+  let data;
+  try {
+    data = await api("GET", `/projects/${encodeURIComponent(state.project)}/logs`);
+  } catch (e) {
+    list.appendChild(el("div", { class: "status-line err" }, [String(e)]));
+    return;
+  }
+  if (!data.logs.length) {
+    list.appendChild(el("span", { class: "empty-hint" }, ["No job logs yet."]));
+    return;
+  }
+  for (const logFile of data.logs) {
+    const when = new Date(logFile.mtime * 1000).toLocaleString();
+    const sizeKb = (logFile.size / 1024).toFixed(1);
+    list.appendChild(el("div", { class: "night-row", style: "justify-content:space-between;" }, [
+      el("span", { class: "mono" }, [`${logFile.name} — ${when} (${sizeKb} KB)`]),
+      el("a", {
+        class: "small",
+        href: `/projects/${encodeURIComponent(state.project)}/download?path=${encodeURIComponent(`logs/${logFile.name}`)}`,
+      }, ["⬇ Download"]),
+    ]));
+  }
+}
+document.getElementById("project-logs-btn").addEventListener("click", () => {
+  document.getElementById("project-logs-panel").style.display = "block";
+  renderProjectLogs();
+});
+document.getElementById("project-logs-close").addEventListener("click", () => {
+  document.getElementById("project-logs-panel").style.display = "none";
+});
+document.getElementById("project-logs-download-all-btn").addEventListener("click", () => {
+  if (!state.project) return;
+  window.location.href = `/projects/${encodeURIComponent(state.project)}/logs/download`;
 });
 
 // ---------- global active-jobs panel + cross-tab job awareness ----------

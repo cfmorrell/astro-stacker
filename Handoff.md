@@ -2416,6 +2416,165 @@ Siril ones, but the same "don't rediscover this" spirit applies.
   - bumping to `0.5` gives this whole batch its own version for whenever
   Chris pushes it. Still deliberately under 1.0, per the existing
   standing call (his own, not a checklist).
+- ✅ **Real production usage round: a dozen fixes/features from Chris
+  building an actual 3-night, 4-filter (H/L/O/S) mono project, plus a new
+  cross-filter registration/alignment step (2026-09-25)**. Chris added
+  real test data matching his production project
+  (`NorthAmericaNebula-NGC7000/{2024-05-31,2024-06-12,2024-06-13}-
+  NorthAmericaNebula-2600MM-Z61`, plus two DELIBERATELY unrelated OSC
+  nights in the same parent folder to test that scanning doesn't pull
+  them in) and his real master bias/dark libraries
+  (`001-MasterBias/`, `002-MasterDarks/`, organized by camera/exposure).
+  One root cause explained THREE of his reports at once:
+
+  1. **Root cause (bugs "flats don't auto-fill," "darks don't auto-fill,"
+     "exposure missing from picker info")**: `frameinfo.detect_exposure_
+     seconds()`'s 90%-dominance rule returns `None` (ambiguous) for a
+     lights folder mixing filters that genuinely use DIFFERENT exposures
+     - confirmed on his real data: H/O/S all at 300s + L at 180s meant
+     300s only covered 59/69 = 85.5% of the WHOLE folder, just under the
+     threshold, even though each filter's own subset is 100% unambiguous.
+     This silently broke `lightsDetectedExposureS` for every filter-locked
+     row sharing that folder, which fed (a) the darks-mismatch warning,
+     (b) darks cross-row auto-fill, and (c) the summary's exposure
+     display - all three "broken" independently, actually one gap. Fixed
+     with a new `frameinfo.detect_exposure_by_filter()` (per-filter
+     dominant exposure, exposed as `/captures/browse`'s new
+     `filter_exposures`) and a new per-row `effectiveLightsExposure()` in
+     `app.js` that every consumer now reads instead of the raw ambiguous
+     value. Verified live via CDP against the real data: H/O/S groups now
+     correctly show "300s," L shows "180s"; darks auto-fill correctly
+     propagates across H/O/S (300s) while correctly excluding L (180s);
+     manually assigning a 300s dark to the 180s L group now correctly
+     warns.
+  2. **"Flats don't auto-fill on a second night"**: separately, splitting
+     a mixed lights folder only ever had LIGHTS info at split time (flats
+     usually isn't picked yet), so each of the resulting filter rows
+     needed flats picked one at a time, once per filter, with no
+     propagation - unlike the exposure-based darks auto-fill already
+     built. New `autoFillMatchingFlats()`, matched by filter membership
+     (not exposure) and deliberately scoped to rows sharing the EXACT SAME
+     lights folder path (same physical night) - real mono data confirms
+     why that scoping matters: each night has its own genuinely different
+     flats (dust/vignetting, even each filter's own auto-exposure, change
+     night to night), so night 2's H group must never inherit night 1's H
+     flats just because both are filter "H." Verified live: picking flats
+     on one of 4 split rows correctly fills the other 3 for that same
+     night.
+  3. **"Currently staged groups panel doesn't show/can't remove staged
+     bias frames"**: new `DELETE /projects/{name}/biases` endpoint
+     (mirrors the existing per-night delete) plus a biases row in
+     `renderExistingStagedNights()`, gated on `biases_count > 0`. Verified
+     end-to-end (stage biases, see it in the panel, delete it, confirm
+     `biases_count` back to 0).
+  4. **"Need a select-all button on Masters/Review/Stack checklists,
+     especially with a 12+ group project"**: added "Select all"/"Select
+     none" buttons to all three (`renderChecklist()`'s existing
+     containers), each just mutating the shared `mastersSelected`/
+     `analyzeSelected`/`stackSelected` Set then re-rendering that one
+     checklist the normal way, so onChange/survivor-count/filter-mismatch
+     side effects still fire correctly.
+  5. **"Accept exclusions button per group, remove the main one at the
+     top"**: removed the single global `#analyze-accept-recommended-btn`
+     (which accepted every group's recommendations at once - too coarse
+     for a 12-group project); each night-block in `renderAnalyzeOutput()`
+     now gets its own button, shown only when that specific group has an
+     unaccepted flagged frame.
+  6. **Real bug: 4 genuinely corrupt (saturated/all-equal, effectively
+     zero-variance) tail frames of a real session showed as "recommended
+     accept" instead of flagged.** Root-caused precisely: the SERVER's
+     `flag_anomalies()` (`app/framestats.py`) already had an unconditional
+     `star_count == 0` rule and correctly computed `flagged=True` for
+     these frames both before and after this fix (confirmed by literally
+     running the OLD, unmodified code against the real bad frames AND a
+     synthetic all-zero frame - both correctly returned `flagged=True`
+     server-side). The REAL bug was client-side: `isFrameFlagged()`
+     (`app.js`) recomputes flagging itself from raw z-scores against the
+     adjustable outlier-sensitivity slider, but never checked
+     `star_count === 0` directly - and a zero-star frame's OWN z-score
+     isn't necessarily statistically extreme relative to a night that
+     already had generally few detected stars (confirmed on the real
+     frames: z-score of only 0.68, no other metric even computed since
+     fwhm/roundness/snr are `None`-excluded for a star_count=0 frame) -
+     confirmed the exact scenario with `state.lastAnomalySigma=3.0` before
+     and after this specific fix via CDP. Fixed with a direct, ordering-
+     independent check: `if (f.star_count === 0) return true;` up front,
+     matching the server's own unconditional rule exactly. Also
+     hardened `app/framestats.py` itself while investigating, even though
+     it wasn't the root cause of THIS report: added `background`/
+     `background_std` to `_FLAGGABLE_METRICS` (computed but never checked
+     before - a real gap for a frame that's degenerate but not exactly
+     star_count=0), and `analyze_frame()` now short-circuits before ever
+     calling `IRAFStarFinder` on a zero-variance frame (a threshold of
+     exactly 0 against already-zero data isn't a case it's designed for,
+     even though it happened to behave predictably on this specific test
+     data).
+  7. **"Show all frames"/"Accept exclusions - show survivors only" popped
+     open an image lightbox unexpectedly.** Root cause: `lightboxNav`
+     (tracks which frame is currently shown) was never reset to `null` on
+     EITHER lightbox-close path (overlay click, Escape key) - only ever
+     reassigned by opening a NEW frame. The survivors toggle's own handler
+     unconditionally does `if (lightboxNav) renderLightboxFrame()` to keep
+     an OPEN lightbox in sync when the visible frame set changes - but
+     with `lightboxNav` still truthy from an earlier, already-closed
+     viewing, this popped the lightbox back open on every toggle click.
+     Fixed by clearing `lightboxNav = null` in both close handlers.
+  8. **New feature - final cross-filter registration/alignment step**:
+     Chris: "the last step of a mono project should be a registration so
+     that when they get combined during post processing they're
+     aligned." New `app/ssf.py` function `render_register_finals()` +
+     template `templates/register_finals.ssf.j2`: gathers every distinct
+     filter's (or OSC exposure-group's) own FINAL stacked result
+     (`final_stack_paths()`, covering both multi-night merges and
+     single-night results, labeled via each night's own `night_filters`/
+     `night_exposures` meta), symlinks them into one small N-frame
+     sequence (named so Siril's own sequential numbering lands in a
+     KNOWN, predictable alphabetical-by-label order - needed to map each
+     aligned output back to its filter afterward), and runs Siril's
+     `register` (global star alignment) on that sequence alone - no
+     `stack` line after it, since `register` by itself already writes one
+     aligned `r_final_NNNNN.fit` per input frame, which is exactly N
+     pixel-aligned outputs, not one merged image. Reused the exact
+     scratch/sibling-input-dir pattern already established for dark
+     merging (the input dir is a SIBLING of the step's own `fresh_dir`,
+     not nested under it, for the identical reason: nesting it would get
+     wiped by `prepare_fresh_dirs()` right before the job runs).
+     `SirilStep` gained a `moves: list[tuple[Path,Path]]` field alongside
+     its existing singular `move`, since this step produces N outputs
+     that each need their own destination (`process/lights/
+     _aligned_finals/<label>.fit`) - `_run_steps()` in `main.py` now
+     applies both. New endpoints `/register-finals/render`+`/run`; new
+     `app/status.py` fields `final_results_count` (so the frontend knows
+     whether to offer this at all) and `aligned_finals` (the list of
+     already-aligned outputs, each downloadable). New Stack-step UI
+     section, hidden until 2+ final results exist. **Verified completely
+     end-to-end against 3 REAL stacked results already on disk (H/O/S from
+     earlier session testing)**: the job succeeded, all three aligned
+     outputs landed correctly labeled
+     (`process/lights/_aligned_finals/{H,O,S}.fit`), and the job log
+     confirms genuine star-based Global Star Alignment ran (2000 stars
+     matched per image) with real, non-trivial computed corrections (dx
+     up to 35px, small sub-degree rotations) - not a trivial no-op.
+  9. **"We need a way to grab project logs through the webui... add some
+     additional helpful logging"**: new `GET /projects/{name}/logs`
+     (lists every `<job_id>.log` under `project/logs/`, surviving a
+     server restart unlike the in-memory Job History list) and
+     `GET /projects/{name}/logs/download` (zips them all up at once - the
+     practical "send me the whole session's troubleshooting data in one
+     click" ask). New "📄 Project logs" panel in the UI alongside the
+     existing Job History button. Also added the requested extra
+     logging: every job log now starts with a header naming the job id,
+     kind, project, and steps (`app/jobs.py`'s new
+     `_write_log_header()`) - previously a handed-over log file had none
+     of that context baked in at all. Verified live: ran a real masters
+     job, confirmed the header appears correctly before Siril's own
+     output, confirmed the list+zip endpoints work against real project
+     logs.
+  10. Version bumped `0.5` → `0.6` (`app/config.py`).
+
+  All fixes verified against the real NorthAmericaNebula data and/or real
+  prior stacked results, not synthetic edge cases alone, per this
+  session's established practice.
 - ❌ **Crop is permanently out of scope**, not deferred — see Architecture
   decisions. Don't reopen this.
 - ❌ Archive/cleanup (the Endstate's last bullet) is explicitly deferred
