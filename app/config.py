@@ -23,7 +23,7 @@ from pathlib import Path
 # until Chris has run this in production long enough to trust it (his
 # call, not a date or feature checklist). Shown in the UI header and
 # from /health so a running container's version is always visible.
-VERSION = "0.5"
+VERSION = "0.6"
 
 SIRIL_BIN = os.environ.get("SIRIL_BIN", "/opt/siril/AppRun")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))

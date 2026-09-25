@@ -66,7 +66,21 @@ DEFAULT_THRESHOLD_SIGMA = 8.0  # multiples of background std, above the median
 # over-sensitive, not under: this recommends for human review, it
 # doesn't decide anything (see AnalyzeLightsRequest's docstring).
 ANOMALY_Z_THRESHOLD = 3.0
-_FLAGGABLE_METRICS = ("star_count", "fwhm", "roundness", "snr")
+# "background"/"background_std" added after a REAL bug: 4 genuinely
+# all-zero (corrupt-capture) frames at the tail of a real session were
+# marked "recommended accept" instead of flagged. They were never checked
+# at all before this - only star_count/fwhm/roundness/snr were - and the
+# one thing that WAS supposed to catch "nothing here" (star_count == 0,
+# see flag_anomalies() below) turned out to depend on IRAFStarFinder
+# behaving predictably when handed a threshold of exactly 0 against
+# all-zero data, which isn't a case it's designed for. See analyze_frame()
+# below, which now short-circuits before ever reaching the star finder
+# for a zero-variance frame, AND these two metrics now also participate
+# in the normal per-night z-score comparison - either one alone would
+# have caught it (background=0 is wildly off a real bias+dark ADU offset;
+# background_std=0 is wildly off real read noise), together they cover a
+# frame that's degenerate but not perfectly, exactly zero too.
+_FLAGGABLE_METRICS = ("star_count", "fwhm", "roundness", "snr", "background", "background_std")
 
 _FIT_SUFFIXES = {".fit", ".fits"}
 
@@ -145,6 +159,29 @@ def analyze_frame(
 
     binned = _bin_mean(data, bin_factor)
     _mean, median, std = sigma_clipped_stats(binned, sigma=3.0, maxiters=3)
+
+    # A frame with zero variance (every pixel identical - confirmed on
+    # real corrupt-capture data: all pixels literally 0) has no usable
+    # signal or noise to threshold against at all. IRAFStarFinder isn't
+    # designed for this case - a threshold of exactly `median + N*0`
+    # against already-zero-background data is undefined behavior, not
+    # guaranteed to cleanly report "0 stars found" the way a genuinely
+    # empty but noisy field would. Short-circuit here instead of handing
+    # it a degenerate threshold: star_count=0 is itself an unambiguous,
+    # unconditional flag (see flag_anomalies()), so this frame is
+    # guaranteed to be caught rather than depending on the star finder's
+    # unpredictable behavior on data it was never meant to see.
+    if std <= 0:
+        return FrameStats(
+            filename=path.name,
+            fwhm=None,
+            roundness=None,
+            star_count=0,
+            background=float(median),
+            background_std=float(std),
+            snr=None,
+            captured_at=captured_at,
+        )
 
     finder = IRAFStarFinder(
         threshold=median + threshold_sigma * std,

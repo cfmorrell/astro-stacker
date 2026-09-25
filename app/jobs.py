@@ -46,6 +46,27 @@ _PROGRESS_RE = re.compile(r"progress:.*?(\d+(?:\.\d+)?)\s*%\s*$")
 _COMMAND_RE = re.compile(r"log: Running command: (\S+)")
 
 
+def _write_log_header(log_path: Path, job_id: str, project: str, kind: str, steps: list[str]) -> None:
+    """Every job log now starts with a short header naming what was
+    actually being attempted - added per Chris: "if you want particular
+    data in those logs, you can add some additional helpful logging for
+    future troubleshooting." Siril's own log output (or a Python job's
+    progress messages) has never included this app-level context (which
+    project, which kind of job, which steps) at all, so a log file handed
+    over for troubleshooting previously needed the job id/project/steps
+    supplied separately alongside it, from whatever was showing in the UI
+    at the time - now it's self-contained.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"=== job {job_id} ({kind or 'job'}) - project {project!r} ===",
+        f"started: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
+    ]
+    if steps:
+        lines.append(f"steps: {', '.join(steps)}")
+    log_path.write_text("\n".join(lines) + "\n\n")
+
+
 @dataclass
 class Job:
     id: str
@@ -166,6 +187,7 @@ def create_multi_script_job(
     """
     job_id = uuid.uuid4().hex[:12]
     log_path = log_dir / f"{job_id}.log"
+    _write_log_header(log_path, job_id, project, kind, [s.label for s in steps])
     job = Job(
         id=job_id,
         workdir=steps[0].workdir if steps else log_dir,
@@ -200,9 +222,12 @@ def create_multi_script_job(
                         if m:
                             job.percent_complete = base + float(m.group(1)) / 100.0 * span
 
-                rc = siril_runner.run_script(
-                    step.script, step.workdir, log_path, on_line=on_line, append_log=(i > 0)
-                )
+                # Always append now - _write_log_header() already created/
+                # truncated the file with this job's header before any
+                # step ran (previously step 0 used append_log=False to be
+                # the one that creates the file; that job is now the
+                # header's).
+                rc = siril_runner.run_script(step.script, step.workdir, log_path, on_line=on_line, append_log=True)
                 if rc != 0:
                     with job._lock:
                         job.return_code = rc
@@ -253,14 +278,16 @@ def create_python_job(
     """
     job_id = uuid.uuid4().hex[:12]
     log_path = log_dir / f"{job_id}.log"
-    # siril_runner.run_script() does this itself for the Siril-based job
-    # types (create_job/create_multi_script_job) - this path has no
-    # subprocess to do it for us, so a project that goes straight from
-    # Stage to Review without ever building masters first (logs/ only
-    # ever gets created as a side effect of a Siril run) crashed here
-    # with a bare "No such file or directory" the first time /lights/
-    # analyze/run tried to open its log file.
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    # _write_log_header() creates the parent dir itself - previously a
+    # separate mkdir lived here specifically because siril_runner.
+    # run_script() does this itself for the Siril-based job types
+    # (create_job/create_multi_script_job) but this path has no subprocess
+    # to do it for us, so a project that goes straight from Stage to
+    # Review without ever building masters first (logs/ only ever got
+    # created as a side effect of a Siril run) crashed here with a bare
+    # "No such file or directory" the first time /lights/analyze/run
+    # tried to open its log file.
+    _write_log_header(log_path, job_id, project, kind, [])
     job = Job(id=job_id, workdir=workdir or log_dir, log_path=log_path, project=project, kind=kind)
     with _registry_lock:
         _jobs[job_id] = job

@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import re
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -105,6 +105,12 @@ class SirilStep:
     # moving to its stable path so a later flat-build step can reference
     # it there. See Handoff.md gotcha #6.
     move: Optional[tuple[Path, Path]] = None
+    # Same idea as `move`, for a step that produces several output files
+    # at once that each need their own destination (e.g.
+    # render_register_finals() below, one aligned result per filter) -
+    # `move` and `moves` aren't mutually exclusive, both are applied if
+    # both are given.
+    moves: list[tuple[Path, Path]] = field(default_factory=list)
 
 
 def apply_light_selections(selections: list[LightSelection]) -> None:
@@ -626,3 +632,132 @@ def render_stack_lights(
         steps.append(SirilStep(script=text, workdir=only, label="register+stack"))
 
     return steps, nights, selections, output_name
+
+
+def final_stack_paths(project: Path) -> dict[str, Path]:
+    """Every FINAL stacked result currently on disk for this project, one
+    per filter (or OSC exposure-group, or a single unlabeled result for a
+    plain one-group OSC project) - regardless of whether it came from a
+    multi-night merge (`merged_result_filenames` meta) or stayed a single
+    night (`night_result_filenames` meta, labeled via that night's own
+    `night_filters`/`night_exposures` meta since a raw night name isn't
+    itself a filter/exposure label). Used by render_register_finals() to
+    gather what to align against each other - a mono project spanning
+    several nights per filter will only ever have merged results; a
+    project with some genuinely single-night filters can still have both.
+    """
+    meta = config.read_project_meta(project)
+    process = project / "process"
+    results: dict[str, Path] = {}
+
+    merged_filenames: dict = meta.get("merged_result_filenames", {})
+    if "merged_result_filename" in meta and "" not in merged_filenames:
+        merged_filenames[""] = meta["merged_result_filename"]
+    for merge_key, filename in merged_filenames.items():
+        merge_dir_name = f"_merged_{merge_key}" if merge_key else "_merged"
+        candidate = process / "lights" / merge_dir_name / filename
+        if candidate.exists():
+            results[merge_key or "result"] = candidate
+
+    night_filenames: dict = meta.get("night_result_filenames", {})
+    night_filters: dict = meta.get("night_filters", {})
+    night_exposures: dict = meta.get("night_exposures", {})
+    for night_name, filename in night_filenames.items():
+        label = night_filters.get(night_name) or (
+            f"{night_exposures[night_name]:g}s" if night_exposures.get(night_name) is not None else night_name
+        )
+        if label in results:
+            continue  # a merged result already covers this same label
+        candidate = process / "nights" / night_name / "lights" / filename
+        if candidate.exists():
+            results[label] = candidate
+
+    return results
+
+
+@dataclass
+class RegisterFinalsInput:
+    """Populates a register-finals step's input sequence dir with every
+    final stacked result symlinked in, named so `convert`'s own
+    sequential numbering lands in a KNOWN, predictable order (alphabetical
+    by label) - needed to map each aligned r_final_NNNNN.fit output back
+    to which filter/group it actually is afterward (see
+    render_register_finals()'s `moves`). Same render/apply split as
+    LightSelection/DarkMergeInput: applied by
+    apply_register_finals_input() right before a job runs, never inside
+    render_register_finals(), which stays a side-effect-free dry run.
+    """
+
+    labels: list[str]  # sorted - same order source_paths and the numbered sequence follow
+    source_paths: list[Path]  # same order as labels
+    dest_dir: Path
+
+
+def apply_register_finals_input(rfi: RegisterFinalsInput) -> None:
+    if rfi.dest_dir.exists():
+        shutil.rmtree(rfi.dest_dir)
+    rfi.dest_dir.mkdir(parents=True, exist_ok=True)
+    for i, source in enumerate(rfi.source_paths):
+        link = rfi.dest_dir / f"{i + 1:02d}_{rfi.labels[i]}{source.suffix}"
+        link.symlink_to(source.resolve())
+
+
+def render_register_finals(project: Path) -> tuple[list[SirilStep], RegisterFinalsInput]:
+    """The last step of a multi-filter (or multi-exposure-group) project:
+    registers every filter's own final stacked result against every OTHER
+    filter's, so they come out of this pixel-aligned - ready to combine as
+    channels in external post-processing (e.g. PixInsight) without a
+    separate manual alignment pass there. Chris: "the last step of a
+    mono project should be a registration so that when they get combined
+    during post processing they're aligned."
+
+    Needs at least 2 final results (see final_stack_paths()) - nothing to
+    align a single result against. Also returns the RegisterFinalsInput
+    the caller must apply (apply_register_finals_input()) before actually
+    running the returned steps - same render/apply split as
+    render_stack_lights()'s LightSelections; this function itself stays a
+    side-effect-free dry run (so /register-finals/render can preview it
+    without touching disk).
+
+    input_dir is deliberately a SIBLING of the step's own scratch dir
+    (`process/_build/register_finals_input`, not nested under
+    `process/_build/register_finals`) - the scratch dir is this step's
+    `fresh_dir`, wiped by prepare_fresh_dirs() right before the job runs,
+    which would otherwise delete the symlinked input out from under
+    itself (the exact same footgun already solved for dark merging - see
+    render_build_masters()'s own DarkMergeInput).
+    """
+    process = project / "process"
+    build_root = process / "_build"
+    results = final_stack_paths(project)
+    if len(results) < 2:
+        raise ValueError(
+            f"need at least 2 final stacked results to register against each other (found {len(results)}) "
+            "- stack every filter/group first"
+        )
+
+    labels = sorted(results.keys())
+    source_paths = [results[label] for label in labels]
+
+    scratch = build_root / "register_finals"
+    input_dir = build_root / "register_finals_input"
+    rfi = RegisterFinalsInput(labels=labels, source_paths=source_paths, dest_dir=input_dir)
+
+    text = _env.get_template("register_finals.ssf.j2").render(
+        input_dir=str(input_dir),
+        scratch_dir=str(scratch),
+    )
+
+    aligned_dir = process / "lights" / "_aligned_finals"
+    moves = [(scratch / f"r_final_{i + 1:05d}.fit", aligned_dir / f"{label}.fit") for i, label in enumerate(labels)]
+
+    steps = [
+        SirilStep(
+            script=text,
+            workdir=scratch,
+            label="register final results",
+            fresh_dir=scratch,
+            moves=moves,
+        )
+    ]
+    return steps, rfi

@@ -9,7 +9,9 @@ spirit to Siril's own OSC Multi-Night Stacking tool. See Handoff.md.
 
 from __future__ import annotations
 
+import io
 import shutil
+import zipfile
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -104,6 +106,31 @@ def delete_night(name: str, night: str):
     return {"deleted": night}
 
 
+@app.delete("/projects/{name}/biases")
+def delete_biases(name: str):
+    """Remove staged biases (raw/biases) and any already-built master bias
+    (process/master_bias.fit) - not the whole project. Mirrors
+    delete_night()'s "remove and re-stage" pattern, for the one other
+    calibration-frame type that previously had no way back to "nothing
+    selected" once staged (Chris: the "Currently staged groups" panel
+    "doesn't show and can't remove staged bias frames" - darks/flats
+    already had this via delete_night(), biases had no equivalent at all).
+    A dark/flat build that referenced the now-gone master bias becomes
+    stale, same as delete_night()'s own note about a merged stack going
+    stale after removing a night - nothing here tries to detect or clean
+    that up either.
+    """
+    project = _project_or_404(name)
+    raw_biases = project / "raw" / "biases"
+    if not raw_biases.is_dir():
+        raise HTTPException(status_code=404, detail="no biases staged for this project")
+    shutil.rmtree(raw_biases)
+    master_bias = project / "process" / "master_bias.fit"
+    if master_bias.exists():
+        master_bias.unlink()
+    return {"deleted": "biases"}
+
+
 @app.get("/projects/{name}/status")
 def project_status(name: str):
     project = _project_or_404(name)
@@ -180,6 +207,14 @@ def browse_captures(path: str = ""):
         # into one row per filter.
         "detected_exposures": frameinfo.detect_exposures(fit_names),
         "exposure_counts": frameinfo.count_exposures(fit_names),
+        # Each filter's OWN dominant exposure (e.g. {"H": 300.0, "L":
+        # 180.0}) - a mono folder mixing filters that use different
+        # exposures can have no single dominant exposure across ALL files
+        # at once (see frameinfo.detect_exposure_by_filter()'s docstring),
+        # even though each filter's own subset is perfectly unambiguous.
+        # Lets a filter-locked Stage row show/use ITS OWN true exposure
+        # instead of falling back to that ambiguous whole-folder answer.
+        "filter_exposures": frameinfo.detect_exposure_by_filter(fit_names),
         "sample_date_obs": sample["date_obs"],
         "sample_instrument": sample["instrument"],
     }
@@ -290,6 +325,54 @@ def project_download(name: str, path: str):
     return FileResponse(candidate, media_type="application/octet-stream", filename=candidate.name)
 
 
+@app.get("/projects/{name}/logs")
+def list_project_logs(name: str):
+    """List every job log file under this project's logs/ dir (newest
+    first) - one <job_id>.log per job (see app/jobs.py's
+    _write_log_header()/create_multi_script_job()/create_python_job()),
+    covering EVERY job ever run against this project, not just the
+    currently in-memory-tracked ones (the in-memory job registry is lost
+    on server restart, per app/jobs.py's own docstring, but these files
+    on disk survive it). Chris: "we need a way to grab project logs
+    through the webui" - this backs a UI listing so an individual log can
+    be fetched via the EXISTING /projects/{name}/download?path=logs/<file>
+    endpoint (already generic enough for any project-relative file), or
+    the whole set via /projects/{name}/logs/download below.
+    """
+    project = _project_or_404(name)
+    logs_dir = project / "logs"
+    if not logs_dir.is_dir():
+        return {"logs": []}
+    files = sorted(logs_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return {
+        "logs": [
+            {"name": p.name, "size": p.stat().st_size, "mtime": p.stat().st_mtime}
+            for p in files
+        ]
+    }
+
+
+@app.get("/projects/{name}/logs/download")
+def download_project_logs(name: str):
+    """Every job log for this project, zipped up as one download - the
+    practical way to "give you troubleshooting data" for a whole session's
+    worth of jobs at once rather than fetching them one at a time.
+    """
+    project = _project_or_404(name)
+    logs_dir = project / "logs"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        if logs_dir.is_dir():
+            for p in sorted(logs_dir.glob("*.log")):
+                zf.write(p, arcname=p.name)
+    buf.seek(0)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{name}-logs.zip"'},
+    )
+
+
 @app.post("/projects/{name}/stage")
 def stage_project(name: str, req: StageProjectRequest | None = None):
     """Symlink raw frames from CAPTURES_DIR into this project's raw/ tree,
@@ -343,17 +426,24 @@ def _reject_if_job_running(name: str) -> None:
 
 
 def _run_steps(steps: list[ssf.SirilStep], project: Path, name: str, kind: str) -> dict:
-    """Wipe each step's fresh_dir, wire up its move (if any), and hand the
-    whole list to jobs.create_multi_script_job() — one subprocess per
+    """Wipe each step's fresh_dir, wire up its move(s) (if any), and hand
+    the whole list to jobs.create_multi_script_job() — one subprocess per
     step, in order (Handoff.md gotcha #8).
     """
     ssf.prepare_fresh_dirs([s.fresh_dir for s in steps if s.fresh_dir is not None])
+
+    def _on_success(s: ssf.SirilStep):
+        if s.move:
+            ssf.perform_move(s.move)
+        for mv in s.moves:
+            ssf.perform_move(mv)
+
     job_steps = [
         jobs.ScriptStep(
             script=s.script,
             workdir=s.workdir,
             label=s.label,
-            on_success=(lambda move=s.move: ssf.perform_move(move)) if s.move else None,
+            on_success=(lambda s=s: _on_success(s)) if (s.move or s.moves) else None,
         )
         for s in steps
     ]
@@ -427,6 +517,38 @@ def run_stack(name: str, req: StackLightsRequest):
         meta.setdefault("night_result_filenames", {})[nights[0]["key"]] = f"{output_name}.fit"
     config.write_project_meta(project, meta)
     return _run_steps(steps, project, name, "stack")
+
+
+@app.post("/projects/{name}/register-finals/render", response_class=PlainTextResponse)
+def render_register_finals(name: str):
+    """Dry-run preview of the final cross-filter/exposure-group alignment
+    step (see ssf.render_register_finals()) - needs at least 2 already-
+    stacked final results to do anything meaningful.
+    """
+    project = _project_or_404(name)
+    try:
+        steps, _rfi = ssf.render_register_finals(project)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _render_steps_text(steps)
+
+
+@app.post("/projects/{name}/register-finals/run")
+def run_register_finals(name: str):
+    """Registers every one of this project's final per-filter (or, for
+    OSC, per-exposure-group) stacked results against each other, so
+    they're pixel-aligned for combining as channels in external post-
+    processing - the last step of a multi-filter mono project. See
+    ssf.render_register_finals().
+    """
+    project = _project_or_404(name)
+    _reject_if_job_running(name)
+    try:
+        steps, rfi = ssf.render_register_finals(project)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    ssf.apply_register_finals_input(rfi)
+    return _run_steps(steps, project, name, "register-finals")
 
 
 @app.post("/projects/{name}/lights/analyze/render")

@@ -155,3 +155,28 @@ def count_exposures(filenames: list[str]) -> dict[float, int]:
             key = round(s, 3)
             counts[key] = counts.get(key, 0) + 1
     return counts
+
+
+def detect_exposure_by_filter(filenames: list[str]) -> dict[str, float | None]:
+    """Each detected filter's OWN dominant exposure length, computed
+    independently per filter rather than across the whole mixed folder at
+    once - a REAL bug this fixes: a folder mixing filters that
+    legitimately use DIFFERENT exposures (e.g. narrowband H/O/S at 300s,
+    L at 180s in the same "Light" folder) can easily have no single
+    dominant exposure across ALL files combined (confirmed on real data:
+    300s covered 59/69 = 85.5% of files, just under detect_exposure_
+    seconds()'s 90% threshold), even though each individual filter's own
+    subset is perfectly unambiguous (H/O/S are each 100% 300s; L is 100%
+    180s). Without this, a filter-locked group falls back to
+    detect_exposure_seconds()'s ambiguous (None) whole-folder answer,
+    which broke the darks/lights exposure-mismatch warning, the darks
+    cross-row auto-fill (both keyed on "this group's own light
+    exposure"), and the frame-count summary's exposure display - all
+    three confirmed as one root cause, not three separate bugs.
+    """
+    by_filter: dict[str, list[str]] = {}
+    for name in filenames:
+        f = parse_filter(name)
+        if f is not None:
+            by_filter.setdefault(f, []).append(name)
+    return {f: detect_exposure_seconds(names) for f, names in by_filter.items()}

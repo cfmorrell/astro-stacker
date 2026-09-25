@@ -117,11 +117,25 @@ def project_status(project: Path) -> dict:
         if (project / merged_rel).exists():
             merged_results.append({"filter": merge_key or None, "path": merged_rel})
 
+    # How many distinct final stacked results (one per filter, or OSC
+    # exposure-group) currently exist - the Stack step's own "Align final
+    # results" action (see app/ssf.py's render_register_finals()) needs at
+    # least 2 to do anything, so the frontend uses this to know whether to
+    # offer it at all rather than the user hitting a 400 first.
+    final_results_count = len(ssf.final_stack_paths(project))
+    aligned_finals = []
+    aligned_dir = process / "lights" / "_aligned_finals"
+    if aligned_dir.is_dir():
+        for p in sorted(aligned_dir.glob("*.fit")):
+            aligned_finals.append({"label": p.stem, "path": str(p.relative_to(project))})
+
     return {
         "biases_count": _count_fits(raw / "biases"),
         "master_bias_built": _master_exists(process / "master_bias"),
         "nights": nights,
         "merged_results": merged_results,
+        "final_results_count": final_results_count,
+        "aligned_finals": aligned_finals,
         # Defaults True (matches StackLightsRequest.is_osc's own default)
         # for projects staged before this setting existed.
         "is_osc": meta.get("is_osc", True),
