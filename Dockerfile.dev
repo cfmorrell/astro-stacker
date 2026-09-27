@@ -1,29 +1,21 @@
 # syntax=docker/dockerfile:1
 #
 # Dev image: Python + Siril CLI + FastAPI (app/).
-# Build once, then `docker exec` into a long-running container. Run the API
-# with: cd /app && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-# (add -p 8000:8000 to the `docker run` below to reach it from outside).
+# CMD runs `uvicorn --reload` directly (see bottom of this file) so the
+# container is a self-starting, always-on dev server once built — no manual
+# `docker exec` step needed to bring the app up. /app is bind-mounted over
+# the code baked in at build time, so edits made on the host take effect
+# immediately via --reload.
 #
-# Build:
-#   docker build -t siril-web-dev -f Dockerfile.dev .
+# Build + run: see run-dev.sh at the repo root (also handles rebuild/restart
+# on UnRAID). It publishes -p 8083:8000 with --restart unless-stopped, which
+# NPM proxies at astro-stacker-dev.cfmorrell.com (see docs/DEPLOY.md) — reach
+# it directly, no SSH tunnel needed.
 #
-# Run (long-lived, so ad hoc `pip install`s survive between sessions).
-# Matches the actual running container (astro-stacker-dev) per Handoff.md's
-# "Environment / paths" section:
-#   docker run -d --name astro-stacker-dev \
-#     -v /mnt/user/docker_appdata/astro-stacker/src:/app \
-#     -v /mnt/user/Astronomy/013-Astro-Stacker-Processing:/captures:ro \
-#     -v /mnt/user/docker_appdata/astro-stacker/data:/data \
-#     -p 8000:8000 \
-#     astro-stacker-dev tail -f /dev/null
-#
-# Then to get a shell (the `astro-stacker` SSH alias does this automatically):
+# For a shell alongside the running server (ad hoc `pip install`s persist in
+# this long-lived container until it's rebuilt):
 #   docker exec -it astro-stacker-dev bash
-#
-# And to resume after a reboot (data/installs on the image/volumes persist,
-# this just restarts the same container):
-#   docker start siril-web-dev
+# (the `astro-stacker` SSH alias does this automatically)
 
 FROM debian:bookworm-slim
 
@@ -75,4 +67,6 @@ WORKDIR /app
 COPY requirements.txt /tmp/requirements.txt
 RUN pip3 install --break-system-packages --no-cache-dir -r /tmp/requirements.txt
 
-CMD ["bash"]
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

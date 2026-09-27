@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<!-- UnRAID template for astro-stacker (docs/DEPLOY.md). Install: copy to
+     /boot/config/plugins/dockerMan/templates-user/my-AstroStacker.xml, then Docker > Add Container > Template. -->
+<Container version="2">
+  <Name>AstroStacker</Name>
+  <Repository>ghcr.io/cfmorrell/astro-stacker:latest</Repository>
+  <Registry>https://github.com/cfmorrell/astro-stacker/pkgs/container/astro-stacker</Registry>
+  <Network>bridge</Network>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/cfmorrell/astro-stacker</Support>
+  <Project>https://github.com/cfmorrell/astro-stacker</Project>
+  <Overview>Calibrates, registers, and stacks .fits light frames with Siril, run as a self-hosted web app against light/dark/flat/bias frames on a NAS share. Point it at a night (or several), review frame quality with a human in the loop, and get back a stacked .fit file.</Overview>
+  <Category>Tools: MediaApp:Photos</Category>
+  <WebUI>http://[IP]:[PORT:8000]/</WebUI>
+  <Icon/>
+  <ExtraParams/>
+  <DateInstalled/>
+  <Config Name="Web UI port" Target="8000" Default="8084" Mode="tcp" Description="Port for the web app." Type="Port" Display="always" Required="true" Mask="false">8084</Config>
+  <Config Name="Captures" Target="/captures" Default="/mnt/user/Astronomy" Mode="ro" Description="Read-only source of raw light/dark/flat/bias frames." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/Astronomy</Config>
+  <Config Name="Data" Target="/data" Default="/mnt/user/docker_appdata/astrostacker/data" Mode="rw" Description="Per-project working directories (staged frames, masters, stacked results)." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/docker_appdata/astrostacker/data</Config>
+</Container>

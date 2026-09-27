@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 #
 # Production image: Python + Siril CLI + FastAPI (app/), self-contained.
-# Unlike Dockerfile.dev (bind-mounted /app, `uvicorn --reload`, long-lived
-# `docker exec` workflow), this COPIES the app code into the image and runs
+# Unlike Dockerfile.dev (bind-mounted /app, `uvicorn --reload`, edits take
+# effect immediately), this COPIES the app code into the image and runs
 # uvicorn directly with no reload — a new build is required to pick up code
 # changes, which is the point for something meant to run unattended.
 #

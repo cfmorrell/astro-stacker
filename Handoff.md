@@ -248,11 +248,21 @@ post-processing elsewhere.
 - Captures test data: `/mnt/user/Astronomy/013-Astro-Stacker-Processing`
   (separate from astrolab's own capture folder, deliberately, so the two
   projects don't collide) — mounted `:ro` at `/captures`.
-- Dev container: `astro-stacker-dev`, long-lived (`docker run -d ... tail -f
-  /dev/null`), not `--rm`. SSH alias `astro-stacker` drops straight into a
-  shell in it (`RemoteCommand docker exec -it astro-stacker-dev bash`).
-- Dockerfile changes need `docker build` + `stop`/`rm`/`run` to take effect.
-  Changes under `src/` (bind-mounted) are live immediately, no rebuild.
+- Dev container: `astro-stacker-dev`, long-lived, `--restart unless-stopped`,
+  CMD is `uvicorn --reload` (self-starting — see Dockerfile.dev). Published
+  at `8083:8000`; NPM proxies `astro-stacker-dev.cfmorrell.com` to
+  `192.168.1.4:8083`, so **the web UI is reached directly by domain/IP, no
+  SSH tunnel** (this replaced the old `ssh -L 8000:172.17.0.x:8000` tunnel
+  workflow — see docs/DEPLOY.md). SSH alias `astro-stacker` still drops
+  straight into a shell in it for ad hoc debugging (`RemoteCommand docker
+  exec -it astro-stacker-dev bash`); rebuild/recreate via `run-dev.sh` at
+  the repo root, not by hand.
+- Dockerfile.dev changes (OS-level deps, etc.) need `run-dev.sh` (rebuild +
+  recreate) to take effect. Changes under `src/` (bind-mounted at `/app`)
+  are live immediately via `--reload`, no rebuild.
+- Production container `AstroStacker` (published GHCR image, no bind mount)
+  runs alongside on port 8084 — see docs/DEPLOY.md for both containers'
+  full mount tables and the checked-in `deploy/` scaffolding.
 
 ## Siril gotchas discovered the hard way (do not rediscover these)
 1. **`$SIRIL_BIN` alone launches the GUI, not the CLI**, and fails
