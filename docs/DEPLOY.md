@@ -5,6 +5,19 @@ a **dev** container (this repo bind-mounted, live-reload) and a **prod**
 container (a published image, no bind mount). Both are repo-tracked so the
 repo stays the source of truth instead of UnRAID's auto-generated templates.
 
+**Both are pinned to `--cpuset-cpus=6-19`**, baked into `run-dev.sh` and
+`deploy/run.sh` directly — Siril saturates every core it can see during a
+stack, and cores 0-5 are reserved for a pihole VM on this box (see
+Handoff.md's incident log). This is a hard requirement of *how these
+containers are created*, not an UnRAID GUI setting: a container (re)created
+by a raw `docker run` (which is what both scripts do) doesn't inherit
+whatever pinning UnRAID's GUI has configured elsewhere — it only gets a
+cpuset if the `docker run` command itself requests one. Override with
+`CPUSET_CPUS=<range> ./run-dev.sh` (or `deploy/run.sh`) if the reserved
+range ever needs to change — re-check `lscpu -e` first if the CPU itself
+changes, to make sure the new range doesn't share hyperthread siblings with
+whatever else is pinned.
+
 ## Dev — `astro-stacker-dev`
 
 Built locally from `Dockerfile.dev`, source bind-mounted at `/app` so edits

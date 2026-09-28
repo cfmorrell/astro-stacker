@@ -263,6 +263,33 @@ post-processing elsewhere.
 - Production container `AstroStacker` (published GHCR image, no bind mount)
   runs alongside on port 8084 — see docs/DEPLOY.md for both containers'
   full mount tables and the checked-in `deploy/` scaffolding.
+- **Both containers are pinned to `--cpuset-cpus=6-19`** (baked into
+  run-dev.sh / deploy/run.sh, not just an UnRAID GUI setting — GUI-level
+  pinning doesn't apply to a container (re)created by a raw `docker run` in
+  these scripts, which is exactly how `astro-stacker-dev` ended up
+  unpinned once before, see the gotcha below). Cores 0-5 are reserved for
+  Chris's pihole VM. On this box's i5-14600K (`lscpu -e`), cores 0-5 are
+  the 3 physical P-cores at HT thread pairs `(0,1)(2,3)(4,5)` — 6-19 is a
+  clean boundary (3 more P-cores fully + all 8 E-cores), no shared
+  hyperthread siblings with the VM's range. If the physical CPU on this
+  box ever changes, re-verify with `lscpu -e` before assuming 6-19 is
+  still safe — don't just copy the number over.
+
+## Incidents (keep entries even after fixed — context for why things are the way they are)
+1. **2026-09-27: a stack run pegged all 20 threads and crashed Chris's
+   pihole VM (pinned to cores 0-5), taking down DNS network-wide.** Root
+   cause: `astro-stacker-dev` had **no** `--cpuset-cpus` at all
+   (`docker inspect` showed `CpusetCpus=[]`) — the container had just been
+   recreated (the astro-stacker-dev.cfmorrell.com/port-8083 migration) via
+   a plain `docker run` in run-dev.sh that never requested a cpuset, so
+   whatever pinning intent existed in UnRAID's GUI never reached this
+   specific container. `AstroStacker` (prod) already had the correct
+   `6-19` cpuset from being set up through the UnRAID GUI at some point —
+   proof the mechanism itself works, just not for containers this repo's
+   own scripts create directly. Fixed by baking `--cpuset-cpus=6-19` into
+   both run-dev.sh and deploy/run.sh (see above) so it's enforced on every
+   (re)build, not dependent on a UI setting surviving a script-driven
+   recreation.
 
 ## Siril gotchas discovered the hard way (do not rediscover these)
 1. **`$SIRIL_BIN` alone launches the GUI, not the CLI**, and fails

@@ -15,6 +15,11 @@
   <Icon/>
   <ExtraParams/>
   <DateInstalled/>
+  <CPUset>6-19</CPUset>
+  <!-- Reserves cores 0-5 for a pihole VM on this box — Siril saturates every
+       core it can see during a stack. Keep in sync with run-dev.sh /
+       deploy/run.sh's own --cpuset-cpus, and re-check `lscpu -e` before
+       reusing this range on different hardware (see Handoff.md). -->
   <Config Name="Web UI port" Target="8000" Default="8084" Mode="tcp" Description="Port for the web app." Type="Port" Display="always" Required="true" Mask="false">8084</Config>
   <Config Name="Captures" Target="/captures" Default="/mnt/user/Astronomy" Mode="ro" Description="Read-only source of raw light/dark/flat/bias frames." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/Astronomy</Config>
   <Config Name="Data" Target="/data" Default="/mnt/user/docker_appdata/astrostacker/data" Mode="rw" Description="Per-project working directories (staged frames, masters, stacked results)." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/docker_appdata/astrostacker/data</Config>
