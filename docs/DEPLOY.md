@@ -18,6 +18,18 @@ range ever needs to change — re-check `lscpu -e` first if the CPU itself
 changes, to make sure the new range doesn't share hyperthread siblings with
 whatever else is pinned.
 
+**Both are also capped at `--memory=40g --memory-swap=40g`.** cpuset alone
+isn't enough — a large multi-night/drizzle stack can grow past 40GB of RAM,
+and this host has no swap configured, so an uncapped container's memory
+growth triggers a system-wide OOM kill that can claim *any* process on the
+box, VM included, not just the offending one (see Handoff.md's incident
+log). The cap scopes an OOM to the container's own cgroup instead. Override
+with `MEMORY_LIMIT=<size> ./run-dev.sh` (or `deploy/run.sh`) — leave enough
+headroom for the VM's own max memory plus host/array overhead when raising
+it, and expect a legitimately huge stack to fail with an OOM inside the
+container if it needs more than the cap (split it into fewer nights, or
+drop drizzle, rather than just raising the number).
+
 ## Dev — `astro-stacker-dev`
 
 Built locally from `Dockerfile.dev`, source bind-mounted at `/app` so edits

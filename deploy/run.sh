@@ -9,12 +9,17 @@ DATA_DIR=${DATA_DIR:-/mnt/user/docker_appdata/astrostacker/data}
 # see run-dev.sh for why this exact range and Handoff.md's "pihole VM
 # starved during a stack" gotcha. Must match run-dev.sh's own pinning.
 CPUSET_CPUS=${CPUSET_CPUS:-6-19}
+# Caps container RAM so a runaway stack OOMs inside its own cgroup instead
+# of triggering a system-wide OOM that can kill anything on the box,
+# including the VM — see run-dev.sh for the full rationale and sizing.
+MEMORY_LIMIT=${MEMORY_LIMIT:-40g}
 
 mkdir -p "$DATA_DIR"
 docker pull "$IMAGE"
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 docker run -d --name "$NAME" --restart unless-stopped \
   --cpuset-cpus="$CPUSET_CPUS" \
+  --memory="$MEMORY_LIMIT" --memory-swap="$MEMORY_LIMIT" \
   -v /mnt/user/Astronomy:/captures:ro \
   -v "$DATA_DIR":/data \
   -p "$PORT":8000 \

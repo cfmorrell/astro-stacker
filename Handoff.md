@@ -267,29 +267,60 @@ post-processing elsewhere.
   run-dev.sh / deploy/run.sh, not just an UnRAID GUI setting — GUI-level
   pinning doesn't apply to a container (re)created by a raw `docker run` in
   these scripts, which is exactly how `astro-stacker-dev` ended up
-  unpinned once before, see the gotcha below). Cores 0-5 are reserved for
-  Chris's pihole VM. On this box's i5-14600K (`lscpu -e`), cores 0-5 are
-  the 3 physical P-cores at HT thread pairs `(0,1)(2,3)(4,5)` — 6-19 is a
-  clean boundary (3 more P-cores fully + all 8 E-cores), no shared
-  hyperthread siblings with the VM's range. If the physical CPU on this
-  box ever changes, re-verify with `lscpu -e` before assuming 6-19 is
-  still safe — don't just copy the number over.
+  unpinned once before, see incident #1 below). Cores 0-5 are reserved for
+  Chris's `Home-Linux-VM` (runs pihole). On this box's i5-14600K
+  (`lscpu -e`), cores 0-5 are the 3 physical P-cores at HT thread pairs
+  `(0,1)(2,3)(4,5)` — 6-19 is a clean boundary (3 more P-cores fully + all
+  8 E-cores), no shared hyperthread siblings with the VM's range.
+  Confirmed via `virsh vcpuinfo` that the VM's own pinning is real at the
+  hypervisor level too (each of its 6 vCPUs affined 1:1 to host cores
+  0-5) — this part was never the problem, see incident #2. If the
+  physical CPU on this box ever changes, re-verify with `lscpu -e` before
+  assuming 6-19 is still safe — don't just copy the number over.
+- **Both containers are capped at `--memory=40g --memory-swap=40g`**
+  (also baked into run-dev.sh / deploy/run.sh) — this host has zero swap
+  configured (`swapon --show` empty) and 62GiB total RAM; the VM above
+  maxes out at 11.5GB. 40GB leaves ~22GB for the VM + host/array overhead
+  even if both containers somehow peaked at once (Chris confirmed he's not
+  concerned about that case). `--memory-swap` set equal to `--memory`
+  disables swap for the container entirely (moot here since there is none
+  anyway) so a runaway process is killed *inside its own cgroup* instead
+  of triggering a global OOM — see incident #2. A legitimately huge
+  multi-night/drizzle stack that wants more than 40GB will now fail with
+  an OOM inside the container rather than threaten anything else; the fix
+  there is to split it into fewer nights or drop drizzle, not raise the
+  cap without also reconsidering the VM's headroom.
 
 ## Incidents (keep entries even after fixed — context for why things are the way they are)
-1. **2026-09-27: a stack run pegged all 20 threads and crashed Chris's
-   pihole VM (pinned to cores 0-5), taking down DNS network-wide.** Root
-   cause: `astro-stacker-dev` had **no** `--cpuset-cpus` at all
-   (`docker inspect` showed `CpusetCpus=[]`) — the container had just been
-   recreated (the astro-stacker-dev.cfmorrell.com/port-8083 migration) via
-   a plain `docker run` in run-dev.sh that never requested a cpuset, so
-   whatever pinning intent existed in UnRAID's GUI never reached this
-   specific container. `AstroStacker` (prod) already had the correct
-   `6-19` cpuset from being set up through the UnRAID GUI at some point —
-   proof the mechanism itself works, just not for containers this repo's
-   own scripts create directly. Fixed by baking `--cpuset-cpus=6-19` into
-   both run-dev.sh and deploy/run.sh (see above) so it's enforced on every
-   (re)build, not dependent on a UI setting surviving a script-driven
-   recreation.
+1. **2026-09-27: a stack run pegged all 20 threads; suspected cause of a
+   VM crash that took down DNS network-wide.** `astro-stacker-dev` had
+   **no** `--cpuset-cpus` at all (`docker inspect` showed `CpusetCpus=[]`)
+   — the container had just been recreated (the
+   astro-stacker-dev.cfmorrell.com/port-8083 migration) via a plain
+   `docker run` in run-dev.sh that never requested a cpuset. Fixed by
+   baking `--cpuset-cpus=6-19` into both run-dev.sh and deploy/run.sh.
+   **This turned out not to be the actual root cause of the VM crash Chris
+   had seen** — see incident #2 — but was a real, separately-worth-fixing
+   gap (the dev container had zero CPU isolation from the VM at all).
+2. **2026-09-28: confirmed the VM crash actually happened on `AstroStacker`
+   (prod), which already had correct `6-19` cpuset pinning at the time** —
+   proving incident #1's fix, while a legitimate gap, wasn't sufficient.
+   Investigated further: `virsh vcpuinfo` confirmed the VM's CPU pinning
+   *is* real and enforced at the hypervisor level (not the problem), but
+   `dmesg` showed three separate **system-wide** OOM-kill events that same
+   morning (`constraint=CONSTRAINT_NONE, global_oom`), each reaping a
+   `task_memcg=/docker/...` process that had grown to ~40GB resident —
+   this host has 62GiB RAM and **zero swap**, and neither container had a
+   memory limit (`Memory=0`). `cpuset` only constrains which CPUs a
+   process can run on; it does nothing to bound memory. A process
+   ballooning past available system RAM with no swap cushion and no
+   per-container cap triggers a *global* OOM kill, which picks a victim by
+   score across every process on the box — VM included, and which one
+   gets picked isn't something cpuset (or anything short of a memory cap)
+   controls. Fixed by adding `--memory=40g --memory-swap=40g` to both
+   run-dev.sh and deploy/run.sh (see above) — this is the fix that
+   actually addresses the reported crash; incident #1's cpuset fix stays
+   in place as a legitimate, independent improvement.
 
 ## Siril gotchas discovered the hard way (do not rediscover these)
 1. **`$SIRIL_BIN` alone launches the GUI, not the CLI**, and fails

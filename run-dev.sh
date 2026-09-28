@@ -10,15 +10,27 @@
 # else (3 more P-cores fully + all 8 E-cores) — a clean split with no
 # shared hyperthread siblings, confirmed via `lscpu -e` on this box's
 # i5-14600K. Must match AstroStacker prod's own pinning (deploy/run.sh).
+#
+# MEMORY_LIMIT: a big multi-night/drizzle stack can balloon Siril's RAM use
+# past 40GB, and this host has zero swap configured — with no cap, that
+# triggers a SYSTEM-WIDE OOM kill (Linux picks a victim by score across
+# every process on the box, VM included) rather than one scoped to this
+# container. 40g leaves ~22GB of the box's 62GiB for the VM (11.5GB max)
+# and host/array overhead. --memory-swap set equal to --memory disables
+# swap for the container entirely (there is none to give it anyway) so a
+# runaway job gets killed inside its own cgroup instead of taking the VM
+# down with it. See Handoff.md's incident log (2026-09-28).
 set -euo pipefail
 BASE=/mnt/user/docker_appdata/astro-stacker
 NAME=astro-stacker-dev
 CPUSET_CPUS=${CPUSET_CPUS:-6-19}
+MEMORY_LIMIT=${MEMORY_LIMIT:-40g}
 
 docker build -t ${NAME} -f "$BASE/src/Dockerfile.dev" "$BASE/src"
 docker rm -f ${NAME} >/dev/null 2>&1 || true
 docker run -d --name ${NAME} --restart unless-stopped \
   --cpuset-cpus="$CPUSET_CPUS" \
+  --memory="$MEMORY_LIMIT" --memory-swap="$MEMORY_LIMIT" \
   -v "$BASE/src":/app \
   -v /mnt/user/Astronomy/013-Astro-Stacker-Processing:/captures:ro \
   -v "$BASE/data":/data \
