@@ -295,11 +295,21 @@ class NightSource(BaseModel):
     built). Darks sharing the same exposure length across sessions are
     still only built into ONE master, never duplicated - see
     app/ssf.py's render_build_masters().
+
+    `flats_dir` being None is the same kind of normal, supported state -
+    a project with no flats available at all for a session should still
+    be stageable. render_build_masters() already skips building a flat
+    master when there's none to build from, and calibrate_night.ssf.j2
+    already omits -flat= when there's no master, so staging accepting
+    None here is the only piece that was actually missing (confirmed the
+    hard way: Chris couldn't stage a flats-less project at all - this
+    field being required with no default rejected the request before it
+    ever reached staging.py).
     """
 
     name: str
     lights_dir: str  # path relative to CAPTURES_DIR, e.g. "Night 1/lights"
-    flats_dir: str  # path relative to CAPTURES_DIR, e.g. "Night 1/flats"
+    flats_dir: Optional[str] = None  # path relative to CAPTURES_DIR; None means no flats for this session
     darks_dir: Optional[str] = None  # path relative to CAPTURES_DIR
     filter: Optional[str] = None
     exposure_s: Optional[float] = None

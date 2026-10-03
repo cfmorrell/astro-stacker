@@ -104,12 +104,18 @@ def stage_project(project: Path, req: StageProjectRequest) -> dict:
         if not night.name or "/" in night.name or night.name in (".", ".."):
             raise ValueError(f"invalid night name: {night.name!r}")
         lights_source = _resolve_capture_dir(night.lights_dir)
-        flats_source = _resolve_capture_dir(night.flats_dir)
         night_root = project / "raw" / "nights" / night.name
         night_summary = {
             "lights": _link_dir(lights_source, night_root / "lights", night.filter, night.exposure_s),
-            "flats": _link_dir(flats_source, night_root / "flats", night.filter),
+            # 0 (not omitted) when there's no flats_dir: the frontend's
+            # stage summary reads this key unconditionally for every
+            # night (unlike "darks" below, which it already treats as
+            # optional) - see static/app.js's renderStageSummary().
+            "flats": 0,
         }
+        if night.flats_dir is not None:
+            flats_source = _resolve_capture_dir(night.flats_dir)
+            night_summary["flats"] = _link_dir(flats_source, night_root / "flats", night.filter)
         if night.darks_dir is not None:
             # No filter/exposure culling here (unlike lights/flats): a
             # dark frame's filename never encodes a filter position (it's

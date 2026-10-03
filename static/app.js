@@ -1489,11 +1489,15 @@ document.getElementById("stage-btn").addEventListener("click", async () => {
   const nights = nightRows
     .map((r) => {
       const lights_dir = r.lightsInput.value.trim();
-      const flats_dir = r.flatsInput.value.trim();
-      if (!lights_dir || !flats_dir) return null;
+      // Flats are optional (same as darks below) - a project with none
+      // available at all should still be stageable; Masters just skips
+      // building a flat for it and calibration proceeds without one
+      // (confirmed the hard way: Chris couldn't stage a flats-less
+      // project because this used to drop the whole row silently).
+      if (!lights_dir) return null;
       return {
         lights_dir,
-        flats_dir,
+        flats_dir: r.flatsInput.value.trim() || null,
         darks_dir: r.darksInput.value.trim() || null,
         filter: r.row.dataset.filter || null,
         exposure_s: r.row.dataset.exposureS ? parseFloat(r.row.dataset.exposureS) : null,

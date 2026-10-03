@@ -586,6 +586,36 @@ Siril ones, but the same "don't rediscover this" spirit applies.
    found and fixed in the same pass.
 
 ## Current validated status
+- ✅ **Fixed: couldn't stage a project with no calibration frames at all**
+  (2026-10-03) — Chris: "I am unable to stage a project that does not
+  contain calibration frames," reproduced with real test data
+  (SadrRegion, lights-only, no flats/darks/biases at all). Two separate
+  bugs, both needed fixing:
+  1) **Backend**: `app/models.py`'s `NightSource.flats_dir` was a
+  required `str`, unlike `darks_dir` (already `Optional[str] = None`) —
+  a request with no flats for a session failed Pydantic validation
+  (422) before ever reaching `staging.py`. `app/staging.py` also called
+  `_resolve_capture_dir`/`_link_dir` on `night.flats_dir` unconditionally
+  (no `is not None` guard the way `darks_dir` already has) — would have
+  crashed on `None` even once the model allowed it. Fixed both: made the
+  field `Optional`, and guarded the flats-linking the same way darks
+  already is, defaulting `night_summary["flats"]` to `0` (not omitted)
+  since the frontend reads that key unconditionally for every night.
+  2) **Frontend**: `static/app.js`'s stage-btn handler had its own,
+  independent bug — `if (!lights_dir || !flats_dir) return null;` 
+  silently dropped any row with an empty Flats field from the request
+  entirely, before it ever reached the (now-fixed) backend. Fixed to
+  only require `lights_dir`, matching how `darks_dir` was already
+  optional there. The backend fix alone wouldn't have been visible to
+  Chris at all without this one — the UI was the actual thing blocking
+  him.
+  The no-flats warning banner from the earlier feedback batch
+  (`renderExistingStagedNights()`) already existed and needed no changes
+  — confirmed it fires correctly once staging a flats-less group
+  actually succeeds. Verified end-to-end via the real UI (not just the
+  API): staged a lights-only group, got "10 lights, 0 flats" in the
+  summary and the existing-groups panel, with the warning banner
+  showing beneath it.
 - ✅ **Removed all 3 old inline Next buttons (Stage, Masters, then
   Review) now that the bottom stepbar replaces them** (2026-10-02, two
   follow-up rounds right after the stepbar landed — Chris initially said
