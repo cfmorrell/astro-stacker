@@ -654,6 +654,11 @@ button.danger-outline:hover {
   color: var(--danger);
 }
 
+.frame-error {
+  color: var(--warn);
+  font-size: 11px;
+}
+
 .frame-exclude {
   display: flex;
   align-items: center;
@@ -921,6 +926,55 @@ button.danger-outline:hover {
 .metric-bars .bar.flagged {
   background: var(--danger);
   opacity: 1;
+}
+
+.metric-chart-host {
+  width: 100%;
+}
+
+/* metricStrip()'s overflow fix: once there are too many frames for a bar
+   each (see MIN_PX_PER_BAR in app.js), this replaces .metric-bars - same
+   72px height and color language (--success line, --danger flagged
+   points), but as a line that scales to any width instead of a row of
+   fixed-minimum-width columns. */
+.metric-sparkline-wrap {
+  position: relative;
+  width: 100%;
+  height: 72px;
+}
+
+.metric-sparkline {
+  display: block;
+  width: 100%;
+}
+
+.metric-spark-line {
+  fill: none;
+  stroke: var(--success);
+  stroke-width: 2;
+  opacity: 0.8;
+  vector-effect: non-scaling-stroke;
+}
+
+/* Overlaid on top of the SVG as plain HTML, not drawn inside it - see
+   renderSparkline()'s comment in app.js for why (preserveAspectRatio=
+   "none" would stretch an in-SVG circle into an ellipse). Fixed pixel
+   size here is what keeps it round. */
+.metric-spark-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.metric-spark-flag {
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  margin: -3.5px;
+  border-radius: 50%;
+  background: var(--danger);
+  cursor: pointer;
+  pointer-events: auto;
 }
 
 .night-block {
@@ -1219,4 +1273,100 @@ button.danger-outline:hover {
   color: var(--text-dim);
   font-size: 12px;
   font-style: italic;
+}
+
+/* Matches astro-ingest's button treatment (nav-alignment ask) - a
+   slightly lighter background and a stronger border than --panel-2/
+   --border give buttons enough contrast to read as clickable against a
+   dark panel, instead of nearly blending into it. Declared here, after
+   the base `button {}` rule earlier in this file, deliberately - same
+   placement astro-ingest uses, so this actually wins the cascade instead
+   of being overridden by it. */
+:root { --border-strong: #3a4060; --button-bg: #1a1e2c; }
+
+button, button.ghost {
+  background: var(--button-bg);
+  border-color: var(--border-strong);
+}
+
+/* Job-done toasts (notifyJobDone() in app.js) - always shown regardless
+   of OS Notification permission, since that can be denied/unsupported
+   and only fires when the tab isn't the one in view anyway. */
+.job-toast-stack {
+  position: fixed;
+  /* Clears the fixed .stepbar added after this (added later, same
+     bottom-of-window real estate) - without this a toast would land
+     right on top of it instead of above it. */
+  bottom: 78px;
+  right: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 1000;
+}
+
+.job-toast {
+  background: var(--panel);
+  border: 1px solid var(--success);
+  color: var(--text);
+  border-radius: var(--radius);
+  padding: 10px 16px;
+  font-size: 13px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  max-width: 360px;
+}
+
+.job-toast.error {
+  border-color: var(--danger);
+}
+
+/* Pinned to the bottom of the window on every step - astro-ingest's own
+   nav pattern (its .stepbar), distinct from .stepper above (the
+   breadcrumb row, which stays in normal flow and scrolls out of view on
+   a long page). z-index below the lightbox (200) so the lightbox still
+   draws on top of this when open. */
+.stepbar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 50;
+  background: var(--panel);
+  border-top: 1px solid var(--border-strong);
+  box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.35);
+  padding: 10px 24px calc(10px + env(safe-area-inset-bottom, 0px));
+}
+
+.stepbar-inner {
+  max-width: 1200px;
+  margin: 0 auto;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.stepbar-status {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+/* Outlined/quiet until the step is actually ready to advance, then
+   filled - a stronger visual cue than the plain button styling conveys
+   on its own, matching astro-ingest's own button.next treatment. */
+button.next {
+  background: transparent;
+  border: 1.5px solid var(--accent);
+  color: #a5b4fc;
+  font-weight: 600;
+}
+
+button.next.ready {
+  background: var(--accent);
+  color: #fff;
+}
+
+button.next:hover {
+  filter: brightness(1.1);
 }

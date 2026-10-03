@@ -97,6 +97,7 @@ class FrameStats:
     captured_at: Optional[str] = None  # FITS DATE-OBS (UTC), for chronological display/sort
     anomaly_z: dict = field(default_factory=dict)  # per-metric robust z-score vs. the rest of this night
     flagged: bool = False  # True if any metric's |z| >= ANOMALY_Z_THRESHOLD — a recommendation, not a decision
+    error: Optional[str] = None  # set only if the file itself couldn't be read (corrupt/truncated) — see analyze_frame
 
 
 @dataclass
@@ -148,10 +149,41 @@ def analyze_frame(
     threshold_sigma: float = DEFAULT_THRESHOLD_SIGMA,
 ) -> FrameStats:
     """Compute quality-review stats for a single light frame."""
-    with fits.open(path) as hdul:
-        data = hdul[0].data
-        captured_at = hdul[0].header.get("DATE-OBS")
-    data = np.asarray(data, dtype=np.float32)
+    # The dtype conversion below happens inside this with block, not after
+    # it, on general principle (fits.open() defaults to memmap=True, so
+    # hdul[0].data CAN be a lazy view backed by the still-open file rather
+    # than a real copy - a documented astropy footgun, and the fix is
+    # free either way).
+    #
+    # The try/except is the actual fix for a real incident: "Failed:
+    # buffer is too small for requested array" on a real 78-frame project,
+    # root-caused by reproducing that EXACT error message (byte for byte)
+    # by truncating a real light frame to simulate a capture cut off
+    # mid-write - a corrupt/truncated FITS file (power blip, dropped USB
+    # frame, session cut short - all real things over a long night). That
+    # raised as an unhandled exception here and took the ENTIRE batch
+    # down with it - 77 good frames' worth of results lost along with the
+    # one bad file, surfaced to Chris as a bare, unhelpful "Failed: ...".
+    # Caught here and turned into the SAME kind of degenerate-but-valid
+    # FrameStats a zero-variance frame already gets below (star_count=0 is
+    # flag_anomalies()'s own unconditional, unambiguous flag) - so one bad
+    # frame now surfaces as "this one's flagged, here's why" instead of
+    # taking every other frame's results down with it.
+    try:
+        with fits.open(path) as hdul:
+            data = np.asarray(hdul[0].data, dtype=np.float32)
+            captured_at = hdul[0].header.get("DATE-OBS")
+    except Exception as exc:
+        return FrameStats(
+            filename=path.name,
+            fwhm=None,
+            roundness=None,
+            star_count=0,
+            background=0.0,
+            background_std=0.0,
+            snr=None,
+            error=f"{type(exc).__name__}: {exc}",
+        )
     if data.ndim == 3:
         # Already-debayered multi-layer data (e.g. a calibrated frame) —
         # green carries the most signal/detail for an RGGB OSC sensor.

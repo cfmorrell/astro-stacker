@@ -5,6 +5,13 @@ name, e.g. "Light_ElephantTrunk_300.0s_Bin1_2600MC_gain100_...fit" or
 "Dark_300.0s_Bin1_2600MC_gain100_...fit" — cheap to check without opening
 any FITS headers, matching this app's existing filename-based approach
 (see the frame-type/lights-flats mismatch warnings at Stage time).
+
+N.I.N.A. (among others) uses a differently-shaped, dash-delimited name
+instead, e.g. "LIGHT-H-Bubble Nebula-300.00s-ZWO ASI2600MM Pro-2025-10-03_
+22-20-49_0008" — frame-type/filter/target/exposure separated by "-" rather
+than "_", and no "_gain<N>_" token at all. Both conventions are supported
+in parallel below rather than picking one; real capture sets have shown up
+in both shapes.
 """
 
 from __future__ import annotations
@@ -13,8 +20,15 @@ import re
 
 _FRAME_TYPE_KEYWORDS = ("light", "dark", "flat", "bias")
 
-# e.g. "_300.0s_" or "_1.0ms_" -> 300.0 seconds / 0.001 seconds.
-_EXPOSURE_RE = re.compile(r"_(\d+(?:\.\d+)?)(ms|s)_", re.IGNORECASE)
+# e.g. "_300.0s_" or "_1.0ms_" (ASIAIR/underscore convention) or
+# "-300.00s-" (N.I.N.A./dash convention) -> 300.0 seconds / 0.001 seconds.
+# The delimiter just needs to match on BOTH sides, not necessarily the
+# same one each side (a dash-convention name can still transition into an
+# underscore-delimited timestamp right after, e.g. "...-300.00s-ZWO...",
+# while others butt a dash up against an underscore-ish neighbor) - "-_"
+# on each side (not a single shared capture group) covers both without
+# requiring the two delimiters to match each other.
+_EXPOSURE_RE = re.compile(r"[-_](\d+(?:\.\d+)?)(ms|s)[-_]", re.IGNORECASE)
 
 # A filter-wheel camera's filenames put the filter code right before
 # "_gain<N>_" (e.g. "..._2600MM_H_gain100_...", "..._2600MM_O_gain100_...")
@@ -22,6 +36,17 @@ _EXPOSURE_RE = re.compile(r"_(\d+(?:\.\d+)?)(ms|s)_", re.IGNORECASE)
 # ("..._2600MC_gain100_...", camera model directly adjacent to gain), so
 # this naturally returns no match for OSC data rather than a false filter.
 _FILTER_RE = re.compile(r"_([A-Za-z]{1,6})_gain\d+_")
+
+# N.I.N.A.'s dash convention has no "gain" token to anchor on at all -
+# instead the filter (when there is one) is the short, pure-alphabetic
+# token right after the frame-type prefix: "LIGHT-H-Bubble Nebula-...".
+# An OSC capture's equivalent name has no filter token there at all -
+# "LIGHT-Bubble Nebula-..." - and since a target name is either long or
+# contains a space/digit, {1,4} pure letters won't accidentally match it,
+# so this naturally falls through to no-match for OSC data too.
+_FILTER_RE_DASH = re.compile(
+    r"^(?:light|dark|flat|bias)-([A-Za-z]{1,4})-", re.IGNORECASE
+)
 
 
 def _dominant(counts: dict, total: int):
@@ -96,8 +121,16 @@ def parse_filter(filename: str) -> str | None:
     if the filename doesn't match a filter-wheel camera's naming pattern
     at all (OSC cameras have no filter wheel — that's the expected,
     correct result for them, not a failure).
+
+    Tries the ASIAIR-style "_X_gain<N>_" convention first, then N.I.N.A.'s
+    dash-delimited "LIGHT-X-..." convention — a filename only ever matches
+    one shape, so trying both in sequence is just "support either", not a
+    priority order that matters in practice.
     """
     m = _FILTER_RE.search(filename)
+    if m:
+        return m.group(1).upper()
+    m = _FILTER_RE_DASH.search(filename)
     return m.group(1).upper() if m else None
 
 

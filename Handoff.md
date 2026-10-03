@@ -586,6 +586,155 @@ Siril ones, but the same "don't rediscover this" spirit applies.
    found and fixed in the same pass.
 
 ## Current validated status
+- ✅ **Removed all 3 old inline Next buttons (Stage, Masters, then
+  Review) now that the bottom stepbar replaces them** (2026-10-02, two
+  follow-up rounds right after the stepbar landed — Chris initially said
+  "staging and calibration," then caught Review had one too). Removed
+  `stage-next-btn`/`masters-next-btn`/`review-next-btn`: their HTML,
+  click listeners, and every `style.display` toggle line. `renderStepBar()`'s
+  "ready" state used to mirror whichever inline button's `style.display`
+  was currently set — now reads `stepStatus(step).complete` directly
+  instead (the same function that already computed those buttons'
+  visibility under the hood, and that the `.stepper` breadcrumbs'
+  complete-checkmark already used too), so one definition of "done" per
+  step instead of three.
+  Removing `review-next-btn` surfaced a real latent bug this exposed
+  (not introduced by the removal, just no longer papered over by it):
+  `state.analyzed` was never actually reset to `false` when a fresh
+  analyze run STARTED, only set to `true` on completion — the old inline
+  button happened to force its own `style.display="none"` at run-start
+  regardless, hiding the staleness. Once that button was gone,
+  `stepStatus("review").complete` (read by both the stepbar and the
+  breadcrumb) stayed stale-true for a re-analyze's entire duration,
+  showing "ready" while a new run was still in progress. Fixed at the
+  source in `runAnalyze()`: `state.analyzed = false` now set explicitly
+  at run-start, same place the badge already resets to "not analyzed".
+  Verified live end-to-end: `ready` is `false` immediately after clicking
+  Analyze, `true` only once the job actually completes (confirmed via
+  `review-status-badge` reaching "analyzed", not a fixed wait) — tested
+  against a real run that took 12s for 3 groups/30 frames, not just the
+  instant-response restore-from-cache path.
+- ✅ **Fixed nav follow-up + a real crash bug, both verified end-to-end
+  (2026-10-02)**: 1) **nav still wasn't right** — Chris, after the 7-item
+  batch below: "look at how astro-ingest keeps the nav bar at the
+  bottom... always in the same place and easily accessible." The
+  breadcrumb `.stepper` (top of page, in normal flow) was never the
+  thing he meant — astro-ingest has a SEPARATE element, `.stepbar`,
+  `position:fixed` to the bottom of the viewport on every step,
+  regardless of scroll. Added the same to astro-stacker: a new
+  `#stepbar` (`index.html`, sibling of `<main>`) with a status line and
+  a "Next" button, driven by `renderStepBar()` (`app.js`) — status text
+  just mirrors whichever `#{step}-status-badge` is already showing (no
+  second source of truth), and Next mirrors the existing inline
+  `*-next-btn`'s visibility (ditto). Hidden on Stack (the last step),
+  same as astro-ingest hides its own bar's Next on ITS last step.
+  z-index 50, below the lightbox's 200 so the lightbox still draws on
+  top when open; the job-toast-stack from the batch below got bumped
+  from `bottom:18px` to `bottom:78px` so a toast doesn't land on top of
+  this instead of above it.
+  2) **real bug: "Failed: buffer is too small for requested array" on a
+  real 78-frame project's Review step** — root-caused by reproducing the
+  EXACT error message (byte for byte) by truncating a real light frame
+  to simulate a capture cut short mid-write (power blip, dropped USB
+  frame — a real thing over a long session). `framestats.py`'s
+  `analyze_frame()` had no error handling around the FITS read at all —
+  one corrupt file raised an unhandled exception and took the ENTIRE
+  batch down with it, 77 good frames' worth of results lost along with
+  the one bad file. Fixed with a try/except around the read that returns
+  the same kind of degenerate-but-valid `FrameStats` a zero-variance
+  frame already got (`star_count=0`, unconditionally flagged by
+  `flag_anomalies()`), plus a new `error` field on `FrameStats` carrying
+  the actual reason, surfaced in the frontend (a `.frame-error` line
+  replacing the normal stat grid on that one tile, and in the lightbox
+  caption) so a bad frame reads as "this one's flagged, here's why"
+  instead of crashing everything else's results too. Verified against
+  the REAL `/lights/analyze/run` job (not just the function in
+  isolation): staged 4 good frames + 1 truncated one, job status came
+  back `succeeded`, the 4 good frames got full correct stats, the bad
+  one got `error: "TypeError: buffer is too small for requested array"`
+  and `flagged: true`. Also moved the FITS->float32 dtype conversion
+  in both this function and `imaging.py`'s preview renderer to happen
+  INSIDE their `with fits.open(...)` blocks rather than after — astropy
+  defaults to `memmap=True`, so `hdul[0].data` accessed after the file
+  closes is a documented footgun; not confirmed as this incident's
+  trigger (the truncated-file repro didn't need it), but a real,
+  zero-cost hardening against a DIFFERENT way to hit the same error
+  class, done here since it was already under the microscope.
+- ✅ **Week-of-use feedback batch, 7 items, verified end-to-end via
+  headless Chrome + CDP against real and synthetic data (2026-10-02)**:
+  1) **nav/theme parity with astro-ingest**: added the `--border-strong`/
+  `--button-bg` override (`static/styles.css`, placed AFTER the base
+  `button {}` rule — same placement astro-ingest uses, deliberately,
+  since adding it right after `:root` at the top of the file instead got
+  silently overridden by the later base rule on the first attempt; a
+  cascade-order mistake, not a judgment call). Audited the project-row
+  buttons for "clickable but useless" states — `delete-project-btn`
+  already had the pattern, `refresh-status-btn` already no-ops safely
+  with no project selected, `job-history-btn`/`project-logs-btn` are
+  already hidden (not just disabled) until a project exists — nothing
+  else needed changing.
+  2) **sky background + background noise added to Review** — the backend
+  (`app/framestats.py`) already computed both; astro-ingest's
+  `core/quality.py` (a direct fork of this same module) just displayed
+  all 6 fields where this app only showed 4. Added the 2 missing
+  `metricStrip()` calls plus the matching fields in `frameStatsLine()`
+  and the per-frame tile caption.
+  3) **review charts no longer overflow the window on a big project** —
+  root cause: `.metric-bars .bar` has `flex:1` AND `min-width:3px`
+  (`styles.css`), and flexbox can't shrink a flex item below its own
+  min-width, so `frame_count × ~5px` past the container's width just
+  overflowed instead of compressing. `metricStrip()` (`app.js`) now
+  measures its own rendered width via `ResizeObserver` (can't measure
+  before the caller mounts it — there's no layout box yet) and swaps to
+  an SVG sparkline below ~5px/frame, back to bars above it. The sparkline
+  deliberately does NOT draw flagged-point markers inside the SVG itself:
+  `preserveAspectRatio="none"` (needed so the chart stretches to any
+  container width independent of point count) scales X/Y independently,
+  which stretches an in-SVG `<circle>` into an ellipse. Markers are
+  plain absolutely-positioned HTML divs overlaid on top instead, sized
+  by CSS alone so they stay round. Known accepted simplification: the
+  `ResizeObserver` is never explicitly `.disconnect()`'d when a chart is
+  torn down (`renderAnalyzeOutput()` discards the old subtree via
+  `innerHTML = ""` on every re-render, e.g. toggling a checkbox) — fine
+  at this app's scale (a handful of re-renders per session, not
+  thousands), but would need a real cleanup hook if that ever changes.
+  4) **click a chart bar (or sparkline point) to jump to that frame** —
+  `openLightboxForFrame(night, frames, index)` already existed (used by
+  the review grid's own tiles); `metricStrip()` just needed `night`
+  threaded through as a new parameter and an `onclick` on each bar/point.
+  The sparkline's click target is the whole chart (nearest-frame-by-x),
+  not just the flagged markers, since a 2px line is too thin to click
+  precisely once there are hundreds of points.
+  5) **job-done notification** — single choke point already existed:
+  every long job (masters/stack/analyze/register-finals) funnels through
+  `pollJob()`, and its one `status === "succeeded" || "failed"` branch is
+  the one place any job's end is detected. Added `notifyJobDone()`
+  there: always shows an in-page toast (bottom-right, auto-dismisses),
+  and additionally fires a browser `Notification` if permission is
+  already granted. Permission is requested once, synchronously at the
+  top of `pollJob()` (before any `await`) so it's still inside the
+  triggering click's user-gesture window — browsers increasingly refuse
+  a permission prompt issued outside one.
+  6) **warn, don't block, when a group has no flats** — confirmed
+  `app/ssf.py`'s `render_build_masters()` already just `continue`s past a
+  night with no `flats/` dir (no master gets built, `calibrate_night.
+  ssf.j2` already omits `-flat=` when there's no master) — "proceed
+  anyway" already existed, nothing to change there. Added the missing
+  warning: `renderExistingStagedNights()` (`app.js`) now flags any night
+  whose `flat_count` is 0 with the same `.session-mismatch-warning` class
+  already used for the OSC/darks-type mismatch warnings.
+  7) **dash-delimited (N.I.N.A.-style) filenames** — e.g. `"LIGHT-H-
+  Bubble Nebula-300.00s-ZWO ASI2600MM Pro-..."`, no `_gain<N>_` anchor at
+  all, unlike the ASIAIR convention this app was built against.
+  `app/frameinfo.py`'s `_EXPOSURE_RE` now accepts `-` or `_` on either
+  side of the number (`[-_](\d+(?:\.\d+)?)(ms|s)[-_]`); `parse_filter()`
+  tries the existing `_gain`-anchored pattern first, then a new
+  frame-type-prefix-anchored one (`^(?:light|dark|flat|bias)-
+  ([A-Za-z]{1,4})-`) for the dash convention — an OSC dash-style name's
+  second token is the target (has a space), so it naturally doesn't match
+  either pattern, same "no match = OSC" behavior the original regex
+  already relied on. Verified against both conventions, mono and OSC, in
+  one script (6 cases, all correct) before touching the live container.
 - ✅ **One fix and three additions from live-usage feedback, verified
   end-to-end (2026-09-2x)**: 1) **fix: review results didn't survive
   switching projects and back.** Chris: "Light frame images do not stay

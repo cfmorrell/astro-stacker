@@ -248,10 +248,17 @@ def render_preview_png(
     if stretch not in _STRETCH_MODES:
         raise ValueError(f"unknown stretch mode {stretch!r}, expected one of {_STRETCH_MODES}")
 
+    # Converting to float32 inside this with block, not after it, is load-
+    # bearing, not stylistic - fits.open() defaults to memmap=True, so
+    # hdul[0].data is a lazy view backed by the still-open file. The raw
+    # data is integer ADU, so np.asarray(..., dtype=np.float32) forces a
+    # real read/copy (it's not a no-op cast) - doing that after the file's
+    # already closed intermittently raised "buffer is too small for
+    # requested array" (see the same fix in framestats.py's analyze_frame,
+    # confirmed there against a real 78-frame project).
     with fits.open(path) as hdul:
-        data = hdul[0].data
+        data = np.asarray(hdul[0].data, dtype=np.float32)
         header = hdul[0].header
-    data = np.asarray(data, dtype=np.float32)
 
     if data.ndim == 3:
         # Siril stores calibrated/stacked color data channels-first

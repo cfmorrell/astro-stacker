@@ -114,7 +114,6 @@
 
         <div class="progress-wrap">
           <button id="stage-btn" class="primary">Stage files</button>
-          <button id="stage-next-btn" class="ghost" style="display:none;">Next: Calibration Frames →</button>
           <div id="stage-summary"></div>
         </div>
       </div>
@@ -162,7 +161,6 @@
 
         <button id="masters-render-btn" class="script-toggle-btn"><span class="arrow">▾</span> Preview script</button>
         <button id="masters-run-btn" class="primary">Build masters</button>
-        <button id="masters-next-btn" class="ghost" style="display:none;">Next: Review Light Frames →</button>
 
         <div id="masters-progress" class="progress-wrap" style="display:none;">
           <div class="progress-bar"><div class="progress-fill"></div></div>
@@ -218,7 +216,6 @@
         <button id="analyze-run-btn" class="primary">Analyze</button>
         <button id="analyze-rerun-btn" class="ghost" style="display:none;">↻ Re-analyze survivors</button>
         <button id="analyze-reset-btn" class="danger-outline" style="display:none;">⟲ Start over</button>
-        <button id="review-next-btn" class="ghost" style="display:none;">Next: Stack →</button>
 
         <div id="analyze-progress" class="progress-wrap" style="display:none;">
           <div class="progress-bar"><div class="progress-fill"></div></div>
@@ -328,6 +325,18 @@
 
   </div>
 </main>
+
+<!-- Pinned to the bottom of the window on every step, same spot
+     regardless of scroll position - astro-ingest's own nav pattern
+     (its .stepbar). Status on the left, Next always in the same place
+     on the right; hidden on Stack, the last step, same as astro-ingest
+     hides it on its own last step. -->
+<div class="stepbar" id="stepbar" style="display:none;">
+  <div class="stepbar-inner">
+    <div class="stepbar-status" id="stepbar-status"></div>
+    <button type="button" id="stepbar-next" class="next"></button>
+  </div>
+</div>
 
 <div class="lightbox-overlay" id="lightbox">
   <div class="lightbox-hint">click image to zoom · scroll to pan</div>

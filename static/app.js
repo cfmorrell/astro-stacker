@@ -54,6 +54,22 @@ function el(tag, attrs, children) {
   return node;
 }
 
+// Same shape as el(), but for SVG (metricStrip()'s sparkline fallback) -
+// SVG elements need createElementNS, not createElement, or the browser
+// creates an inert HTMLUnknownElement instead of a real shape/line/etc.
+function svgEl(tag, attrs, children) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k.startsWith("on") && typeof v === "function") node.addEventListener(k.slice(2), v);
+    else if (v !== null && v !== undefined) node.setAttribute(k, v);
+  }
+  for (const child of children || []) {
+    if (child === null || child === undefined) continue;
+    node.appendChild(child);
+  }
+  return node;
+}
+
 function formatCaptured(iso) {
   // FITS DATE-OBS has no trailing "Z" (e.g. "2026-09-14T00:00:47.585420")
   // but IS UTC per the FITS standard. Appending "Z" before parsing forces
@@ -163,7 +179,52 @@ function setStepBadge(badgeId, kind, text) {
 
 // ---------- job polling ----------
 
-async function pollJob(jobId, { progressEl, logViewEl, pipelineEl, onDone, lockButtons, ownerProject }) {
+// Chris: "give it some way to let me know that it's done with a stack" -
+// a long masters/stack run is easy to wander away from. Two independent
+// channels, since neither alone covers every case: an OS notification
+// (survives switching away to a different app or tab, but needs a grant,
+// and browsers only honor requestPermission() called from within a real
+// user gesture) and an in-page toast (always works, covers denied/
+// unsupported Notification, but only if the tab's actually in view).
+function maybeRequestNotificationPermission() {
+  if (typeof Notification === "undefined") return;
+  // Only ever asks once - "default" means never prompted; a prior
+  // grant/denial should never be re-prompted. Called from pollJob()
+  // itself, synchronously before any await, so this still runs inside
+  // the click handler's user-gesture window that kicked the job off.
+  if (Notification.permission === "default") Notification.requestPermission();
+}
+
+function showJobToast(message, ok) {
+  let stack = document.getElementById("job-toast-stack");
+  if (!stack) {
+    stack = el("div", { id: "job-toast-stack", class: "job-toast-stack" }, []);
+    document.body.appendChild(stack);
+  }
+  const toast = el("div", { class: `job-toast${ok ? "" : " error"}` }, [message]);
+  stack.appendChild(toast);
+  setTimeout(() => toast.remove(), 8000);
+}
+
+function notifyJobDone(label, project, status, error) {
+  const ok = status === "succeeded";
+  const title = `${label}${ok ? " complete" : " failed"}`;
+  const body = project ? `${project}${ok ? "" : error ? `: ${error}` : ""}` : (error || "");
+  showJobToast(body ? `${ok ? "✓" : "✕"} ${title} — ${body}` : `${ok ? "✓" : "✕"} ${title}`, ok);
+  if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+    try {
+      new Notification(title, { body });
+    } catch (_) {
+      // Some browsers (mobile Safari, among others) support the
+      // Notification constructor inconsistently even once "granted" -
+      // the toast above already covers this, so just drop it silently.
+    }
+  }
+}
+
+async function pollJob(jobId, { progressEl, logViewEl, pipelineEl, onDone, lockButtons, ownerProject, label }) {
+  maybeRequestNotificationPermission();
+  const jobLabel = label || "Job";
   const fill = progressEl ? progressEl.querySelector(".progress-fill") : null;
   const pct = progressEl ? progressEl.querySelector(".pct") : null;
   const msg = progressEl ? progressEl.querySelector(".msg") : null;
@@ -195,6 +256,7 @@ async function pollJob(jobId, { progressEl, logViewEl, pipelineEl, onDone, lockB
       // once ownerProject no longer matches - rather than stopping the
       // poll outright - still lets onDone fire correctly if the user
       // switches BACK to this project before the job finishes.
+      notifyJobDone(jobLabel, ownerProject, "failed", String(e));
       if (!ownerProject || state.project === ownerProject) {
         (lockButtons || []).forEach((b) => { b.disabled = false; });
         if (onDone) onDone({ status: "failed", error: String(e) });
@@ -215,6 +277,7 @@ async function pollJob(jobId, { progressEl, logViewEl, pipelineEl, onDone, lockB
       }
     }
     if (snap.status === "succeeded" || snap.status === "failed") {
+      notifyJobDone(jobLabel, ownerProject, snap.status, snap.error);
       if (!ownerProject || state.project === ownerProject) {
         (lockButtons || []).forEach((b) => { b.disabled = false; });
         if (onDone) onDone(snap);
@@ -508,7 +571,7 @@ function renderExistingStagedNights() {
     ]));
   }
   for (const n of nights) {
-    container.appendChild(el("div", { class: "night-row", style: "justify-content:space-between;" }, [
+    const rowChildren = [
       el("span", {}, [`${nightDisplayLabel(n)} — ${n.light_count} lights, ${n.flat_count} flats`]),
       el("button", {
         type: "button", class: "small danger-outline",
@@ -522,7 +585,18 @@ function renderExistingStagedNights() {
           }
         },
       }, ["✕ Remove"]),
-    ]));
+    ];
+    // Not a hard stop - Masters already just skips building a flat for a
+    // group with none (app/ssf.py render_build_masters()) and calibration
+    // proceeds without one - this is purely so that's a visible choice,
+    // not a silent one. Borrow another group's flat via the Masters step's
+    // calibration-alignment override if that's not what you want.
+    if (n.flat_count === 0) {
+      rowChildren.push(el("div", { class: "session-mismatch-warning" }, [
+        `⚠ No flats staged for ${nightDisplayLabel(n)} — it'll stack without flat-fielding unless you point it at another group's flat in Masters' calibration alignment.`,
+      ]));
+    }
+    container.appendChild(el("div", { class: "night-row", style: "justify-content:space-between;" }, rowChildren));
   }
 }
 
@@ -1667,6 +1741,7 @@ document.getElementById("masters-run-btn").addEventListener("click", async () =>
       logViewEl: document.querySelector('[data-log-view="masters"]'),
       lockButtons: [runBtn],
       ownerProject,
+      label: "Masters build",
       onDone: async (snap) => {
         if (snap.status === "succeeded") setStepBadge("masters-status-badge", "ok", "masters built");
         else setOutcome(resultEl, false, `Failed: ${snap.error || ""}`);
@@ -1678,10 +1753,6 @@ document.getElementById("masters-run-btn").addEventListener("click", async () =>
     setOutcome(resultEl, false, String(e));
   }
 });
-
-document.getElementById("stage-next-btn").addEventListener("click", () => { state.activeStep = "masters"; showActiveStep(); });
-document.getElementById("masters-next-btn").addEventListener("click", () => { state.activeStep = "review"; showActiveStep(); });
-document.getElementById("review-next-btn").addEventListener("click", () => { state.activeStep = "stack"; showActiveStep(); });
 
 // ---------- Analyze / Review section ----------
 
@@ -1695,26 +1766,102 @@ function analyzeBody() {
   };
 }
 
-function metricStrip(label, frames, key, subKey, anomalySigma) {
+// Below this many px per frame, a discrete bar (3px min-width + 2px gap,
+// see .metric-bars .bar in styles.css) can no longer actually shrink to
+// fit - flexbox won't compress a flex item past its min-width, so the row
+// just overflows the panel instead (Chris: "blows way past the edge of
+// the window" on a big project). MIN_PX_PER_BAR matches that floor;
+// below it, metricStrip() switches to an SVG sparkline instead, which
+// scales to any width regardless of point count.
+const MIN_PX_PER_BAR = 5;
+
+function metricStrip(label, frames, key, subKey, anomalySigma, night) {
   if (frames.length === 0) {
     return el("div", { class: "metric-strip" }, [el("div", { class: "metric-label" }, [label]), el("div", { class: "hint" }, ["no surviving frames"])]);
   }
   const values = frames.map((f) => (typeof f[key] === "number" ? f[key] : 0));
   const lo = Math.min(...values);
   const hi = Math.max(...values);
-  // Scale bars to the metric's own min..max range, not 0..max: two FWHM
-  // values like 4.62 and 4.69 are indistinguishable as bars sized against
-  // a 0-based axis, but scaling to the actual observed range makes real
-  // (if small) differences visible - which is also just what the bars are
+  // Scale to the metric's own min..max range, not 0..max: two FWHM
+  // values like 4.62 and 4.69 are indistinguishable sized against a
+  // 0-based axis, but scaling to the actual observed range makes real
+  // (if small) differences visible - which is also just what these are
   // for now that flagging is a separate, tunable z-score (see the anomaly
   // sigma input) rather than something to infer by eye from bar height.
   const span = hi - lo || 1;
-  const bars = el("div", { class: "metric-bars" }, frames.map((f, i) => {
-    const h = Math.max(3, ((values[i] - lo) / span) * 68 + 4);
-    const flagged = f.anomaly_z && f.anomaly_z[subKey] !== undefined && f.anomaly_z[subKey] >= anomalySigma;
+  const isFlagged = (f) => f.anomaly_z && f.anomaly_z[subKey] !== undefined && f.anomaly_z[subKey] >= anomalySigma;
+  const pointTitle = (f, i) => {
     const { date, time } = formatCaptured(f.captured_at);
-    return el("div", { class: `bar${flagged ? " flagged" : ""}`, style: `height:${h}px;`, title: `${f.filename} (${date} ${time}): ${key}=${values[i]}` }, []);
-  }));
+    return `${f.filename} (${date} ${time}): ${key}=${values[i]}`;
+  };
+
+  function renderBars() {
+    return el("div", { class: "metric-bars" }, frames.map((f, i) => {
+      const h = Math.max(3, ((values[i] - lo) / span) * 68 + 4);
+      // Clicking a bar jumps straight to that frame in the lightbox (same
+      // nav - prev/next arrows, exclude checkbox - the review grid's own
+      // tiles already use via openLightboxForFrame()) instead of having
+      // to hunt for it in the frame-strip below by eye.
+      return el("div", {
+        class: `bar${isFlagged(f) ? " flagged" : ""}`,
+        style: `height:${h}px; cursor:pointer;`,
+        title: pointTitle(f, i),
+        onclick: () => openLightboxForFrame(night, frames, i),
+      }, []);
+    }));
+  }
+
+  // Same data as the bars, traced as a line instead of discrete columns -
+  // for a frame count dense enough that individual bars can't fit. Fixed
+  // viewBox (one unit per frame) + preserveAspectRatio="none" so the SVG
+  // stretches to whatever width its container actually has, independent
+  // of how many points there are.
+  //
+  // Flagged-point markers are deliberately NOT drawn inside this SVG:
+  // preserveAspectRatio="none" scales X and Y independently whenever the
+  // container's aspect ratio doesn't match the viewBox's (the normal
+  // case here), which stretches a <circle> into an ellipse - fine for a
+  // line (a stretched trend line still reads correctly) but wrong for a
+  // marker that's supposed to look like a dot. Markers are plain
+  // absolutely-positioned HTML elements overlaid on top instead, sized
+  // by CSS alone so they stay round regardless of how the SVG beneath
+  // them is scaled.
+  function renderSparkline() {
+    const w = Math.max(frames.length, 2);
+    const h = 72;
+    const yFor = (i) => h - Math.max(3, ((values[i] - lo) / span) * 68 + 4);
+    const points = frames.map((_, i) => `${i + 0.5},${yFor(i)}`).join(" ");
+    const svg = svgEl("svg", {
+      viewBox: `0 0 ${w} ${h}`, preserveAspectRatio: "none",
+      class: "metric-sparkline", style: `height:${h}px;`,
+    }, [svgEl("polyline", { points, class: "metric-spark-line" }, [])]);
+
+    const overlay = el("div", { class: "metric-spark-overlay" }, frames.map((f, i) => {
+      if (!isFlagged(f)) return null;
+      return el("div", {
+        class: "metric-spark-flag",
+        style: `left:${((i + 0.5) / w) * 100}%; top:${(yFor(i) / h) * 100}%;`,
+        title: pointTitle(f, i),
+        onclick: (e) => { e.stopPropagation(); openLightboxForFrame(night, frames, i); },
+      }, []);
+    }).filter(Boolean));
+
+    // Clicking anywhere along the chart jumps to whichever frame's x
+    // position is nearest - the line itself is only 2px tall, far too
+    // thin a target to click precisely on a dense chart, and this way
+    // every frame is reachable, not just the flagged ones.
+    const wrap = el("div", {
+      class: "metric-sparkline-wrap", style: "cursor:pointer;",
+      onclick: (e) => {
+        const rect = wrap.getBoundingClientRect();
+        const frac = (e.clientX - rect.left) / rect.width;
+        const i = Math.min(frames.length - 1, Math.max(0, Math.round(frac * frames.length - 0.5)));
+        openLightboxForFrame(night, frames, i);
+      },
+    }, [svg, overlay]);
+    return wrap;
+  }
+
   const axis = el("div", { class: "metric-axis" }, [
     el("span", {}, [hi.toFixed(2)]),
     el("span", {}, [lo.toFixed(2)]),
@@ -1725,7 +1872,23 @@ function metricStrip(label, frames, key, subKey, anomalySigma) {
     el("span", {}, [firstTime]),
     el("span", {}, [lastTime]),
   ]);
-  const barsWrap = el("div", { class: "metric-bars-wrap" }, [bars, xAxis]);
+  const chartHost = el("div", { class: "metric-chart-host" }, [renderBars()]);
+  let usingSparkline = false;
+  // Decided after layout, not up front: metricStrip() builds this node
+  // off-DOM, before the caller has appended it anywhere, so there's no
+  // real width to measure yet. ResizeObserver's callback only fires once
+  // chartHost is actually connected and has geometry, and again on every
+  // later resize (window resize, sidebar toggle, etc.) - exactly the
+  // "recompute if it would now overflow" behavior this needs.
+  const ro = new ResizeObserver(() => {
+    const shouldUseSparkline = chartHost.clientWidth / frames.length < MIN_PX_PER_BAR;
+    if (shouldUseSparkline === usingSparkline) return;
+    usingSparkline = shouldUseSparkline;
+    chartHost.innerHTML = "";
+    chartHost.appendChild(usingSparkline ? renderSparkline() : renderBars());
+  });
+  ro.observe(chartHost);
+  const barsWrap = el("div", { class: "metric-bars-wrap" }, [chartHost, xAxis]);
   return el("div", { class: "metric-strip" }, [
     el("div", { class: "metric-label" }, [label]),
     el("div", { class: "metric-strip-body" }, [axis, barsWrap]),
@@ -1739,8 +1902,10 @@ let lightboxZoomed = false;
 let lightboxNav = null;
 
 function frameStatsLine(f) {
+  if (f.error) return `⚠ Could not read this frame: ${f.error}`;
   return `Stars: ${f.star_count}, FWHM: ${f.fwhm !== null ? f.fwhm.toFixed(2) : "—"}, `
-    + `Eccentricity: ${f.roundness !== null ? f.roundness.toFixed(3) : "—"}, SNR: ${f.snr !== null ? f.snr.toFixed(0) : "—"}`;
+    + `Eccentricity: ${f.roundness !== null ? f.roundness.toFixed(3) : "—"}, SNR: ${f.snr !== null ? f.snr.toFixed(0) : "—"}, `
+    + `Background: ${Math.round(f.background)}, Noise: ${f.background_std !== null && f.background_std !== undefined ? f.background_std.toFixed(1) : "—"}`;
 }
 
 function frameLightboxUrl(night, f) {
@@ -1925,19 +2090,28 @@ function frameCard(night, f, frames, index) {
   const meta = el("div", { class: "frame-meta" }, []);
   meta.appendChild(el("div", { class: "frame-name" }, [f.filename]));
   meta.appendChild(el("div", { class: "frame-time" }, [`${date}  ${time}`]));
-  const stats = el("div", { class: "frame-stats" }, []);
-  const rows = [
-    ["stars", f.star_count, "star_count"],
-    ["fwhm", f.fwhm !== null ? f.fwhm.toFixed(2) : "—", "fwhm"],
-    ["eccen", f.roundness !== null ? f.roundness.toFixed(3) : "—", "roundness"],
-    ["snr", f.snr !== null ? f.snr.toFixed(0) : "—", "snr"],
-  ];
-  for (const [k, v, metricKey] of rows) {
-    const isAnom = f.anomaly_z && f.anomaly_z[metricKey] !== undefined && f.anomaly_z[metricKey] >= state.lastAnomalySigma;
-    stats.appendChild(el("span", {}, [k]));
-    stats.appendChild(el("b", { class: isAnom ? "anom" : "" }, [String(v)]));
+  if (f.error) {
+    // A corrupt/truncated capture (see app/framestats.py's analyze_frame)
+    // - every stat below is a meaningless placeholder for this one, so
+    // show the actual reason instead of a confusing row of zeroes/dashes.
+    meta.appendChild(el("div", { class: "frame-error" }, [`⚠ Could not read: ${f.error}`]));
+  } else {
+    const stats = el("div", { class: "frame-stats" }, []);
+    const rows = [
+      ["stars", f.star_count, "star_count"],
+      ["fwhm", f.fwhm !== null ? f.fwhm.toFixed(2) : "—", "fwhm"],
+      ["eccen", f.roundness !== null ? f.roundness.toFixed(3) : "—", "roundness"],
+      ["snr", f.snr !== null ? f.snr.toFixed(0) : "—", "snr"],
+      ["bg", Math.round(f.background), "background"],
+      ["noise", f.background_std !== null && f.background_std !== undefined ? f.background_std.toFixed(1) : "—", "background_std"],
+    ];
+    for (const [k, v, metricKey] of rows) {
+      const isAnom = f.anomaly_z && f.anomaly_z[metricKey] !== undefined && f.anomaly_z[metricKey] >= state.lastAnomalySigma;
+      stats.appendChild(el("span", {}, [k]));
+      stats.appendChild(el("b", { class: isAnom ? "anom" : "" }, [String(v)]));
+    }
+    meta.appendChild(stats);
   }
-  meta.appendChild(stats);
   if (isFrameFlagged(f)) meta.appendChild(el("div", { class: "badge danger", style: "margin-top:6px;" }, ["flagged"]));
   const excludeRow = el("label", { class: "frame-exclude" }, [
     el("input", {
@@ -2062,10 +2236,12 @@ function renderAnalyzeOutput() {
         }, ["✓ Accept recommended exclusions"]));
       }
       const grid = el("div", { class: "metric-grid" }, [
-        metricStrip("star count", frames, "star_count", "star_count", state.lastAnomalySigma),
-        metricStrip("FWHM", frames, "fwhm", "fwhm", state.lastAnomalySigma),
-        metricStrip("eccentricity", frames, "roundness", "roundness", state.lastAnomalySigma),
-        metricStrip("SNR", frames, "snr", "snr", state.lastAnomalySigma),
+        metricStrip("star count", frames, "star_count", "star_count", state.lastAnomalySigma, night),
+        metricStrip("FWHM", frames, "fwhm", "fwhm", state.lastAnomalySigma, night),
+        metricStrip("eccentricity", frames, "roundness", "roundness", state.lastAnomalySigma, night),
+        metricStrip("SNR", frames, "snr", "snr", state.lastAnomalySigma, night),
+        metricStrip("sky background", frames, "background", "background", state.lastAnomalySigma, night),
+        metricStrip("background noise", frames, "background_std", "background_std", state.lastAnomalySigma, night),
       ]);
       block.appendChild(grid);
 
@@ -2129,8 +2305,17 @@ async function runAnalyze() {
   resultEl.appendChild(el("div", { class: "status-line" }, ["starting…"]));
   document.getElementById("analyze-output").innerHTML = "";
   document.getElementById("analyze-reset-btn").style.display = "none";
-  document.getElementById("review-next-btn").style.display = "none";
   setStepBadge("review-status-badge", null, "not analyzed");
+  // Was previously only implied by the old inline review-next-btn's own
+  // explicit style.display="none" right here (removed along with that
+  // button) - state.analyzed itself was never actually reset mid-run, so
+  // stepStatus("review").complete (and anything reading it - the bottom
+  // stepbar's "ready" state, the .stepper breadcrumb's own checkmark)
+  // stayed stale-true for a RE-analyze's whole duration. Reset for real
+  // here instead of relying on a button's side effect to paper over it.
+  state.analyzed = false;
+  renderStepper();
+  renderStepBar();
   runBtn.disabled = true;
   rerunBtn.disabled = true;
   const ownerProject = state.project;
@@ -2140,6 +2325,7 @@ async function runAnalyze() {
       progressEl: document.getElementById("analyze-progress"),
       lockButtons: [runBtn, rerunBtn],
       ownerProject,
+      label: "Review analysis",
       onDone: (snap) => {
         if (snap.status !== "succeeded") {
           setOutcome(resultEl, false, `Failed: ${snap.error || ""}`);
@@ -2154,7 +2340,7 @@ async function runAnalyze() {
         renderAnalyzeOutput();
         renderStepper();
         document.getElementById("analyze-reset-btn").style.display = "inline-block";
-        document.getElementById("review-next-btn").style.display = "inline-block";
+        renderStepBar();
       },
     });
   } catch (e) {
@@ -2203,10 +2389,10 @@ document.getElementById("analyze-reset-btn").addEventListener("click", () => {
   document.getElementById("analyze-result").innerHTML = "";
   document.getElementById("analyze-reset-btn").style.display = "none";
   document.getElementById("analyze-rerun-btn").style.display = "none";
-  document.getElementById("review-next-btn").style.display = "none";
   setStepBadge("review-status-badge", null, "not analyzed");
   refreshStackNightsChecklist();
   renderStepper();
+  renderStepBar();
 });
 
 // ---------- Stack section ----------
@@ -2335,6 +2521,7 @@ document.getElementById("stack-run-btn").addEventListener("click", async () => {
           logViewEl: document.querySelector('[data-log-view="stack"]'),
           pipelineEl: document.getElementById("stack-pipeline"),
           ownerProject,
+          label: groups.length > 1 ? `Stack (${label})` : "Stack",
           onDone: resolve,
         });
       });
@@ -2403,6 +2590,7 @@ document.getElementById("register-finals-run-btn").addEventListener("click", asy
         progressEl: document.getElementById("register-finals-progress"),
         logViewEl: document.querySelector('[data-log-view="register-finals"]'),
         ownerProject,
+        label: "Align final results",
         onDone: resolve,
       });
     });
@@ -2553,11 +2741,43 @@ function renderStepper() {
   });
 }
 
+// The fixed-at-bottom status+Next bar (Chris: astro-ingest "keeps the nav
+// bar at the bottom... always in the same place and easily accessible" -
+// the breadcrumb .stepper above scrolls out of view on a long page; this
+// doesn't). Status text is just whatever the active step's own badge
+// already says (#stage-status-badge etc.) - already accurate and already
+// kept up to date everywhere that badge is, so this never needs its own
+// separate source of truth. Next's "ready" state reads stepStatus(step)
+// directly - the same function that already drove the old per-step
+// inline Next buttons (now removed; this bar replaced them, not just
+// duplicated them) and the .stepper breadcrumbs' own complete/available
+// styling, so there's exactly one definition of "done" per step, not
+// three.
+function renderStepBar() {
+  if (!state.project) return;
+  const step = state.activeStep;
+  const badge = document.getElementById(`${step}-status-badge`);
+  document.getElementById("stepbar-status").textContent = `${STEP_LABELS[step]}: ${badge ? badge.textContent : ""}`;
+
+  const nextBtn = document.getElementById("stepbar-next");
+  const nextStep = STEPS[STEPS.indexOf(step) + 1];
+  if (!nextStep) {
+    nextBtn.style.display = "none";
+    return;
+  }
+  const ready = stepStatus(step).complete;
+  nextBtn.style.display = "inline-block";
+  nextBtn.textContent = `Next: ${STEP_LABELS[nextStep]} →`;
+  nextBtn.classList.toggle("ready", ready);
+  nextBtn.onclick = () => { state.activeStep = nextStep; showActiveStep(); };
+}
+
 function showActiveStep() {
   document.querySelectorAll(".step-panel").forEach((panel) => {
     panel.classList.toggle("visible", panel.dataset.step === state.activeStep);
   });
   renderStepper();
+  renderStepBar();
 }
 
 // ---------- project load / status ----------
@@ -2589,6 +2809,7 @@ async function loadProjectStatus() {
     document.getElementById("delete-project-btn").title = "This project hasn't been staged yet — nothing to delete";
     renumberGroups();
     renderStepper();
+    renderStepBar();
     return;
   }
   document.getElementById("delete-project-btn").disabled = false;
@@ -2596,11 +2817,9 @@ async function loadProjectStatus() {
   const nights = state.status.nights;
 
   setStepBadge("stage-status-badge", nights.length ? "ok" : null, nights.length ? `${nights.length} group(s) staged` : "not staged");
-  document.getElementById("stage-next-btn").style.display = nights.length ? "inline-block" : "none";
 
   const mastersDone = stepStatus("masters").complete;
   setStepBadge("masters-status-badge", mastersDone ? "ok" : null, mastersDone ? "masters built" : "not built");
-  document.getElementById("masters-next-btn").style.display = mastersDone ? "inline-block" : "none";
 
   const stackDone = stepStatus("stack").complete;
   setStepBadge("stack-status-badge", stackDone ? "ok" : null, stackDone ? "stack complete" : "not stacked");
@@ -2625,6 +2844,7 @@ async function loadProjectStatus() {
   showStackPreview();
   renderRegisterFinalsSection();
   renderStepper();
+  renderStepBar();
   // Fire-and-forget, not awaited: a large project means one syscall per
   // staged file server-side, which could be noticeably slower than the
   // status load above on a big project or a slow NAS - never block the
@@ -2704,6 +2924,7 @@ async function switchToProject(name, initialStep) {
   state.status = null;
   document.getElementById("project-panels").style.display = state.project ? "block" : "none";
   document.getElementById("no-project-hint").style.display = state.project ? "none" : "block";
+  document.getElementById("stepbar").style.display = state.project ? "block" : "none";
   document.getElementById("delete-project-btn").style.display = state.project ? "inline-block" : "none";
   document.getElementById("job-history-btn").style.display = state.project ? "inline-block" : "none";
   document.getElementById("job-history-panel").style.display = "none";
@@ -2765,9 +2986,6 @@ async function switchToProject(name, initialStep) {
   document.getElementById("register-finals-list").innerHTML = "";
   document.getElementById("analyze-reset-btn").style.display = "none";
   document.getElementById("analyze-rerun-btn").style.display = "none";
-  document.getElementById("stage-next-btn").style.display = "none";
-  document.getElementById("masters-next-btn").style.display = "none";
-  document.getElementById("review-next-btn").style.display = "none";
   setStepBadge("review-status-badge", null, "not analyzed");
   // Same staleness risk as state.status above: these otherwise only get
   // updated inside loadProjectStatus()'s success path, so a project that
@@ -2836,10 +3054,10 @@ async function switchToProject(name, initialStep) {
     document.getElementById("anomaly-sigma-value").textContent = restored.lastAnomalySigma.toFixed(1);
     setStepBadge("review-status-badge", "ok", "analyzed");
     document.getElementById("analyze-reset-btn").style.display = "inline-block";
-    document.getElementById("review-next-btn").style.display = "inline-block";
     refreshExcludeDisplay();
     renderAnalyzeOutput();
     renderStepper();
+    renderStepBar();
     if (!cached) {
       reviewCache[state.project] = {
         lastAnalyzeResult: restored.lastAnalyzeResult,
