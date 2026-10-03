@@ -13,7 +13,15 @@
   <Category>Tools: MediaApp:Photos</Category>
   <WebUI>http://[IP]:[PORT:8000]/</WebUI>
   <Icon/>
-  <ExtraParams/>
+  <ExtraParams>--memory=40g --memory-swap=40g</ExtraParams>
+  <!-- Caps container RAM so a runaway stack OOMs inside its own cgroup
+       instead of triggering a system-wide OOM that can kill anything on
+       the box, including a VM (see Handoff.md's incident log). There's
+       no dedicated template field for a memory limit, unlike CPUset
+       below — ExtraParams is the only way to carry this through a
+       container recreated via Add Container + this template, so it MUST
+       stay here, not just in run-dev.sh/deploy/run.sh's own --memory
+       flags. Keep in sync with both. -->
   <DateInstalled/>
   <CPUset>6-19</CPUset>
   <!-- Reserves cores 0-5 for a pihole VM on this box — Siril saturates every
