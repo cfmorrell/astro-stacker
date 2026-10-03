@@ -1,6 +1,28 @@
 <?xml version="1.0"?>
 <!-- UnRAID template for astro-stacker (docs/DEPLOY.md). Install: copy to
-     /boot/config/plugins/dockerMan/templates-user/my-AstroStacker.xml, then Docker > Add Container > Template. -->
+     /boot/config/plugins/dockerMan/templates-user/my-AstroStacker.xml, then Docker > Add Container > Template.
+
+     ExtraParams carries the memory=40g and memory swap=40g limit flags: caps
+     container RAM so a runaway stack OOMs inside its own cgroup instead of
+     triggering a system wide OOM that can kill anything on the box, including
+     a VM (see Handoff.md's incident log). There's no dedicated template field
+     for a memory limit the way there is for CPUset below, so this must stay in
+     ExtraParams - keep it in sync with run-dev.sh and deploy/run.sh's own
+     memory limit flags.
+
+     CPUset reserves cores 0-5 for a pihole VM on this box - Siril saturates
+     every core it can see during a stack. Keep in sync with run-dev.sh and
+     deploy/run.sh's own cpuset flag, and re-check lscpu -e before reusing this
+     range on different hardware.
+
+     No comments inside the Container element below, only here - UnRAID's
+     template parser silently failed to populate the Add Container form from
+     an earlier version of this file: that version had comments between tags,
+     AND those comments contained a literal double hyphen from spelling out a
+     command line flag (illegal inside an XML comment per the XML spec,
+     confirmed the hard way). Avoid both in any future edit to this file: no
+     inline comments between tags, and no two consecutive hyphen characters
+     inside whatever comment text remains. -->
 <Container version="2">
   <Name>AstroStacker</Name>
   <Repository>ghcr.io/cfmorrell/astro-stacker:latest</Repository>
@@ -14,20 +36,8 @@
   <WebUI>http://[IP]:[PORT:8000]/</WebUI>
   <Icon/>
   <ExtraParams>--memory=40g --memory-swap=40g</ExtraParams>
-  <!-- Caps container RAM so a runaway stack OOMs inside its own cgroup
-       instead of triggering a system-wide OOM that can kill anything on
-       the box, including a VM (see Handoff.md's incident log). There's
-       no dedicated template field for a memory limit, unlike CPUset
-       below — ExtraParams is the only way to carry this through a
-       container recreated via Add Container + this template, so it MUST
-       stay here, not just in run-dev.sh/deploy/run.sh's own --memory
-       flags. Keep in sync with both. -->
   <DateInstalled/>
-  <CPUset>6-19</CPUset>
-  <!-- Reserves cores 0-5 for a pihole VM on this box — Siril saturates every
-       core it can see during a stack. Keep in sync with run-dev.sh /
-       deploy/run.sh's own --cpuset-cpus, and re-check `lscpu -e` before
-       reusing this range on different hardware (see Handoff.md). -->
+  <CPUset>6,7,8,9,10,11,12,13,14,15,16,17,18,19</CPUset>
   <Config Name="Web UI port" Target="8000" Default="8084" Mode="tcp" Description="Port for the web app." Type="Port" Display="always" Required="true" Mask="false">8084</Config>
   <Config Name="Captures" Target="/captures" Default="/mnt/user/Astronomy" Mode="ro" Description="Read-only source of raw light/dark/flat/bias frames." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/Astronomy</Config>
   <Config Name="Data" Target="/data" Default="/mnt/user/docker_appdata/astrostacker/data" Mode="rw" Description="Per-project working directories (staged frames, masters, stacked results)." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/docker_appdata/astrostacker/data</Config>
